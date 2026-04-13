@@ -1,6 +1,12 @@
-# Tank Tool Scaffold
+# 管区辅助工具
 
-Tank Tool Scaffold 是一个收敛到最小基础能力的 Go + Vue 3 单仓库脚手架。
+管区辅助工具是一个收敛到最小基础能力的 Go + Vue 3 单仓库脚手架。
+
+当前默认命名约定如下：
+
+- 程序展示名称：管区辅助工具
+- 应用英文名：tank-helper
+- 项目英文简称：tank-tool
 
 当前仓库只保留两类程序级能力：
 
@@ -81,9 +87,87 @@ http://localhost:8888/static/
 
 这个仓库后续大概率会被拿去孵化新项目，因此第一步通常就是把当前默认的项目名替换掉。
 
+当前脚手架默认将命名拆成三层：
+
+- 程序展示名称：管区辅助工具
+- 应用英文名：tank-helper
+- 项目英文简称：tank-tool
+
+### 当前脚手架修改范围
+
+为了避免只改一半导致命名错位，建议把脚手架修改范围理解为下面三层：
+
+#### 1. 展示层命名
+
+- 中文展示名称：当前为 `管区辅助工具`
+- 应用英文名：当前为 `tank-helper`
+- 这两项主要影响页面标题、接口返回的站点信息和前端品牌区
+- 当前对应文件：`internal/app/meta.go`、`frontend/index.html`、`frontend/src/components/AppShell.vue`、`frontend/src/pages/Home.vue`
+
+#### 2. 项目层命名
+
+- Go 模块名：当前为 `tank-tool`
+- 项目英文简称：当前为 `tank-tool`
+- 构建产物前缀：当前为 `tank-tool`
+- 这三项在当前脚手架里视为同一组标识，默认应保持一致
+- 当前对应文件：`go.mod`、`build.sh`、所有 `tank-tool/...` Go 导入路径
+
+#### 3. 静态资源与文档层
+
+- 浏览器标题、品牌区文案、README 说明文档、CLAUDE.md
+- 前端公共资源命名与引用
+- 这部分虽然不参与 Go 编译，但如果不一起改，最容易留下旧脚手架痕迹
+
+### 当前约定的实际值
+
+当前仓库已经明确采用以下组合，后续修改时请以此为基线：
+
+- [go.mod](go.mod) 中的 Go 模块名是 `tank-tool`
+- [build.sh](build.sh) 中的构建产物前缀是 `tank-tool`
+- [internal/app/meta.go](internal/app/meta.go) 中的 `AppName` 是 `tank-helper`
+- [internal/app/meta.go](internal/app/meta.go) 中的 `AppDisplayName` 是 `管区辅助工具`
+
+这意味着：
+
+- `tank-tool` 代表项目简称、Go 模块名和构建产物名
+- `tank-helper` 代表应用英文名，不等于 Go 模块名
+- `管区辅助工具` 代表中文展示名称，不等于二进制名
+
+### 修改时的联动规则
+
+#### 只改展示名称
+
+如果你只想改界面展示和应用名称，而不改项目简称，那么只需要联动修改：
+
+- `internal/app/meta.go`
+- `frontend/index.html`
+- `frontend/src/components/AppShell.vue`
+- `frontend/src/pages/Home.vue`
+- `README.md`
+
+这种情况下，不要改 `go.mod`、`build.sh` 和 Go import 路径。
+
+#### 连 Go 模块名一起改
+
+如果你要把 `tank-tool` 这组项目简称一起改掉，那么必须一次性联动修改：
+
+- `go.mod`
+- `build.sh`
+- 所有 `tank-tool/...` 导入路径
+- README 和 CLAUDE 中涉及模块名、构建命令、示例导入的内容
+
+不要只改 `go.mod` 或只改 `build.sh`。这两类修改如果分开做，会出现编辑器、构建产物和源码导入彼此不一致的问题。
+
+#### 前端构建产物与资源
+
+- 不要手改 `frontend/dist/`
+- 改完前端源码后重新执行 `pnpm build`
+- 如旧模板资源已经不再引用，应一并清理，避免保留无效的脚手架残留
+
 如果你要让 AI 直接帮你改名，建议一次明确给出这三类名称：
 
-- Go 模块名：例如 `acme-admin`
+- Go 模块名 / 项目英文简称：例如 `acme-admin`
+- 应用英文名：例如 `acme-helper`
 - 对外展示名：例如 `Acme Admin Console`
 - 构建产物名：例如 `acme-admin`
 
@@ -139,8 +223,9 @@ http://localhost:8888/static/
 
 目标信息：
 1. Go 模块名改为：my-new-app
-2. 程序显示名称改为：My New App
-3. 构建产物名改为：my-new-app
+2. 应用英文名改为：my-new-helper
+3. 程序显示名称改为：My New App
+4. 构建产物名改为：my-new-app
 
 要求：
 1. 同步修改 go.mod、internal/app/meta.go、build.sh、frontend/index.html、frontend/src/components/AppShell.vue、README.md
