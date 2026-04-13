@@ -1,0 +1,20 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="nekoFavBg" x1="10" y1="8" x2="52" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF1C9"/>
+      <stop offset="1" stop-color="#F2B06D"/>
+    </linearGradient>
+  </defs>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#nekoFavBg)"/>
+  <path d="M22 25L17 15L27 20L22 25Z" fill="#CE8354"/>
+  <path d="M42 25L47 15L37 20L42 25Z" fill="#CE8354"/>
+  <path d="M21 28C21 18.6112 28.6112 11 38 11H26C35.3888 11 43 18.6112 43 28V35C43 44.3888 35.3888 52 26 52H38C28.6112 52 21 44.3888 21 35V28Z" fill="#FFF6E5" opacity="0.88"/>
+  <circle cx="25" cy="30" r="3.5" fill="#3D2E2E"/>
+  <circle cx="39" cy="30" r="3.5" fill="#3D2E2E"/>
+  <path d="M32 34L28.5 38H35.5L32 34Z" fill="#D68585"/>
+  <path d="M27.5 41C28.9167 43.3333 30.4167 44.5 32 44.5C33.5833 44.5 35.0833 43.3333 36.5 41" stroke="#8A5A3C" stroke-width="2.8" stroke-linecap="round"/>
+  <path d="M18 33H10" stroke="#8A5A3C" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M18 38H8" stroke="#8A5A3C" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M46 33H54" stroke="#8A5A3C" stroke-width="2.5" stroke-linecap="round"/>
+  <path d="M46 38H56" stroke="#8A5A3C" stroke-width="2.5" stroke-linecap="round"/>
+</svg>

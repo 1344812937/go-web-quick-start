@@ -1,0 +1,15 @@
+/.idea/
+/.vscode/
+/node_modules/
+/dist/
+/build/
+.DS_Store
+/logs/
+/.github/
+/.claude/
+/frontend/dist/
+/frontend/node_modules/
+/data/
+/config/
+data.db
+neko-tool

@@ -1,0 +1,30 @@
+<svg width="320" height="320" viewBox="0 0 320 320" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="badgeBg" x1="36" y1="32" x2="280" y2="286" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF5D6"/>
+      <stop offset="1" stop-color="#F7C88A"/>
+    </linearGradient>
+    <linearGradient id="catFur" x1="101" y1="76" x2="221" y2="222" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F8ECD0"/>
+      <stop offset="1" stop-color="#E9B06C"/>
+    </linearGradient>
+  </defs>
+  <rect x="20" y="20" width="280" height="280" rx="84" fill="url(#badgeBg)"/>
+  <circle cx="160" cy="160" r="108" fill="#FFF9EE" opacity="0.72"/>
+  <path d="M110 117L86 74L132 95L110 117Z" fill="#D58856"/>
+  <path d="M210 117L234 74L188 95L210 117Z" fill="#D58856"/>
+  <path d="M101 126C101 93.4152 127.415 67 160 67C192.585 67 219 93.4152 219 126V175C219 210.346 190.346 239 155 239H165C129.654 239 101 210.346 101 175V126Z" fill="url(#catFur)"/>
+  <path d="M160 205C181.539 205 199 187.539 199 166V145H121V166C121 187.539 138.461 205 160 205Z" fill="#FFFBF4"/>
+  <circle cx="132" cy="140" r="10" fill="#3C302F"/>
+  <circle cx="188" cy="140" r="10" fill="#3C302F"/>
+  <path d="M160 152L149 164H171L160 152Z" fill="#CE7E7E"/>
+  <path d="M142 176C147.177 184.683 153.307 189.024 160 189.024C166.693 189.024 172.823 184.683 178 176" stroke="#8A5A3C" stroke-width="7" stroke-linecap="round"/>
+  <path d="M109 160H70" stroke="#8A5A3C" stroke-width="5" stroke-linecap="round"/>
+  <path d="M109 177H62" stroke="#8A5A3C" stroke-width="5" stroke-linecap="round"/>
+  <path d="M211 160H250" stroke="#8A5A3C" stroke-width="5" stroke-linecap="round"/>
+  <path d="M211 177H258" stroke="#8A5A3C" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="119" cy="171" r="8" fill="#F2A9A9" opacity="0.8"/>
+  <circle cx="201" cy="171" r="8" fill="#F2A9A9" opacity="0.8"/>
+  <path d="M251 93L258 108L274 110L262 121L265 137L251 129L237 137L240 121L228 110L244 108L251 93Z" fill="#F0B74A"/>
+  <path d="M79 227C102.274 209.325 125.631 200.487 149.073 200.487C172.514 200.487 195.49 208.992 218 226" stroke="#B66D42" stroke-width="10" stroke-linecap="round" opacity="0.6"/>
+</svg>
