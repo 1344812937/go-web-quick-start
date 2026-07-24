@@ -5,8 +5,8 @@ import (
 	"net/http"
 	"runtime/debug"
 
-	"tank-tool/pkg/common"
-	"tank-tool/pkg/until"
+	"github.com/1344812937/go-web-quick-start/pkg/common"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 
 	"github.com/gin-gonic/gin"
 )

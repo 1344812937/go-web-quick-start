@@ -2,9 +2,9 @@ package service
 
 import (
 	"context"
-	"tank-tool/pkg/common"
-	"tank-tool/pkg/core/tx"
-	"tank-tool/pkg/repository"
+	"github.com/1344812937/go-web-quick-start/pkg/common"
+	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
+	"github.com/1344812937/go-web-quick-start/pkg/repository"
 )
 
 // IBaseService[T] 服务基础能力接口，T 为绑定的业务模型类型。

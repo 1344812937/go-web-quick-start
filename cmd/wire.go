@@ -5,10 +5,10 @@
 package cmd
 
 import (
-	"tank-tool/internal/api"
-	apiProviders "tank-tool/internal/api/providers"
-	"tank-tool/internal/app"
-	"tank-tool/internal/config"
+	"github.com/1344812937/go-web-quick-start/internal/api"
+	apiProviders "github.com/1344812937/go-web-quick-start/internal/api/providers"
+	"github.com/1344812937/go-web-quick-start/internal/app"
+	"github.com/1344812937/go-web-quick-start/internal/config"
 
 	"github.com/google/wire"
 )

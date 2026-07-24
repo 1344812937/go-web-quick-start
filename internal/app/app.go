@@ -2,14 +2,14 @@ package app
 
 import (
 	"embed"
+	"github.com/1344812937/go-web-quick-start/internal/config"
+	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 	"io/fs"
 	"net/http"
 	"path"
 	"path/filepath"
 	"strings"
-	"tank-tool/internal/config"
-	pkgApi "tank-tool/pkg/api"
-	"tank-tool/pkg/until"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"

@@ -1,11 +1,12 @@
 package api
 
 import (
+	"github.com/1344812937/go-web-quick-start/internal/app"
+	"github.com/1344812937/go-web-quick-start/internal/config"
+	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
+	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
+	"github.com/1344812937/go-web-quick-start/pkg/common"
 	"net/http"
-	"tank-tool/internal/app"
-	"tank-tool/internal/config"
-	pkgApi "tank-tool/pkg/api"
-	"tank-tool/pkg/common"
 	"time"
 
 	gin "github.com/gin-gonic/gin"
@@ -41,15 +42,15 @@ func (a *SiteApi) GetSiteInfo(c *gin.Context) {
 
 	cfg := a.configManager.GetConfig()
 	data := SiteInfo{
-		AppName:     app.AppName,
-		Title:       app.AppDisplayName,
-		Version:     app.AppVersion,
+		AppName:     projectmeta.AppName,
+		Title:       projectmeta.DisplayName,
+		Version:     projectmeta.Version,
 		BasePath:    app.StaticBasePath,
 		Host:        cfg.WebConfig.Host,
 		Port:        cfg.WebConfig.Port,
 		StartedAt:   app.StartedAt.Format(time.RFC3339),
 		RunningFor:  time.Since(app.StartedAt).Round(time.Second).String(),
-		Description: "一个保留主页与设置能力的 Go + Vue 3 单仓库脚手架。",
+		Description: projectmeta.Description,
 	}
 	var result any = data
 	c.JSON(http.StatusOK, common.S(&result))

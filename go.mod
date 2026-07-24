@@ -1,4 +1,4 @@
-module tank-tool
+module github.com/1344812937/go-web-quick-start
 
 go 1.25.4
 

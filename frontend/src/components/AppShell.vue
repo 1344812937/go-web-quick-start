@@ -1,6 +1,7 @@
 <script setup>
 import { computed } from 'vue'
 import { useRoute } from 'vue-router'
+import projectMeta from '@/config/project.generated.js'
 
 const route = useRoute()
 
@@ -21,9 +22,9 @@ const pageTitle = computed(() => {
   <div class="app-shell">
     <header class="app-header">
       <div class="brand-block">
-        <p class="brand-kicker">Tank Tool</p>
-        <h1 class="brand-title">脚手架基础壳</h1>
-        <p class="brand-summary">保留主页和设置页，后续业务模块可直接在此继续扩展。</p>
+        <p class="brand-kicker">{{ projectMeta.appName }}</p>
+        <h1 class="brand-title">{{ projectMeta.displayName }}</h1>
+        <p class="brand-summary">{{ projectMeta.description }}</p>
       </div>
       <nav class="nav-bar">
         <RouterLink

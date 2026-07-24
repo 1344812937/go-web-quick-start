@@ -7,10 +7,10 @@
 package cmd
 
 import (
-	"tank-tool/internal/api"
-	providers2 "tank-tool/internal/api/providers"
-	"tank-tool/internal/app"
-	"tank-tool/internal/config"
+	"github.com/1344812937/go-web-quick-start/internal/api"
+	providers2 "github.com/1344812937/go-web-quick-start/internal/api/providers"
+	"github.com/1344812937/go-web-quick-start/internal/app"
+	"github.com/1344812937/go-web-quick-start/internal/config"
 )
 
 // Injectors from wire.go:

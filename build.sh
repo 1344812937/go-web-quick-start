@@ -3,12 +3,12 @@
 
 set -euo pipefail
 
-# 设置变量
-APP_NAME="tank-tool"
-VERSION=$(sed -n 's/^const AppVersion = "\([^"]*\)"$/\1/p' internal/app/meta.go)
+# 项目标识由 project.json 统一维护。
+APP_NAME=$(go run ./tools/projectctl field binaryName)
+VERSION=$(go run ./tools/projectctl field version)
 
 if [ -z "$VERSION" ]; then
-	echo "无法从 internal/app/meta.go 读取版本号"
+	echo "无法从 project.json 读取版本号"
 	exit 1
 fi
 

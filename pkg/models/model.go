@@ -1,7 +1,7 @@
 package models
 
 import (
-	"tank-tool/pkg/until"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 	"time"
 
 	"gorm.io/gorm"

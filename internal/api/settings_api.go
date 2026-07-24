@@ -1,10 +1,10 @@
 package api
 
 import (
+	"github.com/1344812937/go-web-quick-start/internal/config"
+	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
+	"github.com/1344812937/go-web-quick-start/pkg/common"
 	"net/http"
-	"tank-tool/internal/config"
-	pkgApi "tank-tool/pkg/api"
-	"tank-tool/pkg/common"
 
 	gin "github.com/gin-gonic/gin"
 )

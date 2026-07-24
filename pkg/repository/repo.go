@@ -1,8 +1,8 @@
 package repository
 
 import (
-	"tank-tool/pkg/common"
-	"tank-tool/pkg/core/tx"
+	"github.com/1344812937/go-web-quick-start/pkg/common"
+	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
 
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
