@@ -3,14 +3,56 @@
 
 set -euo pipefail
 
-# 项目标识由 project.json 统一维护。
-APP_NAME=$(go run ./tools/projectctl field binaryName)
+# project.json 维护稳定项目身份；PACKAGE_NAME 只控制本次构建产物名。
+PROJECT_BINARY=$(go run ./tools/projectctl field binaryName)
 VERSION=$(go run ./tools/projectctl field version)
+
+branch_package_name() {
+	local branch_name="$1"
+	local semantic_name="$branch_name"
+
+	semantic_name="${semantic_name#refs/heads/}"
+	semantic_name="${semantic_name#codex/}"
+	case "$semantic_name" in
+		feature/*|feat/*|fix/*|bugfix/*|hotfix/*|chore/*|release/*)
+			semantic_name="${semantic_name#*/}"
+			;;
+	esac
+
+	printf '%s' "$semantic_name" \
+		| tr '[:upper:]' '[:lower:]' \
+		| sed -E 's/[^a-z0-9._-]+/-/g; s/^[._-]+//; s/[._-]+$//'
+}
+
+REQUESTED_PACKAGE_NAME="${PACKAGE_NAME:-}"
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || true)
+
+if [ -n "$REQUESTED_PACKAGE_NAME" ]; then
+	if [[ ! "$REQUESTED_PACKAGE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+		echo "PACKAGE_NAME 只能包含字母、数字、点、下划线和短横线，并且必须以字母或数字开头"
+		exit 1
+	fi
+	APP_NAME="$REQUESTED_PACKAGE_NAME"
+	NAME_SOURCE="PACKAGE_NAME"
+elif [ -n "$CURRENT_BRANCH" ] && [ "$CURRENT_BRANCH" != "main" ] && [ "$CURRENT_BRANCH" != "master" ]; then
+	APP_NAME=$(branch_package_name "$CURRENT_BRANCH")
+	if [ -z "$APP_NAME" ]; then
+		APP_NAME="$PROJECT_BINARY"
+		NAME_SOURCE="project.json（分支名无法生成可移植文件名）"
+	else
+		NAME_SOURCE="分支 $CURRENT_BRANCH"
+	fi
+else
+	APP_NAME="$PROJECT_BINARY"
+	NAME_SOURCE="project.json（main/master 或 detached HEAD）"
+fi
 
 if [ -z "$VERSION" ]; then
 	echo "无法从 project.json 读取版本号"
 	exit 1
 fi
+
+echo "构建产物名称：${APP_NAME}（来源：${NAME_SOURCE}）"
 
 # 清理之前的构建
 rm -rf build

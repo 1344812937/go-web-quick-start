@@ -6,10 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
-	"github.com/1344812937/go-web-quick-start/pkg/until"
 	"os"
 	"path/filepath"
+
+	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 
 	"github.com/creasty/defaults"
 	"github.com/pelletier/go-toml/v2"
@@ -17,6 +18,11 @@ import (
 
 var log = until.Log
 var configPath = filepath.Join("./", "config", "config.toml")
+
+const (
+	DefaultWebHost = "0.0.0.0"
+	DefaultWebPort = "8888"
+)
 
 type ApplicationConfigManager struct {
 	config *ApplicationConfig
@@ -92,7 +98,7 @@ type ApplicationConfig struct {
 }
 
 type WebConfig struct {
-	Host string `toml:"host" json:"host" default:"localhost"`
+	Host string `toml:"host" json:"host" default:"0.0.0.0"`
 	Port string `toml:"port" json:"port" default:"8888"`
 }
 

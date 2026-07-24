@@ -3,13 +3,14 @@ package config
 import (
 	"bufio"
 	"fmt"
-	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
 	"io"
 	"net"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -87,11 +88,11 @@ func buildStartupGuidePlan(firstRun bool, presence configFieldPresence, cfg *App
 func applyRuntimeFallbacks(cfg *ApplicationConfig, plan startupGuidePlan) (bool, error) {
 	changed := false
 	if strings.TrimSpace(cfg.WebConfig.Host) == "" {
-		cfg.WebConfig.Host = "localhost"
+		cfg.WebConfig.Host = DefaultWebHost
 		changed = true
 	}
 	if strings.TrimSpace(cfg.WebConfig.Port) == "" {
-		cfg.WebConfig.Port = "8888"
+		cfg.WebConfig.Port = DefaultWebPort
 		changed = true
 	}
 	if strings.TrimSpace(cfg.NodeConfig.SharedToken) == "" {
@@ -172,14 +173,14 @@ func (g startupConfigGuide) run(configFilePath string, cfg *ApplicationConfig, p
 	fmt.Fprintln(g.writer, "直接回车可接受方括号中的默认值。")
 
 	if plan.PromptWebHost {
-		value, err := g.promptString("web_config.host", "监听主机地址，例如 localhost、0.0.0.0 或局域网 IP", defaultString(cfg.WebConfig.Host, "localhost"), false, validateHost)
+		value, err := g.promptString("web_config.host", "监听主机地址，例如 0.0.0.0、localhost 或局域网 IP", defaultString(cfg.WebConfig.Host, DefaultWebHost), false, validateHost)
 		if err != nil {
 			return err
 		}
 		cfg.WebConfig.Host = value
 	}
 	if plan.PromptWebPort {
-		value, err := g.promptString("web_config.port", "监听端口，范围 1-65535", defaultString(cfg.WebConfig.Port, "8888"), false, validatePort)
+		value, err := g.promptString("web_config.port", "监听端口，范围 1-65535", defaultString(cfg.WebConfig.Port, DefaultWebPort), false, validatePort)
 		if err != nil {
 			return err
 		}

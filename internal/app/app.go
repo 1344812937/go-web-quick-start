@@ -2,14 +2,17 @@ package app
 
 import (
 	"embed"
-	"github.com/1344812937/go-web-quick-start/internal/config"
-	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
-	"github.com/1344812937/go-web-quick-start/pkg/until"
 	"io/fs"
+	"net"
 	"net/http"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+
+	"github.com/1344812937/go-web-quick-start/internal/config"
+	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
@@ -78,11 +81,13 @@ func (applicationHolder *ApplicationHolder) Start(staticFS embed.FS) {
 }
 
 type AppWebManager struct {
-	WebServer   *gin.Engine
-	WebConfig   *config.WebConfig
-	assertFs    embed.FS
-	staticFiles map[string]bool
-	apis        []pkgApi.IApi
+	WebServer       *gin.Engine
+	WebConfig       *config.WebConfig
+	assertFs        embed.FS
+	staticFiles     map[string]bool
+	apis            []pkgApi.IApi
+	browserOpenOnce sync.Once
+	browserOpener   func(string) error
 }
 
 func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi) *AppWebManager {
@@ -92,9 +97,10 @@ func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []
 		webConfig = &appConfig.WebConfig
 	}
 	return &AppWebManager{
-		WebServer: getGin(),
-		WebConfig: webConfig,
-		apis:      apis,
+		WebServer:     getGin(),
+		WebConfig:     webConfig,
+		apis:          apis,
+		browserOpener: openDefaultBrowser,
 	}
 }
 
@@ -125,17 +131,24 @@ func (awm *AppWebManager) Run(assertFs embed.FS) {
 	awm.RegisterRouter()
 	if webConfig == nil {
 		webConfig = &config.WebConfig{
-			Port: "8080",
-			Host: "",
+			Port: config.DefaultWebPort,
+			Host: config.DefaultWebHost,
 		}
 	}
+	listenAddress := net.JoinHostPort(webConfig.Host, webConfig.Port)
+	listener, err := net.Listen("tcp", listenAddress)
+	if err != nil {
+		panic(err)
+	}
+	localURL := localBrowserURL(webConfig.Host, webConfig.Port)
 	go func() {
-		err := awm.WebServer.Run(webConfig.Host + ":" + webConfig.Port)
-		if err != nil {
+		if err := awm.WebServer.RunListener(listener); err != nil {
 			panic(err)
 		}
 	}()
-	log.Info("application start in http://" + webConfig.Host + ":" + webConfig.Port)
+	log.Infof("application listening on %s", listenAddress)
+	log.Infof("local interface available at %s", localURL)
+	go awm.openBrowserOnce(localURL)
 }
 
 func (awm *AppWebManager) RegisterRouter() {
