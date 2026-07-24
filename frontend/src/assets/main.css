@@ -1,3 +1,4 @@
+@import './supos-industrial.css';
 @import './base.css';
 
 #app {
@@ -11,19 +12,19 @@ a {
 
 .page-section {
   display: grid;
-  gap: 24px;
+  gap: 16px;
 }
 
 .surface-card {
-  border: 1px solid var(--app-line);
-  background: var(--app-card);
-  box-shadow: var(--app-shadow);
-  backdrop-filter: blur(14px);
+  border: 1px solid var(--supos-line);
+  border-radius: var(--supos-radius-md);
+  background: var(--supos-panel);
+  box-shadow: none;
 }
 
 .surface-card > .el-card__header {
-  border-bottom: 1px solid rgba(95, 63, 44, 0.1);
-  background: linear-gradient(180deg, rgba(255, 252, 247, 0.88), rgba(245, 235, 223, 0.72));
+  border-bottom: 1px solid var(--supos-line);
+  background: var(--supos-panel-muted);
 }
 
 .metric-grid {
@@ -33,39 +34,40 @@ a {
 }
 
 .metric-tile {
-  padding: 18px;
-  border: 1px solid rgba(126, 65, 37, 0.12);
-  border-radius: 18px;
-  background: var(--app-card-strong);
+  padding: 16px;
+  border: 1px solid var(--supos-line);
+  border-radius: var(--supos-radius-sm);
+  background: var(--supos-panel);
 }
 
 .metric-label {
   font-size: 12px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
-  color: var(--app-text-soft);
+  color: var(--supos-muted);
 }
 
 .metric-value {
   margin-top: 6px;
   font-size: 26px;
   line-height: 1.2;
-  color: var(--app-accent-deep);
+  color: var(--supos-text);
+  font-family: var(--supos-font-mono);
 }
 
 .metric-description {
   margin-top: 8px;
-  color: var(--app-text-soft);
+  color: var(--supos-muted);
 }
 
 .section-title {
   font-size: 20px;
-  color: var(--app-accent-deep);
+  color: var(--supos-text);
 }
 
 .section-subtitle {
   margin-top: 6px;
-  color: var(--app-text-soft);
+  color: var(--supos-muted);
 }
 
 .list-block {
@@ -74,10 +76,10 @@ a {
 }
 
 .list-item {
-  padding: 14px 16px;
-  border-radius: 16px;
-  border: 1px solid rgba(126, 65, 37, 0.12);
-  background: rgba(255, 251, 246, 0.72);
+  padding: 12px 14px;
+  border-radius: var(--supos-radius-sm);
+  border: 1px solid var(--supos-line);
+  background: var(--supos-panel-muted);
 }
 
 .inline-actions {
@@ -89,6 +91,23 @@ a {
 .form-grid {
   display: grid;
   gap: 18px;
+}
+
+.el-button {
+  border-radius: var(--supos-radius-sm);
+}
+
+.el-input__wrapper,
+.el-textarea__inner,
+.el-select__wrapper {
+  border-radius: var(--supos-radius-sm);
+  box-shadow: 0 0 0 1px var(--supos-line) inset;
+}
+
+.el-input__wrapper.is-focus,
+.el-textarea__inner:focus,
+.el-select__wrapper.is-focused {
+  box-shadow: 0 0 0 1px var(--supos-blue-600) inset;
 }
 
 @media (max-width: 768px) {
