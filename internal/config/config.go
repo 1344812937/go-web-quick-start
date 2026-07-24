@@ -6,9 +6,10 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
+	"github.com/1344812937/go-web-quick-start/pkg/until"
 	"os"
 	"path/filepath"
-	"tank-tool/pkg/until"
 
 	"github.com/creasty/defaults"
 	"github.com/pelletier/go-toml/v2"
@@ -115,7 +116,7 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 }
 
 func generateSharedToken() (string, error) {
-	return generatePrefixedToken("neko")
+	return generatePrefixedToken(projectmeta.TokenPrefix)
 }
 
 func generateAccessToken() (string, error) {

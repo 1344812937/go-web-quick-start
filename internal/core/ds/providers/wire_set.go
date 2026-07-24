@@ -1,9 +1,9 @@
 package providers
 
 import (
+	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
 	"os"
 	"path/filepath"
-	"tank-tool/pkg/core/tx"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"

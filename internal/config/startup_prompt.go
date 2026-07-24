@@ -3,6 +3,7 @@ package config
 import (
 	"bufio"
 	"fmt"
+	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
 	"io"
 	"net"
 	"os"
@@ -163,7 +164,7 @@ type startupConfigGuide struct {
 
 func (g startupConfigGuide) run(configFilePath string, cfg *ApplicationConfig, plan startupGuidePlan) error {
 	if plan.FirstRun {
-		fmt.Fprintf(g.writer, "\nNeko Tool 首次启动，正在引导填写配置。\n")
+		fmt.Fprintf(g.writer, "\n%s 首次启动，正在引导填写配置。\n", projectmeta.DisplayName)
 	} else {
 		fmt.Fprintf(g.writer, "\n检测到配置文件存在缺失项，正在补全启动配置。\n")
 	}
@@ -192,7 +193,7 @@ func (g startupConfigGuide) run(configFilePath string, cfg *ApplicationConfig, p
 		cfg.NodeConfig.SharedToken = value
 	}
 	if plan.PromptAccessToken {
-		value, err := g.promptString("auth_config.access_token", "浏览器登录口令，打开 /static/auth 时需要输入这个值", plan.DefaultAccessToken, false, validateAccessToken)
+		value, err := g.promptString("auth_config.access_token", "预留的访问令牌，可供后续认证功能使用", plan.DefaultAccessToken, false, validateAccessToken)
 		if err != nil {
 			return err
 		}
@@ -321,7 +322,7 @@ func validatePort(value string) error {
 }
 
 func validateSharedToken(value string) error {
-	return validatePrefixedToken(value, "neko", "shared_token")
+	return validatePrefixedToken(value, projectmeta.TokenPrefix, "shared_token")
 }
 
 func validateAccessToken(value string) error {
