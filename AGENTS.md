@@ -1,16 +1,16 @@
 # Repository Guidelines
 
-## Project Structure
+## 项目结构
 
-This is a Go and Vue 3 monorepo. `main.go` embeds `frontend/dist/` and starts the Gin server. Backend application code lives under `internal/`; reusable API, model, repository, service, transaction, and logging primitives live under `pkg/`. Wire dependency injection is defined in `cmd/wire.go`, with generated output in `cmd/wire_gen.go`. Vue source is under `frontend/src/`, public files are under `frontend/public/`, and generated frontend output is ignored at `frontend/dist/`.
+这是一个 Go 与 Vue 3 单仓库项目。`main.go` 嵌入 `frontend/dist/` 并启动 Gin 服务；后端业务代码放在 `internal/`，可复用的 API、模型、Repository、Service、事务和日志能力放在 `pkg/`。Wire 定义位于 `cmd/wire.go`，生成文件为 `cmd/wire_gen.go`。
 
-Project identity is defined only in `project.json`. Generated metadata lives in `internal/projectmeta/` and `frontend/src/config/`. Do not edit generated files directly.
+前端源码位于 `frontend/src/`，页面位于 `frontend/src/pages/`，公共资源位于 `frontend/public/`。功能菜单和页面路由统一由 `frontend/src/navigation/index.ts` 管理。项目身份只在 `project.json` 中维护，`internal/projectmeta/` 和 `frontend/src/config/project.generated.js` 是生成文件，不得直接编辑。
 
-## Git Workflow
+## Git 工作流
 
-Before changing code, run `git status --short --branch` and preserve all existing user changes.
+修改前执行 `git status --short --branch`，保留用户已有修改，不得擅自覆盖或回退。
 
-If Git is available but `.git/` does not exist, establish the initial code as the stable baseline:
+如果系统支持 Git 但仓库不存在 `.git/`，可建立稳定基线：
 
 ```bash
 git init -b main
@@ -18,13 +18,13 @@ git add .
 git commit -m "chore: initialize project"
 ```
 
-Never reinitialize an existing repository. Treat `main` as the stable baseline. Creating a separate branch is recommended for features, risky changes, and multi-file work, but it is not mandatory; small changes or work explicitly requested on `main` may be developed there directly. When using branches, create them from an up-to-date `main` with names such as `feature/<short-name>`, `fix/<short-name>`, or `chore/<short-name>`. Keep commits focused and use concise imperative subjects; `feat:`, `fix:`, `docs:`, and `chore:` prefixes are preferred.
+已有仓库不得重新初始化。独立分支是建议而非强制：小型修改或用户明确要求时可留在当前分支；高风险、跨模块工作可建议使用 `feature/<name>`、`fix/<name>` 或 `chore/<name>`。提交应聚焦，优先使用 `feat:`、`fix:`、`docs:`、`chore:` 等简洁前缀。
 
-## Quick Start
+## 快速开始
 
-### 1. Detect the Environment
+### 1. 检测环境
 
-Run these checks before installing project dependencies:
+安装项目依赖前先执行：
 
 ```bash
 git --version
@@ -34,50 +34,32 @@ corepack --version
 pnpm --version
 ```
 
-Required versions are Go `1.25.4` from `go.mod`, Node `^20.19.0 || >=22.12.0` from `frontend/package.json`, and pnpm `10.23.0`. Node 22 LTS is the recommended default. Stop setup if a command is missing or its version is unsupported; do not hope that a later build will compensate.
+版本要求：Go `1.25.4`、Node `^20.19.0 || >=22.12.0`、pnpm `10.23.0`，推荐 Node 22 LTS。命令缺失或版本不满足时，先停止项目依赖安装。使用 `uname -srm`、`cat /etc/os-release` 或 Windows `systeminfo` 确认系统和 CPU 架构。
 
-Also identify the operating system and architecture before selecting installers:
+### 2. 安装缺失工具
 
-```bash
-uname -srm                 # macOS/Linux
-cat /etc/os-release       # Linux distribution
-```
+系统级安装、全局包修改、管理员权限和代理修改必须先向用户说明目的并获得批准。
 
-On Windows, use `systeminfo` and `$env:PROCESSOR_ARCHITECTURE` in PowerShell.
-
-### 2. Install Missing System Tools
-
-System-wide installation, administrator access, global package changes, and proxy changes require explicit user approval. Explain the tool, version, command, and affected location before executing.
-
-macOS with Homebrew:
+macOS：
 
 ```bash
 brew install git go node
 ```
 
-Debian or Ubuntu can install Git with:
+Debian/Ubuntu 的 Git：
 
 ```bash
 sudo apt-get update
 sudo apt-get install -y git
 ```
 
-Fedora can install Git with:
+Fedora 的 Git：
 
 ```bash
 sudo dnf install -y git
 ```
 
-Distribution repositories may provide an outdated Go or Node release. Install Go `1.25.4` from [go.dev/dl](https://go.dev/dl/) and Node 22 LTS from [nodejs.org](https://nodejs.org/) or an already-installed nvm/Volta. With nvm:
-
-```bash
-nvm install 22
-nvm use 22
-```
-
-Before installing a Go archive, match `uname -m` to the download architecture, verify the published SHA-256 checksum, and request approval before replacing `/usr/local/go` or changing a system PATH. Do not run unchecked `curl | sh` installers.
-
-Windows with `winget`:
+Go `1.25.4` 优先使用 [go.dev/dl](https://go.dev/dl/) 官方包；Node 使用已有 nvm/Volta 或 Node 22 LTS 官方包。Windows 可执行：
 
 ```powershell
 winget install --id Git.Git -e
@@ -85,11 +67,9 @@ winget install --id GoLang.Go -e
 winget install --id OpenJS.NodeJS.LTS -e
 ```
 
-Open a new terminal after installation and rerun every version check. Never disable TLS verification or use an untrusted package mirror to bypass download errors.
+安装 Go 压缩包前必须核对架构和 SHA-256；修改 `/usr/local` 或系统 PATH 前请求批准。禁止静默使用 `sudo`、未经检查的 `curl | sh`、关闭 TLS 校验或切换到不可信镜像。
 
-### 3. Install pnpm
-
-Use Corepack so pnpm stays pinned to the repository version:
+### 3. 安装 pnpm
 
 ```bash
 corepack enable
@@ -97,11 +77,9 @@ corepack install --global pnpm@10.23.0
 pnpm --version
 ```
 
-If `corepack enable` fails because its shim directory is not writable, do not add `sudo`. Use `corepack pnpm <command>` temporarily or ask the user to repair the Node installation. If Corepack is absent, request approval before installing Corepack or a global pinned pnpm package.
+如果 `corepack enable` 因目录权限失败，不使用 `sudo` 覆盖；临时使用 `corepack pnpm <command>`，或提示用户修复 Node 安装权限。Corepack 缺失时，取得批准后再安装固定版本。
 
-### 4. Install Project Dependencies
-
-From the repository root:
+### 4. 安装项目依赖
 
 ```bash
 go mod download
@@ -111,54 +89,49 @@ pnpm build
 cd ..
 ```
 
-The frozen lockfile is mandatory. Do not delete or regenerate the lockfile, disable integrity checks, or upgrade dependencies merely to make installation pass. The frontend must be built before Go because `main.go` embeds `frontend/dist/`.
+必须使用 lockfile，不得通过删除 lockfile、关闭完整性检查或随意升级依赖绕过失败。Go 使用 `go:embed` 嵌入 `frontend/dist/`，因此首次运行前必须完成前端构建。
 
-### 5. Develop, Run, and Package
+### 5. 开发、运行与打包
 
-Run the complete local application:
+完整运行：
 
 ```bash
 pnpm --dir frontend build
 go run .
 ```
 
-Open `http://localhost:8888/static/`. For live frontend development, first ensure `frontend/dist/` exists, then use two terminals:
+默认监听 `0.0.0.0:8888`，每个进程只调用一次系统默认浏览器并打开 `http://127.0.0.1:8888/static/`。`0.0.0.0` 只用于监听，不是浏览器访问地址。
+
+前后端联调：
 
 ```bash
-# Terminal 1
+# 终端一
 go run .
 
-# Terminal 2
+# 终端二
 pnpm --dir frontend dev
 ```
 
-Vite proxies `/api` to `http://localhost:8888`. Create release binaries with:
+Vite 将 `/api` 代理到 `http://127.0.0.1:8888`。只运行前端开发服务时后端 API 不可用，联调必须同时运行 Go 服务。打包命令：
 
 ```bash
 pnpm --dir frontend build
 ./build.sh
 ```
 
-Regenerate Wire after editing providers:
+不得假定固定产物名。用户指定名称时执行：
 
 ```bash
-go generate ./cmd
+PACKAGE_NAME=<package-slug> ./build.sh
 ```
 
-## Installation Failure Policy
+未指定时，`build.sh` 从有业务含义的分支名生成，例如 `feature/device-monitoring` 生成 `device-monitoring`。`main`、`master`、detached HEAD 或无法转换的分支名回退到 `project.json.binaryName`。打包完成后向用户报告实际产物名。修改 Wire provider 后执行 `go generate ./cmd`。
 
-Diagnose failures in this order:
+## 依赖安装失败处理
 
-1. Confirm the command exists and the terminal has refreshed its PATH.
-2. Compare the actual version with repository requirements.
-3. Check write permissions for the intended install/cache directory.
-4. Check DNS, proxy, certificate, registry, and network errors.
-5. Check operating system and CPU architecture compatibility.
-6. Inspect `go env GOPATH GOMODCACHE GOPROXY` and `pnpm store path` for a usable offline cache.
+按以下顺序定位：命令与 PATH、实际版本、目录写权限、DNS/代理/证书/仓库连通性、系统与 CPU 架构、Go module cache 或 pnpm store 离线缓存。修复一个明确原因后最多重试一次，不循环安装，不擅自更换镜像。企业代理和私有镜像地址必须由用户提供，不永久修改全局代理。
 
-After correcting one evidenced cause, retry once. Do not enter repeated install loops or silently switch registries. Corporate proxies and private mirrors must be supplied by the user; do not persist global proxy settings without approval.
-
-If setup still cannot continue, stop dependent builds and report:
+无法继续时停止后续构建，并按统一格式报告：
 
 ```text
 Dependency setup is blocked: <dependency> <required-version>.
@@ -170,20 +143,37 @@ Resume with: <verification command>
 Unverified checks: <build/test list>
 ```
 
-Never claim that builds or tests passed when dependency setup prevented them from running.
+## 功能菜单与页面注册
 
-## Project Personalization
+所有新增的用户功能都必须表现为可访问的功能菜单；新增页面必须直接挂载到菜单树，不得只在 Vue Router 中添加孤立路由。`frontend/src/navigation/index.ts` 是菜单与页面路由的唯一注册源，`frontend/src/router/index.ts` 只消费自动生成的 `navigationRoutes`。
 
-All project identity belongs in `project.json`: Go module, binary name, application name, display name, description, version, token prefix, and favicon path. Do not add branded literals to Go, Vue, HTML, shell scripts, or documentation.
+新增页面时必须在 `navigationGroups` 中声明唯一 `key`、`label`、`icon`、`path`、`routeName` 和懒加载 `component`。通过 `children` 挂到正确父菜单；`children` 支持递归多级。可访问的叶子缺少路由字段时应用构建会失败。示例：
 
-After editing the manifest, regenerate and validate metadata:
+```ts
+{
+  key: 'device-monitoring',
+  path: '/device-monitoring',
+  routeName: 'device-monitoring',
+  label: '设备监控',
+  icon: Monitor,
+  component: () => import('@/pages/DeviceMonitoring.vue'),
+}
+```
+
+菜单遵循“配置即显示”：登记在 `navigationGroups` 中的菜单全部直接展示和访问，不增加角色、权限、租户、隐藏字段、灰度开关、功能开关或二次装配。这个项目用于快速验证原型，不为菜单引入权限系统。菜单搜索只做用户主动的文本筛选；访问子页面时父菜单自动展开，面包屑反映完整层级。删除或移动页面时同步修改菜单树。纯后端支撑、重构或基础设施工作不伪造菜单。
+
+## 项目个性化
+
+Go module、二进制名、应用名、显示名称、描述、版本、令牌前缀和 favicon 只在 `project.json` 维护。单次打包产物名不属于项目身份。设置页中的仓库链接是固定指向本仓库的例外。
+
+修改清单后执行：
 
 ```bash
 go run ./tools/projectctl generate
 go run ./tools/projectctl check
 ```
 
-For a full project rename, use one command so Go imports and generated files remain consistent:
+完整重命名使用：
 
 ```bash
 go run ./tools/projectctl rename \
@@ -196,13 +186,13 @@ go run ./tools/projectctl rename \
   --favicon /favicon.svg
 ```
 
-Replace the referenced favicon file if the brand asset itself changes. Existing runtime configuration and tokens are not migrated by project renaming.
+现有 `config/config.toml` 和令牌不会迁移；品牌资源变化时需替换对应 favicon。
 
-## Coding and Testing Standards
+## 编码与测试规范
 
-Format Go with `gofmt`; use tabs, standard Go names, and `NewTypeName` constructors. Each API implements `pkg/api.IApi`. Keep business code in `internal/` and reusable primitives in `pkg/`. Vue component filenames use PascalCase; JavaScript identifiers use camelCase and two-space indentation. Do not hand-edit `frontend/dist/`, generated project metadata, or `cmd/wire_gen.go`.
+Go 使用 `gofmt`、Tab 缩进和标准命名；API 实现 `pkg/api.IApi`。业务实现放在 `internal/`，可复用能力放在 `pkg/`。Vue 组件使用 PascalCase，JavaScript/TypeScript 标识符使用 camelCase 和两空格缩进。不得手工修改 `frontend/dist/`、生成元数据或 `cmd/wire_gen.go`。
 
-Add Go tests beside production code as `*_test.go` with `TestXxx` names. There is no frontend unit-test runner yet, so frontend changes require a production build and manual route verification. Before handoff, run:
+Go 测试与源码同目录，命名为 `*_test.go` 和 `TestXxx`。当前没有前端单元测试运行器，前端修改必须完成生产构建和实际路由检查。交付前执行：
 
 ```bash
 go run ./tools/projectctl check
@@ -212,12 +202,22 @@ go build -buildvcs=false ./...
 pnpm --dir frontend build
 ```
 
-## UI Direction
+## UI 方向
 
-The current pages demonstrate functionality only. Their layout, colors, spacing, and visual language are not a design requirement for future modules. Developers may replace the theme or page structure to suit the business domain. New UI must still be responsive, accessible, internally consistent, and complete across loading, empty, error, and success states.
+编辑 Vue 页面、应用外壳或样式前，完整读取 `docs/design/supos-industrial/THEME.md`。未指定其他风格时，使用 `frontend/src/assets/supos-industrial.css` 中的 SUPOS 工业主题变量。现有页面只演示功能，布局可以按业务重做，但必须响应式、可访问，并覆盖加载、空数据、错误和成功状态。
 
-## Pull Requests and Security
+## 需求提示词模板
 
-Pull requests should describe behavior changes, list verification commands, link relevant issues, and include screenshots for visible UI changes. Keep generated build output and unrelated refactors out of the diff.
+开始任务前读取对应模板：
 
-Runtime configuration and generated tokens are stored in ignored `config/config.toml`. Never commit configuration files, access tokens, shared tokens, databases, or logs. Treat `/api/settings` changes as security-sensitive because that endpoint reads and writes token values.
+- 功能开发：`docs/prompts/feature-request.md`
+- 模块开发：`docs/prompts/module-request.md`
+- 页面调整：`docs/prompts/page-change-request.md`
+
+模板用于发现会影响实现的缺失信息，不是强制表单。用户信息充分时直接实施；信息不足时只询问会改变实现的字段，可向用户提供对应模板路径。独立分支仍为可选项。
+
+## Pull Request 与安全
+
+Pull Request 应说明行为变化、验证命令、关联 issue，并为可见 UI 修改提供截图。不得混入无关重构或生成构建产物。
+
+运行配置和令牌位于被忽略的 `config/config.toml`。禁止提交配置文件、访问令牌、共享令牌、数据库或日志。`/api/settings` 会读写令牌，相关修改按安全敏感变更处理。
