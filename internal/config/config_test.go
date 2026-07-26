@@ -23,7 +23,6 @@ func TestApplyRuntimeFallbacksUsesDefaultWebAddress(t *testing.T) {
 	cfg := &ApplicationConfig{}
 	plan := startupGuidePlan{
 		DefaultSharedToken: "test_shared_token",
-		DefaultAccessToken: "test_access_token",
 	}
 
 	changed, err := applyRuntimeFallbacks(cfg, plan)

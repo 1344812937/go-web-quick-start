@@ -1,0 +1,177 @@
+package gateway
+
+import "time"
+
+const (
+	RoutingPriorityWeighted = "priority_weighted"
+	RoutingLowestCost       = "lowest_cost"
+	RoutingLowestLatency    = "lowest_latency"
+)
+
+type AdminUser struct {
+	ID           uint64 `gorm:"primaryKey;autoIncrement"`
+	Username     string `gorm:"size:80;uniqueIndex;not null"`
+	PasswordHash string `gorm:"size:255;not null"`
+	Enabled      bool   `gorm:"not null;default:true"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+type AdminSession struct {
+	ID        uint64 `gorm:"primaryKey;autoIncrement"`
+	TokenHash string `gorm:"size:64;uniqueIndex;not null"`
+	UserID    uint64 `gorm:"index;not null"`
+	ExpiresAt time.Time
+	CreatedAt time.Time
+	LastSeen  time.Time
+}
+
+type Channel struct {
+	ID                  uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name                string     `gorm:"size:120;not null" json:"name"`
+	BaseURL             string     `gorm:"size:1024;not null" json:"baseUrl"`
+	APIKeyCipher        string     `gorm:"type:text;not null" json:"-"`
+	Enabled             bool       `gorm:"not null;default:true" json:"enabled"`
+	SupportsStreamUsage bool       `gorm:"not null;default:true" json:"supportsStreamUsage"`
+	ConsecutiveFailures int        `gorm:"not null;default:0" json:"consecutiveFailures"`
+	CircuitOpenUntil    *time.Time `json:"circuitOpenUntil"`
+	LatencyEWMA         float64    `gorm:"not null;default:0" json:"latencyEwmaMs"`
+	LastHealthAt        *time.Time `json:"lastHealthAt"`
+	LastError           string     `gorm:"type:text" json:"lastError"`
+	CreatedAt           time.Time  `json:"createdAt"`
+	UpdatedAt           time.Time  `json:"updatedAt"`
+}
+
+type GatewayModel struct {
+	ID              uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name            string    `gorm:"size:160;uniqueIndex;not null" json:"name"`
+	RoutingStrategy string    `gorm:"size:32;not null;default:priority_weighted" json:"routingStrategy"`
+	Enabled         bool      `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt       time.Time `json:"createdAt"`
+	UpdatedAt       time.Time `json:"updatedAt"`
+}
+
+type ChannelModel struct {
+	ID                     uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
+	ChannelID              uint64    `gorm:"uniqueIndex:idx_channel_model;not null" json:"channelId"`
+	ModelID                uint64    `gorm:"uniqueIndex:idx_channel_model;index;not null" json:"modelId"`
+	UpstreamModel          string    `gorm:"size:200;not null" json:"upstreamModel"`
+	Priority               int       `gorm:"not null;default:0" json:"priority"`
+	Weight                 int       `gorm:"not null;default:100" json:"weight"`
+	InputPriceMicros       int64     `gorm:"not null;default:0" json:"inputPriceMicros"`
+	OutputPriceMicros      int64     `gorm:"not null;default:0" json:"outputPriceMicros"`
+	CachedInputPriceMicros *int64    `json:"cachedInputPriceMicros"`
+	Enabled                bool      `gorm:"not null;default:true" json:"enabled"`
+	CreatedAt              time.Time `json:"createdAt"`
+	UpdatedAt              time.Time `json:"updatedAt"`
+}
+
+type ClientToken struct {
+	ID             uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name           string     `gorm:"size:120;not null" json:"name"`
+	KeyHash        string     `gorm:"size:64;uniqueIndex;not null" json:"-"`
+	KeyPrefix      string     `gorm:"size:24;not null" json:"keyPrefix"`
+	Enabled        bool       `gorm:"not null;default:true" json:"enabled"`
+	AllowAllModels bool       `gorm:"not null;default:false" json:"allowAllModels"`
+	RPM            int        `gorm:"not null;default:60" json:"rpm"`
+	MaxConcurrency int        `gorm:"not null;default:10" json:"maxConcurrency"`
+	LastUsedAt     *time.Time `json:"lastUsedAt"`
+	CreatedAt      time.Time  `json:"createdAt"`
+	UpdatedAt      time.Time  `json:"updatedAt"`
+}
+
+type ClientTokenModel struct {
+	TokenID uint64 `gorm:"primaryKey"`
+	ModelID uint64 `gorm:"primaryKey;index"`
+}
+
+type RelayRequestLog struct {
+	ID                    string    `gorm:"size:36;primaryKey" json:"id"`
+	TokenID               uint64    `gorm:"index;not null" json:"tokenId"`
+	TokenName             string    `gorm:"size:120" json:"tokenName"`
+	TokenKeyPrefix        string    `gorm:"size:24" json:"tokenKeyPrefix"`
+	Endpoint              string    `gorm:"size:40;not null" json:"endpoint"`
+	RequestedModel        string    `gorm:"size:200;index;not null" json:"requestedModel"`
+	CodexSessionID        string    `gorm:"size:512;index" json:"codexSessionId"`
+	CodexSessionSource    string    `gorm:"size:48;index" json:"codexSessionSource"`
+	RequestParametersJSON string    `gorm:"type:text" json:"-"`
+	StatusCode            int       `gorm:"index;not null" json:"statusCode"`
+	InputTokens           int64     `gorm:"not null;default:0" json:"inputTokens"`
+	OutputTokens          int64     `gorm:"not null;default:0" json:"outputTokens"`
+	CachedTokens          int64     `gorm:"not null;default:0" json:"cachedTokens"`
+	EstimatedCost         int64     `gorm:"not null;default:0" json:"estimatedCostMicros"`
+	UsageSource           string    `gorm:"size:32" json:"usageSource"`
+	AttemptCount          int       `gorm:"not null;default:0" json:"attemptCount"`
+	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
+	Stream                bool      `gorm:"not null;default:false" json:"stream"`
+	ErrorCode             string    `gorm:"size:80" json:"errorCode"`
+	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
+}
+
+type RelayAttemptLog struct {
+	ID             uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
+	RequestID      string    `gorm:"size:36;index;not null" json:"requestId"`
+	ChannelID      uint64    `gorm:"index;not null" json:"channelId"`
+	ChannelName    string    `gorm:"size:120" json:"channelName"`
+	ChannelBaseURL string    `gorm:"size:1024" json:"channelBaseUrl"`
+	ChannelModelID uint64    `gorm:"not null" json:"channelModelId"`
+	UpstreamModel  string    `gorm:"size:200;not null" json:"upstreamModel"`
+	StatusCode     int       `gorm:"not null" json:"statusCode"`
+	InputTokens    int64     `gorm:"not null;default:0" json:"inputTokens"`
+	OutputTokens   int64     `gorm:"not null;default:0" json:"outputTokens"`
+	CachedTokens   int64     `gorm:"not null;default:0" json:"cachedTokens"`
+	EstimatedCost  int64     `gorm:"not null;default:0" json:"estimatedCostMicros"`
+	UsageSource    string    `gorm:"size:32" json:"usageSource"`
+	LatencyMS      int64     `gorm:"not null;default:0" json:"latencyMs"`
+	Success        bool      `gorm:"not null;default:false" json:"success"`
+	ErrorMessage   string    `gorm:"type:text" json:"errorMessage"`
+	CreatedAt      time.Time `gorm:"index" json:"createdAt"`
+}
+
+type TokenDailyStat struct {
+	Date          string `gorm:"size:10;primaryKey"`
+	TokenID       uint64 `gorm:"primaryKey;autoIncrement:false;index"`
+	RequestCount  int64  `gorm:"not null;default:0"`
+	SuccessCount  int64  `gorm:"not null;default:0"`
+	InputTokens   int64  `gorm:"not null;default:0"`
+	OutputTokens  int64  `gorm:"not null;default:0"`
+	CachedTokens  int64  `gorm:"not null;default:0"`
+	EstimatedCost int64  `gorm:"not null;default:0"`
+	DurationMS    int64  `gorm:"not null;default:0"`
+	AttemptCount  int64  `gorm:"not null;default:0"`
+	CreatedAt     time.Time
+	UpdatedAt     time.Time
+}
+
+type GatewayMigration struct {
+	Name      string `gorm:"size:120;primaryKey"`
+	AppliedAt time.Time
+}
+
+type ResponseAffinity struct {
+	ResponseHash   string    `gorm:"size:64;primaryKey"`
+	ChannelModelID uint64    `gorm:"index;not null"`
+	ExpiresAt      time.Time `gorm:"index"`
+	CreatedAt      time.Time
+}
+
+type SessionAffinity struct {
+	TokenID        uint64    `gorm:"primaryKey;autoIncrement:false"`
+	ModelID        uint64    `gorm:"primaryKey;autoIncrement:false"`
+	SessionHash    string    `gorm:"size:64;primaryKey"`
+	ChannelModelID uint64    `gorm:"index;not null"`
+	ExpiresAt      time.Time `gorm:"index"`
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+}
+
+type Usage struct {
+	InputTokens  int64
+	OutputTokens int64
+	CachedTokens int64
+	Source       string
+}
+
+func (u Usage) TotalTokens() int64 {
+	return u.InputTokens + u.OutputTokens
+}

@@ -16,6 +16,11 @@ type IApi interface {
 	Register(router *gin.RouterGroup)
 }
 
+// IRootApi registers protocol-compatible routes that live outside the internal /api namespace.
+type IRootApi interface {
+	RegisterRoot(router *gin.Engine)
+}
+
 // BaseApi API 层基类，业务 API 内嵌此结构体以复用通用能力。
 type BaseApi struct{}
 

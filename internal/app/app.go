@@ -86,11 +86,12 @@ type AppWebManager struct {
 	assertFs        embed.FS
 	staticFiles     map[string]bool
 	apis            []pkgApi.IApi
+	rootApi         pkgApi.IRootApi
 	browserOpenOnce sync.Once
 	browserOpener   func(string) error
 }
 
-func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi) *AppWebManager {
+func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi, rootApi pkgApi.IRootApi) *AppWebManager {
 	var webConfig *config.WebConfig = nil
 	appConfig := appConfigManager.GetConfig()
 	if appConfig != nil {
@@ -100,12 +101,16 @@ func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []
 		WebServer:     getGin(),
 		WebConfig:     webConfig,
 		apis:          apis,
+		rootApi:       rootApi,
 		browserOpener: openDefaultBrowser,
 	}
 }
 
 func getGin() *gin.Engine {
 	engine := gin.Default()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		panic(err)
+	}
 	// 重定向 Gin 日志
 	gin.DefaultWriter = &until.GinLogWriter{}
 	gin.DefaultErrorWriter = &until.GinLogWriter{}
@@ -158,6 +163,9 @@ func (awm *AppWebManager) RegisterRouter() {
 	apiGroup := server.Group("/api")
 	for _, a := range awm.apis {
 		a.Register(apiGroup)
+	}
+	if awm.rootApi != nil {
+		awm.rootApi.RegisterRoot(server)
 	}
 
 	server.GET("/", func(c *gin.Context) {

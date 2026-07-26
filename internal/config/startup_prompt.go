@@ -19,7 +19,6 @@ type configFieldPresence struct {
 	WebHost         bool
 	WebPort         bool
 	NodeSharedToken bool
-	AuthAccessToken bool
 }
 
 type startupGuidePlan struct {
@@ -27,16 +26,14 @@ type startupGuidePlan struct {
 	PromptWebHost      bool
 	PromptWebPort      bool
 	PromptSharedToken  bool
-	PromptAccessToken  bool
 	DefaultSharedToken string
-	DefaultAccessToken string
 }
 
 var tokenValuePattern = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 var hostNamePattern = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
 
 func (plan startupGuidePlan) HasQuestions() bool {
-	return plan.PromptWebHost || plan.PromptWebPort || plan.PromptSharedToken || plan.PromptAccessToken
+	return plan.PromptWebHost || plan.PromptWebPort || plan.PromptSharedToken
 }
 
 func detectConfigFieldPresence(content []byte) (configFieldPresence, error) {
@@ -48,7 +45,6 @@ func detectConfigFieldPresence(content []byte) (configFieldPresence, error) {
 		WebHost:         hasTomlKey(raw, "web_config", "host"),
 		WebPort:         hasTomlKey(raw, "web_config", "port"),
 		NodeSharedToken: hasTomlKey(raw, "node_config", "shared_token"),
-		AuthAccessToken: hasTomlKey(raw, "auth_config", "access_token"),
 	}, nil
 }
 
@@ -58,7 +54,6 @@ func buildStartupGuidePlan(firstRun bool, presence configFieldPresence, cfg *App
 		PromptWebHost:     firstRun || !presence.WebHost || strings.TrimSpace(cfg.WebConfig.Host) == "",
 		PromptWebPort:     firstRun || !presence.WebPort || strings.TrimSpace(cfg.WebConfig.Port) == "",
 		PromptSharedToken: firstRun || !presence.NodeSharedToken || strings.TrimSpace(cfg.NodeConfig.SharedToken) == "",
-		PromptAccessToken: firstRun || !presence.AuthAccessToken || strings.TrimSpace(cfg.AuthConfig.AccessToken) == "",
 	}
 	if plan.PromptSharedToken {
 		defaultToken := strings.TrimSpace(cfg.NodeConfig.SharedToken)
@@ -70,17 +65,6 @@ func buildStartupGuidePlan(firstRun bool, presence configFieldPresence, cfg *App
 			defaultToken = generatedToken
 		}
 		plan.DefaultSharedToken = defaultToken
-	}
-	if plan.PromptAccessToken {
-		defaultToken := strings.TrimSpace(cfg.AuthConfig.AccessToken)
-		if defaultToken == "" {
-			generatedToken, err := generateAccessToken()
-			if err != nil {
-				return startupGuidePlan{}, err
-			}
-			defaultToken = generatedToken
-		}
-		plan.DefaultAccessToken = defaultToken
 	}
 	return plan, nil
 }
@@ -105,18 +89,6 @@ func applyRuntimeFallbacks(cfg *ApplicationConfig, plan startupGuidePlan) (bool,
 			defaultToken = generatedToken
 		}
 		cfg.NodeConfig.SharedToken = defaultToken
-		changed = true
-	}
-	if strings.TrimSpace(cfg.AuthConfig.AccessToken) == "" {
-		defaultToken := plan.DefaultAccessToken
-		if defaultToken == "" {
-			generatedToken, err := generateAccessToken()
-			if err != nil {
-				return false, err
-			}
-			defaultToken = generatedToken
-		}
-		cfg.AuthConfig.AccessToken = defaultToken
 		changed = true
 	}
 	return changed, nil
@@ -193,14 +165,6 @@ func (g startupConfigGuide) run(configFilePath string, cfg *ApplicationConfig, p
 		}
 		cfg.NodeConfig.SharedToken = value
 	}
-	if plan.PromptAccessToken {
-		value, err := g.promptString("auth_config.access_token", "预留的访问令牌，可供后续认证功能使用", plan.DefaultAccessToken, false, validateAccessToken)
-		if err != nil {
-			return err
-		}
-		cfg.AuthConfig.AccessToken = value
-	}
-
 	fmt.Fprintln(g.writer, "配置填写完成，应用继续启动。")
 	return nil
 }
@@ -324,10 +288,6 @@ func validatePort(value string) error {
 
 func validateSharedToken(value string) error {
 	return validatePrefixedToken(value, projectmeta.TokenPrefix, "shared_token")
-}
-
-func validateAccessToken(value string) error {
-	return validatePrefixedToken(value, "access", "access_token")
 }
 
 func validatePrefixedToken(value string, prefix string, fieldName string) error {

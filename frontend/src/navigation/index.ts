@@ -1,9 +1,13 @@
 import type { Component } from 'vue'
 import type { RouteRecordRaw } from 'vue-router'
 import {
+  ChatLineSquare,
+  Connection,
   DataBoard,
+  Grid,
+  Key,
   Setting,
-  Tools,
+  Tickets,
 } from '@element-plus/icons-vue'
 
 export interface NavigationItem {
@@ -32,7 +36,7 @@ export interface NavigationGroup {
 
 export const navigationGroups: NavigationGroup[] = [
   {
-    label: '工作空间',
+    label: '网关运营',
     items: [
       {
         key: 'overview',
@@ -43,19 +47,57 @@ export const navigationGroups: NavigationGroup[] = [
         component: () => import('@/pages/Home.vue'),
       },
       {
-        key: 'system-management',
-        label: '系统管理',
-        icon: Tools,
-        children: [
-          {
-            key: 'settings',
-            path: '/settings',
-            routeName: 'settings',
-            label: '基础设置',
-            icon: Setting,
-            component: () => import('@/pages/Settings.vue'),
-          },
-        ],
+        key: 'channels',
+        path: '/channels',
+        routeName: 'channels',
+        label: '渠道管理',
+        icon: Connection,
+        component: () => import('@/pages/Channels.vue'),
+      },
+      {
+        key: 'models',
+        path: '/models',
+        routeName: 'models',
+        label: '模型路由',
+        icon: Grid,
+        component: () => import('@/pages/ModelRoutes.vue'),
+      },
+      {
+        key: 'tokens',
+        path: '/tokens',
+        routeName: 'tokens',
+        label: '访问令牌',
+        icon: Key,
+        component: () => import('@/pages/Tokens.vue'),
+      },
+      {
+        key: 'logs',
+        path: '/logs',
+        routeName: 'logs',
+        label: '调用日志',
+        icon: Tickets,
+        component: () => import('@/pages/RequestLogs.vue'),
+      },
+      {
+        key: 'sessions',
+        path: '/sessions',
+        routeName: 'sessions',
+        label: '会话日志',
+        icon: ChatLineSquare,
+        component: () => import('@/pages/CodexSessions.vue'),
+      },
+    ],
+  },
+  {
+    label: '系统',
+    items: [
+      {
+        key: 'settings',
+        path: '/settings',
+        routeName: 'settings',
+        label: '系统设置',
+        icon: Setting,
+        component: () => import('@/pages/Settings.vue'),
       },
     ],
   },

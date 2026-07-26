@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
 	"github.com/1344812937/go-web-quick-start/pkg/until"
@@ -25,14 +26,18 @@ const (
 )
 
 type ApplicationConfigManager struct {
+	mu     sync.RWMutex
 	config *ApplicationConfig
 }
 
 func (acm *ApplicationConfigManager) GetConfig() *ApplicationConfig {
+	acm.mu.RLock()
+	defer acm.mu.RUnlock()
 	if acm.config == nil {
-		acm.Load()
+		return nil
 	}
-	return acm.config
+	configCopy := *acm.config
+	return &configCopy
 }
 
 func (acm *ApplicationConfigManager) Load() {
@@ -82,7 +87,9 @@ func (acm *ApplicationConfigManager) Load() {
 		}
 	}
 
+	acm.mu.Lock()
 	acm.config = &cfg
+	acm.mu.Unlock()
 }
 
 func NewApplicationConfigManager() *ApplicationConfigManager {
@@ -92,9 +99,9 @@ func NewApplicationConfigManager() *ApplicationConfigManager {
 }
 
 type ApplicationConfig struct {
-	WebConfig  WebConfig  `toml:"web_config" json:"webConfig"`
-	NodeConfig NodeConfig `toml:"node_config" json:"nodeConfig"`
-	AuthConfig AuthConfig `toml:"auth_config" json:"authConfig"`
+	WebConfig     WebConfig     `toml:"web_config" json:"webConfig"`
+	NodeConfig    NodeConfig    `toml:"node_config" json:"nodeConfig"`
+	GatewayConfig GatewayConfig `toml:"gateway_config" json:"gatewayConfig"`
 }
 
 type WebConfig struct {
@@ -106,8 +113,13 @@ type NodeConfig struct {
 	SharedToken string `toml:"shared_token" json:"sharedToken"`
 }
 
-type AuthConfig struct {
-	AccessToken string `toml:"access_token" json:"accessToken"`
+type GatewayConfig struct {
+	MaxAttempts                  int  `toml:"max_attempts" json:"maxAttempts" default:"3"`
+	RequestBodyLimitMB           int  `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
+	ResponseHeaderTimeoutSeconds int  `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
+	StreamIdleTimeoutSeconds     int  `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
+	SessionTTLHours              int  `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
+	SecureCookie                 bool `toml:"secure_cookie" json:"secureCookie" default:"false"`
 }
 
 func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
@@ -117,16 +129,15 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 	if err := writeConfigFile(configPath, cfg); err != nil {
 		return err
 	}
-	acm.config = cfg
+	configCopy := *cfg
+	acm.mu.Lock()
+	acm.config = &configCopy
+	acm.mu.Unlock()
 	return nil
 }
 
 func generateSharedToken() (string, error) {
 	return generatePrefixedToken(projectmeta.TokenPrefix)
-}
-
-func generateAccessToken() (string, error) {
-	return generatePrefixedToken("access")
 }
 
 func generatePrefixedToken(prefix string) (string, error) {
