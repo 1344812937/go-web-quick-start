@@ -69,7 +69,13 @@ func (s *Store) migrate() error {
 	); err != nil {
 		return err
 	}
-	return s.backfillTokenDailyStats()
+	if err := s.backfillTokenDailyStats(); err != nil {
+		return err
+	}
+	if err := s.backfillTokenLogFields(); err != nil {
+		return err
+	}
+	return s.backfillCostFields()
 }
 
 func (s *Store) backfillTokenDailyStats() error {
@@ -87,14 +93,117 @@ func (s *Store) backfillTokenDailyStats() error {
 		if err := db.Model(&RelayRequestLog{}).Select(
 			"date(created_at) AS date, token_id, COUNT(*) AS request_count, " +
 				"SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
-				"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, " +
-				"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, " +
+				"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, " +
+				"COALESCE(SUM(output_tokens),0) AS output_tokens, " +
+				"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, " +
+				"COALESCE(SUM(sent_tokens),0) AS sent_tokens, " +
+				"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(estimated_cost),0) AS upstream_cost, " +
 				"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
 		).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
 			return err
 		}
 		if len(stats) > 0 {
 			if err := db.Create(&stats).Error; err != nil {
+				return err
+			}
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+	})
+}
+
+func (s *Store) backfillCostFields() error {
+	const migrationName = "upstream_cost_fields_v3"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		if err := db.Model(&TokenDailyStat{}).
+			Where("upstream_cost = 0 AND estimated_cost <> 0").
+			Update("upstream_cost", gorm.Expr("estimated_cost")).Error; err != nil {
+			return err
+		}
+
+		cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND (status_code < 200 OR status_code >= 300)", cutoff).Updates(map[string]any{
+			"estimated_cost": 0,
+			"upstream_cost":  0,
+			"cost_source":    CostSourceFailedZero,
+		}).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", cutoff).Updates(map[string]any{
+			"upstream_cost": gorm.Expr("estimated_cost"),
+			"cost_source":   CostSourceFallback,
+		}).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND (success = ? OR status_code < 200 OR status_code >= 300)", cutoff, false).Updates(map[string]any{
+			"estimated_cost": 0,
+			"upstream_cost":  0,
+			"cost_source":    CostSourceFailedZero,
+		}).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND success = ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", cutoff, true).Updates(map[string]any{
+			"upstream_cost": gorm.Expr("estimated_cost"),
+			"cost_source":   CostSourceFallback,
+		}).Error; err != nil {
+			return err
+		}
+
+		var dates []string
+		if err := db.Model(&RelayRequestLog{}).Distinct("date(created_at)").Where("created_at >= ?", cutoff).Pluck("date(created_at)", &dates).Error; err != nil {
+			return err
+		}
+		if len(dates) > 0 {
+			if err := db.Where("date IN ?", dates).Delete(&TokenDailyStat{}).Error; err != nil {
+				return err
+			}
+			var stats []TokenDailyStat
+			if err := db.Model(&RelayRequestLog{}).Select(
+				"date(created_at) AS date, token_id, COUNT(*) AS request_count, "+
+					"SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, "+
+					"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, "+
+					"COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, "+
+					"COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, COALESCE(SUM(sent_tokens),0) AS sent_tokens, "+
+					"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
+					"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
+			).Where("date(created_at) IN ?", dates).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
+				return err
+			}
+			if len(stats) > 0 {
+				if err := db.Create(&stats).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+	})
+}
+
+func (s *Store) backfillTokenLogFields() error {
+	const migrationName = "token_log_fields_v2"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		normalInputSQL := "CASE WHEN input_tokens > cached_tokens + cache_write_tokens THEN input_tokens - cached_tokens - cache_write_tokens ELSE 0 END"
+		for _, table := range []string{"relay_request_logs", "relay_attempt_logs", "token_daily_stats"} {
+			if err := db.Table(table).Where("1 = 1").Updates(map[string]any{
+				"normal_input_tokens": gorm.Expr(normalInputSQL),
+				"sent_tokens":         gorm.Expr("input_tokens"),
+			}).Error; err != nil {
 				return err
 			}
 		}

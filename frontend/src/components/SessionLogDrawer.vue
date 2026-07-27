@@ -21,9 +21,13 @@ interface ChannelAttemptGroup {
   channelBaseUrl: string
   current: boolean
   requestCount: number
-  inputTokens: number
+  normalInputTokens: number
   outputTokens: number
   cachedTokens: number
+  cacheWriteTokens: number
+  sentTokens: number
+  estimatedCostMicros: number
+  upstreamCostMicros: number
   items: ChannelAttemptItem[]
 }
 
@@ -52,9 +56,13 @@ const channelGroups = computed<ChannelAttemptGroup[]>(() => {
           channelBaseUrl: attempt.channelBaseUrl,
           current: attempt.channelId === currentChannelId,
           requestCount: 0,
-          inputTokens: 0,
+          normalInputTokens: 0,
           outputTokens: 0,
           cachedTokens: 0,
+          cacheWriteTokens: 0,
+          sentTokens: 0,
+          estimatedCostMicros: 0,
+          upstreamCostMicros: 0,
           items: [],
           requestIds: new Set<string>(),
         }
@@ -63,9 +71,13 @@ const channelGroups = computed<ChannelAttemptGroup[]>(() => {
       group.items.push({ request: requestItem, attempt })
       group.requestIds.add(requestItem.id)
       group.requestCount = group.requestIds.size
-      group.inputTokens += attempt.inputTokens
+      group.normalInputTokens += attempt.normalInputTokens
       group.outputTokens += attempt.outputTokens
       group.cachedTokens += attempt.cachedTokens
+      group.cacheWriteTokens += attempt.cacheWriteTokens
+      group.sentTokens += attempt.sentTokens
+      group.estimatedCostMicros += attempt.estimatedCostMicros
+      group.upstreamCostMicros += attempt.upstreamCostMicros
     }
   }
   return Array.from(groups.values())
@@ -101,6 +113,19 @@ function assignmentLabel(value: string): string {
   if (value === 'session_affinity') return '会话固定渠道'
   if (value === 'latest_successful_attempt') return '最近成功渠道'
   return '最近尝试渠道'
+}
+
+function costSourceLabel(value: RelayRequestLog['costSource']): string {
+  if (value === 'upstream') return '上游返回'
+  if (value === 'estimated_fallback') return '估算回退'
+  if (value === 'mixed') return '混合'
+  return '失败为零'
+}
+
+function costSourceType(value: RelayRequestLog['costSource']): 'success' | 'warning' | 'info' {
+  if (value === 'upstream') return 'success'
+  if (value === 'estimated_fallback' || value === 'mixed') return 'warning'
+  return 'info'
 }
 
 function currentChannelState(): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
@@ -162,16 +187,19 @@ watch(
   <el-drawer v-model="open" :title="drawerTitle" size="min(1180px, 100vw)" destroy-on-close>
     <el-skeleton v-if="loading && !detail" :rows="8" animated />
     <div v-else-if="errorMessage" class="state-panel state-error" role="alert">
-      <strong>会话详情加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadDetail">重试</el-button>
+      <strong>会话详情加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadDetail">重试</el-button>
     </div>
     <div v-else-if="detail" v-loading="loading" class="session-detail">
       <section class="session-summary-strip" aria-label="会话统计">
         <div><span>请求</span><strong>{{ detail.summary.requestCount }}</strong></div>
         <div><span>成功率</span><strong>{{ formatPercent(detail.summary.successRate) }}</strong></div>
-        <div><span>输入 Token</span><strong>{{ formatTokens(detail.summary.inputTokens) }}</strong></div>
+        <div><span>普通输入 Token</span><strong>{{ formatTokens(detail.summary.normalInputTokens) }}</strong></div>
         <div><span>输出 Token</span><strong>{{ formatTokens(detail.summary.outputTokens) }}</strong></div>
-        <div><span>缓存 Token</span><strong>{{ formatTokens(detail.summary.cachedTokens) }}</strong></div>
-        <div><span>估算费用</span><strong>{{ formatUSD(detail.summary.estimatedCostMicros) }}</strong></div>
+        <div><span>缓存读 Token</span><strong>{{ formatTokens(detail.summary.cachedTokens) }}</strong></div>
+        <div><span>缓存写 Token</span><strong>{{ formatTokens(detail.summary.cacheWriteTokens) }}</strong></div>
+        <div><span>真实发送（本地分词）</span><strong>{{ formatTokens(detail.summary.sentTokens) }}</strong></div>
+        <div><span>上游金额</span><strong>{{ formatUSD(detail.summary.upstreamCostMicros) }}</strong></div>
+        <div><span>自行估算</span><strong>{{ formatUSD(detail.summary.estimatedCostMicros) }}</strong></div>
       </section>
 
       <section class="current-channel-section">
@@ -189,15 +217,26 @@ watch(
       <section v-for="group in channelGroups" :key="group.key" class="channel-group">
         <header>
           <div><div class="channel-heading"><h3>{{ group.channelName }}</h3><el-tag v-if="group.current" type="success" effect="plain">当前</el-tag></div><p><code>{{ group.channelBaseUrl }}</code></p></div>
-          <div class="channel-totals"><span>{{ group.requestCount }} 个请求</span><span>输入 {{ formatTokens(group.inputTokens) }}</span><span>输出 {{ formatTokens(group.outputTokens) }}</span><span>缓存 {{ formatTokens(group.cachedTokens) }}</span></div>
+          <div class="channel-totals"><span>{{ group.requestCount }} 个请求</span><span>普通输入 {{ formatTokens(group.normalInputTokens) }}</span><span>输出 {{ formatTokens(group.outputTokens) }}</span><span>缓存读 {{ formatTokens(group.cachedTokens) }}</span><span>缓存写 {{ formatTokens(group.cacheWriteTokens) }}</span><span>真实发送（本地分词） {{ formatTokens(group.sentTokens) }}</span><span>上游金额 {{ formatUSD(group.upstreamCostMicros) }}</span><span>自行估算 {{ formatUSD(group.estimatedCostMicros) }}</span></div>
         </header>
         <el-table :data="group.items" row-key="attempt.id" empty-text="没有调用记录">
           <el-table-column label="时间 / 请求" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ formatDate(scope.row.request.createdAt) }}</strong><small><code>{{ scope.row.request.id }}</code></small></div></template></el-table-column>
           <el-table-column label="端点 / 模型" min-width="170"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.request.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</strong><small><code>{{ scope.row.request.requestedModel }} → {{ scope.row.attempt.upstreamModel }}</code></small></div></template></el-table-column>
           <el-table-column label="状态" width="96"><template #default="scope"><el-tag :type="statusType(scope.row.attempt.statusCode)" effect="plain">{{ scope.row.attempt.statusCode || '网络错误' }}</el-tag></template></el-table-column>
-          <el-table-column label="Token（入 / 出 / 缓存）" min-width="170" align="right"><template #default="scope">{{ formatTokens(scope.row.attempt.inputTokens) }} / {{ formatTokens(scope.row.attempt.outputTokens) }} / {{ formatTokens(scope.row.attempt.cachedTokens) }}</template></el-table-column>
+          <el-table-column label="Token 明细" min-width="310">
+            <template #default="scope">
+              <div class="attempt-token-grid">
+                <span><small>普通输入</small><strong>{{ formatTokens(scope.row.attempt.normalInputTokens) }}</strong></span>
+                <span><small>输出</small><strong>{{ formatTokens(scope.row.attempt.outputTokens) }}</strong></span>
+                <span><small>缓存读</small><strong>{{ formatTokens(scope.row.attempt.cachedTokens) }}</strong></span>
+                <span><small>缓存写</small><strong>{{ formatTokens(scope.row.attempt.cacheWriteTokens) }}</strong></span>
+                <span><small>真实发送（本地分词）</small><strong>{{ formatTokens(scope.row.attempt.sentTokens) }}</strong></span>
+              </div>
+            </template>
+          </el-table-column>
           <el-table-column label="延迟" width="90" align="right"><template #default="scope">{{ scope.row.attempt.latencyMs }} ms</template></el-table-column>
-          <el-table-column label="费用" width="116" align="right"><template #default="scope">{{ formatUSD(scope.row.attempt.estimatedCostMicros) }}</template></el-table-column>
+          <el-table-column label="费用" width="158" align="right"><template #default="scope"><div class="attempt-cost"><strong>{{ formatUSD(scope.row.attempt.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.attempt.estimatedCostMicros) }}</small></div></template></el-table-column>
+          <el-table-column label="费用来源" width="108"><template #default="scope"><el-tag :type="costSourceType(scope.row.attempt.costSource)" effect="plain" size="small">{{ costSourceLabel(scope.row.attempt.costSource) }}</el-tag></template></el-table-column>
           <el-table-column label="参数" width="76" fixed="right"><template #default="scope"><el-button text :icon="View" title="查看接口调用参数" @click="showParameters(scope.row.request)" /></template></el-table-column>
         </el-table>
       </section>
@@ -213,7 +252,7 @@ watch(
         </el-table>
       </section>
 
-      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :total="detail.requestTotal" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadDetail" /></footer>
+      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="detail.requestTotal" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadDetail" /></footer>
     </div>
   </el-drawer>
 
@@ -228,7 +267,7 @@ watch(
 
 <style scoped>
 .session-detail { display: grid; gap: 22px; }
-.session-summary-strip { display: grid; grid-template-columns: repeat(6, minmax(110px, 1fr)); border-block: 1px solid var(--rose-border); }
+.session-summary-strip { display: grid; grid-template-columns: repeat(9, minmax(110px, 1fr)); border-block: 1px solid var(--rose-border); }
 .session-summary-strip > div { display: grid; gap: 5px; padding: 13px 14px; border-right: 1px solid var(--rose-border); }
 .session-summary-strip > div:last-child { border-right: 0; }
 .session-summary-strip span, .current-channel-grid span { color: var(--rose-text-muted); font-size: 11px; }
@@ -247,12 +286,19 @@ watch(
 .channel-group > header { padding: 14px 16px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
 .channel-heading { gap: 8px; }
 .channel-totals { flex-wrap: wrap; justify-content: flex-end; gap: 6px 16px; color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.attempt-token-grid { display: grid; grid-template-columns: repeat(5, minmax(56px, 1fr)); gap: 8px; font-variant-numeric: tabular-nums; }
+.attempt-token-grid > span { display: grid; gap: 1px; }
+.attempt-token-grid small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
+.attempt-token-grid strong { color: var(--rose-text); font-size: 12px; }
+.attempt-cost { display: grid; gap: 2px; }
+.attempt-cost strong { color: var(--rose-text); font-variant-numeric: tabular-nums; }
+.attempt-cost small { color: var(--rose-text-muted); font-size: 10px; }
 .parameter-dialog-content { display: grid; gap: 14px; }
 .parameter-meta { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--rose-text-muted); font-size: 12px; }
 .parameter-meta span { display: flex; align-items: center; gap: 7px; }
 .parameter-meta strong { color: var(--rose-text); }
 .parameter-dialog-content pre { max-height: 56vh; margin: 0; padding: 14px; overflow: auto; border: 1px solid var(--rose-border); border-radius: var(--rose-radius-control); color: var(--rose-text); background: var(--rose-surface-muted); font: 12px/1.6 var(--rose-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .parameter-dialog-content .mapping-empty { padding: 24px; border: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); text-align: center; }
-@media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, 1fr); } .session-summary-strip > div:nth-child(3) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even) { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .channel-group > header { align-items: flex-start; flex-direction: column; } .channel-totals { justify-content: flex-start; } }
+@media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .channel-group > header { align-items: flex-start; flex-direction: column; } .channel-totals { justify-content: flex-start; } }
 </style>

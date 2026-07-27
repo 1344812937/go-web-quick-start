@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Connection, Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
+import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ChannelLatencySparkline from '@/components/ChannelLatencySparkline.vue'
 import type {
@@ -22,6 +22,8 @@ interface MappingDraft {
   inputPrice: number
   outputPrice: number
   cachedInputPrice: number | null
+  cacheWritePrice: number | null
+  adjustmentMultiplier: number
   enabled: boolean
 }
 
@@ -38,7 +40,11 @@ const discoveringModels = ref(false)
 const discoveryError = ref('')
 const discoveredModels = ref<UpstreamModel[]>([])
 const discoverySummary = ref<ChannelModelDiscovery | null>(null)
+const priceMultiplier = ref(1)
+const testingChannelId = ref<number | null>(null)
+const deletingChannelId = ref<number | null>(null)
 const drawerTitle = computed(() => editingId.value ? '编辑渠道' : '新增渠道')
+const createdPublicModelCount = computed(() => discoveredModels.value.filter((model) => model.publicModelCreated).length)
 let discoveryRequestVersion = 0
 
 function fromMicros(value: number | null): number | null {
@@ -55,7 +61,35 @@ function mappingDraft(mapping: ChannelModel): MappingDraft {
     inputPrice: fromMicros(mapping.inputPriceMicros) ?? 0,
     outputPrice: fromMicros(mapping.outputPriceMicros) ?? 0,
     cachedInputPrice: fromMicros(mapping.cachedInputPriceMicros),
+    cacheWritePrice: fromMicros(mapping.cacheWritePriceMicros),
+    adjustmentMultiplier: Number.isFinite(mapping.priceMultiplierBasisPoints) ? mapping.priceMultiplierBasisPoints / 10_000 : 1,
     enabled: mapping.enabled,
+  }
+}
+
+function discoveredMappingDraft(model: UpstreamModel): MappingDraft {
+  const price = model.officialPrice
+  return {
+    modelId: model.publicModelId || null,
+    upstreamModel: model.id,
+    priority: 0,
+    weight: 100,
+    inputPrice: fromMicros(price?.inputPriceMicros ?? 0) ?? 0,
+    outputPrice: fromMicros(price?.outputPriceMicros ?? 0) ?? 0,
+    cachedInputPrice: fromMicros(price?.cachedInputPriceMicros ?? null),
+    cacheWritePrice: fromMicros(price?.cacheWritePriceMicros ?? null),
+    adjustmentMultiplier: 1,
+    enabled: false,
+  }
+}
+
+function mergeDiscoveredMappings(discovered: UpstreamModel[]) {
+  const configured = new Set(mappings.value.map((mapping) => mapping.upstreamModel.trim()))
+  for (const model of discovered) {
+    if (!configured.has(model.id)) {
+      mappings.value.push(discoveredMappingDraft(model))
+      configured.add(model.id)
+    }
   }
 }
 
@@ -72,6 +106,9 @@ function resetForm(channel?: Channel) {
   discoveryError.value = ''
   discoveredModels.value = []
   discoverySummary.value = null
+  priceMultiplier.value = channel && Number.isFinite(channel.priceMultiplierBasisPoints)
+    ? channel.priceMultiplierBasisPoints / 10_000
+    : 1
   drawerOpen.value = true
   if (channel) void discoverChannelModels()
 }
@@ -81,13 +118,118 @@ function addMapping() {
     ElMessage.warning('当前没有可选择的上游模型')
     return
   }
-  mappings.value.push({ modelId: null, upstreamModel: '', priority: 0, weight: 100, inputPrice: 0, outputPrice: 0, cachedInputPrice: null, enabled: true })
+  const upstreamModel = discoveredModels.value.find((model) => !mappings.value.some((mapping) => mapping.upstreamModel === model.id)) ?? discoveredModels.value[0]
+  mappings.value.push(discoveredMappingDraft(upstreamModel))
 }
 
 function modelOptionsForMapping(mapping: MappingDraft): UpstreamModel[] {
   const current = mapping.upstreamModel.trim()
   if (!current || discoveredModels.value.some((model) => model.id === current)) return discoveredModels.value
-  return [{ id: current, ownedBy: '已配置', created: 0 }, ...discoveredModels.value]
+  return [{ id: current, ownedBy: '已配置', created: 0, publicModelId: mapping.modelId ?? 0, publicModelCreated: false, officialPrice: null }, ...discoveredModels.value]
+}
+
+function selectUpstreamModel(mapping: MappingDraft, upstreamModelId: string) {
+  const upstreamModel = discoveredModels.value.find((model) => model.id === upstreamModelId)
+  if (upstreamModel?.publicModelId) mapping.modelId = upstreamModel.publicModelId
+  if (mapping.id === undefined) {
+    if (upstreamModel?.officialPrice) {
+      assignOfficialPrice(mapping, upstreamModel.officialPrice)
+    } else {
+      mapping.inputPrice = 0
+      mapping.outputPrice = 0
+      mapping.cachedInputPrice = null
+      mapping.cacheWritePrice = null
+    }
+    mapping.adjustmentMultiplier = 1
+  }
+}
+
+function formatOfficialPrice(model: UpstreamModel): string {
+  const price = model.officialPrice
+  if (!price) return '未收录'
+  const cachedInput = fromMicros(price.cachedInputPriceMicros)
+  const cacheWrite = fromMicros(price.cacheWritePriceMicros)
+  return `输入 $${fromMicros(price.inputPriceMicros)?.toFixed(4)} · 输出 $${fromMicros(price.outputPriceMicros)?.toFixed(4)} · 缓存读 ${cachedInput === null ? '未提供' : `$${cachedInput.toFixed(4)}`} · 缓存写 ${cacheWrite === null ? '未提供' : `$${cacheWrite.toFixed(4)}`}`
+}
+
+function officialPriceForMapping(mapping: MappingDraft) {
+  return discoveredModels.value.find((model) => model.id === mapping.upstreamModel)?.officialPrice ?? null
+}
+
+function assignOfficialPrice(mapping: MappingDraft, official: NonNullable<UpstreamModel['officialPrice']>) {
+  mapping.inputPrice = fromMicros(official.inputPriceMicros) ?? 0
+  mapping.outputPrice = fromMicros(official.outputPriceMicros) ?? 0
+  mapping.cachedInputPrice = fromMicros(official.cachedInputPriceMicros)
+  mapping.cacheWritePrice = fromMicros(official.cacheWritePriceMicros)
+}
+
+function roundedPrice(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function applyMappingPriceMultiplier(mapping: MappingDraft) {
+  const multiplier = mapping.adjustmentMultiplier
+  if (!Number.isFinite(multiplier) || multiplier < 0) {
+    ElMessage.error('请输入有效的价格倍率')
+    return
+  }
+  mapping.inputPrice = roundedPrice(mapping.inputPrice * multiplier)
+  mapping.outputPrice = roundedPrice(mapping.outputPrice * multiplier)
+  mapping.cachedInputPrice = mapping.cachedInputPrice === null ? null : roundedPrice(mapping.cachedInputPrice * multiplier)
+  mapping.cacheWritePrice = mapping.cacheWritePrice === null ? null : roundedPrice(mapping.cacheWritePrice * multiplier)
+  ElMessage.success(`已按当前价格的 ${multiplier} 倍调整`)
+}
+
+function restoreMappingOfficialPrice(mapping: MappingDraft) {
+  const official = officialPriceForMapping(mapping)
+  if (!official) {
+    ElMessage.warning('该模型未收录官方默认价格')
+    return
+  }
+  assignOfficialPrice(mapping, official)
+  mapping.adjustmentMultiplier = 1
+  ElMessage.success('已恢复官方默认价格')
+}
+
+function applyOfficialPriceMultiplier() {
+  const multiplier = priceMultiplier.value
+  if (!Number.isFinite(multiplier) || multiplier < 0) {
+    ElMessage.error('请输入有效的价格倍率')
+    return
+  }
+  let updated = 0
+  for (const mapping of mappings.value) {
+    const official = discoveredModels.value.find((model) => model.id === mapping.upstreamModel)?.officialPrice
+    if (!official) continue
+    mapping.inputPrice = Math.round(official.inputPriceMicros * multiplier) / 1_000_000
+    mapping.outputPrice = Math.round(official.outputPriceMicros * multiplier) / 1_000_000
+    mapping.cachedInputPrice = official.cachedInputPriceMicros === null ? null : Math.round(official.cachedInputPriceMicros * multiplier) / 1_000_000
+    mapping.cacheWritePrice = official.cacheWritePriceMicros === null ? null : Math.round(official.cacheWritePriceMicros * multiplier) / 1_000_000
+    mapping.adjustmentMultiplier = multiplier
+    updated += 1
+  }
+  if (updated === 0) {
+    ElMessage.warning('当前映射没有可匹配的官方价格')
+    return
+  }
+  ElMessage.success(`已按官方基准价重算 ${updated} 条映射`)
+}
+
+function restoreAllOfficialPrices() {
+  let updated = 0
+  for (const mapping of mappings.value) {
+    const official = officialPriceForMapping(mapping)
+    if (!official) continue
+    assignOfficialPrice(mapping, official)
+    mapping.adjustmentMultiplier = 1
+    updated += 1
+  }
+  priceMultiplier.value = 1
+  if (updated === 0) {
+    ElMessage.warning('当前映射没有可恢复的官方默认价格')
+    return
+  }
+  ElMessage.success(`已恢复 ${updated} 条映射的官方默认价格`)
 }
 
 function formatDiscoveryTime(value: string): string {
@@ -113,9 +255,16 @@ async function discoverChannelModels(showSuccess = false) {
       body: JSON.stringify(payload),
     })
     if (requestVersion !== discoveryRequestVersion) return
+    const refreshedModels = await request<GatewayModel[]>('/admin/gateway/models')
+    if (requestVersion !== discoveryRequestVersion) return
     discoverySummary.value = result
     discoveredModels.value = result.models
-    if (showSuccess) ElMessage.success(`已获取 ${result.models.length} 个上游模型`)
+    models.value = refreshedModels
+    mergeDiscoveredMappings(result.models)
+    if (showSuccess) {
+      const createdCount = result.models.filter((model) => model.publicModelCreated).length
+      ElMessage.success(createdCount > 0 ? `已获取 ${result.models.length} 个模型，自动新增 ${createdCount} 个公共模型` : `已获取 ${result.models.length} 个模型，公共模型均已存在`)
+    }
   } catch (error) {
     if (requestVersion !== discoveryRequestVersion) return
     discoverySummary.value = null
@@ -175,11 +324,22 @@ async function saveChannel() {
     ElMessage.error('模型映射需要选择公开模型和上游模型')
     return
   }
+  if (mappings.value.some((item) => !Number.isFinite(item.adjustmentMultiplier) || item.adjustmentMultiplier < 0 || item.adjustmentMultiplier > 100)) {
+    ElMessage.error('价格倍率必须在 0 到 100 之间')
+    return
+  }
+  if (!Number.isFinite(priceMultiplier.value) || priceMultiplier.value < 0 || priceMultiplier.value > 100) {
+    ElMessage.error('渠道官方价倍率必须在 0 到 100 之间')
+    return
+  }
   saving.value = true
   try {
     const channel = await request<Channel>(editingId.value ? `/admin/gateway/channels/${editingId.value}` : '/admin/gateway/channels', {
       method: editingId.value ? 'PUT' : 'POST',
-      body: JSON.stringify(form),
+      body: JSON.stringify({
+        ...form,
+        priceMultiplierBasisPoints: Math.round(priceMultiplier.value * 10_000),
+      }),
     })
     await request<ChannelModel[]>(`/admin/gateway/channels/${channel.id}/models`, {
       method: 'PUT',
@@ -191,6 +351,8 @@ async function saveChannel() {
         inputPriceMicros: Math.round(item.inputPrice * 1_000_000),
         outputPriceMicros: Math.round(item.outputPrice * 1_000_000),
         cachedInputPriceMicros: item.cachedInputPrice === null ? null : Math.round(item.cachedInputPrice * 1_000_000),
+        cacheWritePriceMicros: item.cacheWritePrice === null ? null : Math.round(item.cacheWritePrice * 1_000_000),
+        priceMultiplierBasisPoints: Math.round(item.adjustmentMultiplier * 10_000),
         enabled: item.enabled,
       }))),
     })
@@ -205,6 +367,7 @@ async function saveChannel() {
 }
 
 async function testChannel(channel: Channel) {
+  testingChannelId.value = channel.id
   try {
     const result = await request<{ latencyMs: number; status: number }>(`/admin/gateway/channels/${channel.id}/test`, { method: 'POST' })
     ElMessage.success(`连接成功，HTTP ${result.status}，${result.latencyMs} ms`)
@@ -212,17 +375,22 @@ async function testChannel(channel: Channel) {
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '连接测试失败')
     await loadData()
+  } finally {
+    testingChannelId.value = null
   }
 }
 
 async function deleteChannel(channel: Channel) {
   await ElMessageBox.confirm(`删除渠道“${channel.name}”及其全部模型映射？`, '删除渠道', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
+  deletingChannelId.value = channel.id
   try {
     await request<null>(`/admin/gateway/channels/${channel.id}`, { method: 'DELETE' })
     ElMessage.success('渠道已删除')
     await loadData()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '渠道删除失败')
+  } finally {
+    deletingChannelId.value = null
   }
 }
 
@@ -239,7 +407,7 @@ onMounted(loadData)
       </div>
     </header>
 
-    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>渠道加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadData">重试</el-button></div>
+    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>渠道加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="channels" row-key="id" empty-text="还没有渠道">
         <el-table-column label="渠道" min-width="190">
@@ -260,11 +428,11 @@ onMounted(loadData)
             <span v-else class="muted-text">近 5 天无成功采样</span>
           </template>
         </el-table-column>
-        <el-table-column label="缓存命中" min-width="170">
+        <el-table-column label="缓存读取" min-width="170">
           <template #default="scope">
             <div v-if="scope.row.metrics.inputTokens > 0" class="metric-copy cache-metric">
               <strong>{{ formatPercent(scope.row.metrics.cacheHitRate) }}</strong>
-              <div class="cache-meter" role="meter" aria-label="缓存命中率" aria-valuemin="0" aria-valuemax="1" :aria-valuenow="Math.min(Math.max(scope.row.metrics.cacheHitRate, 0), 1)">
+              <div class="cache-meter" role="meter" aria-label="缓存读取占比" aria-valuemin="0" aria-valuemax="1" :aria-valuenow="Math.min(Math.max(scope.row.metrics.cacheHitRate, 0), 1)">
                 <span :style="{ width: `${Math.min(Math.max(scope.row.metrics.cacheHitRate, 0), 1) * 100}%` }" />
               </div>
               <small>{{ formatTokens(scope.row.metrics.cachedTokens) }} / {{ formatTokens(scope.row.metrics.inputTokens) }} Token</small>
@@ -274,16 +442,16 @@ onMounted(loadData)
         </el-table-column>
         <el-table-column label="操作" width="236" fixed="right">
           <template #default="scope">
-            <el-button text :icon="Connection" @click="testChannel(scope.row)">测试</el-button>
+            <el-button text :icon="Connection" :loading="testingChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id" @click="testChannel(scope.row)">测试</el-button>
             <el-button text :icon="Edit" @click="resetForm(scope.row)">编辑</el-button>
-            <el-button text type="danger" :icon="Delete" @click="deleteChannel(scope.row)">删除</el-button>
+            <el-button text type="danger" :icon="Delete" :loading="deletingChannelId === scope.row.id" :disabled="testingChannelId === scope.row.id" @click="deleteChannel(scope.row)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>
       <div v-if="!loading && channels.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="resetForm()">添加第一个渠道</el-button></div>
     </section>
 
-    <el-drawer v-model="drawerOpen" :title="drawerTitle" size="min(720px, 100vw)" destroy-on-close>
+    <el-drawer v-model="drawerOpen" :title="drawerTitle" size="min(820px, 100vw)" destroy-on-close>
       <el-form label-position="top" class="drawer-form">
         <div class="form-columns">
           <el-form-item label="渠道名称"><el-input v-model="form.name" placeholder="例如 OpenAI 主渠道" /></el-form-item>
@@ -301,6 +469,7 @@ onMounted(loadData)
             <p v-else>尚未获取</p>
           </div>
           <div class="model-discovery-actions">
+            <el-tag v-if="createdPublicModelCount" type="warning" effect="plain">自动新增 {{ createdPublicModelCount }} 个公共模型</el-tag>
             <el-tag v-if="discoverySummary" type="success" effect="plain">{{ discoveredModels.length }} 个模型</el-tag>
             <el-button :icon="Refresh" :loading="discoveringModels" @click="discoverChannelModels(true)">获取模型</el-button>
           </div>
@@ -311,25 +480,88 @@ onMounted(loadData)
         <el-table v-else :data="discoveredModels" row-key="id" max-height="240" class="supported-model-table">
           <el-table-column label="模型 ID" min-width="200"><template #default="scope"><code>{{ scope.row.id }}</code></template></el-table-column>
           <el-table-column label="所属方" min-width="100"><template #default="scope">{{ scope.row.ownedBy || '未提供' }}</template></el-table-column>
+          <el-table-column label="官方短上下文价（USD / 百万 Token）" min-width="430"><template #default="scope"><span class="official-price" :class="{ 'muted-text': !scope.row.officialPrice }">{{ formatOfficialPrice(scope.row) }}</span></template></el-table-column>
+          <el-table-column label="本站公共模型" min-width="190">
+            <template #default="scope">
+              <div class="public-model-cell">
+                <code>{{ modelName(scope.row.publicModelId) }}</code>
+                <el-tag :type="scope.row.publicModelCreated ? 'warning' : 'success'" effect="plain" size="small">{{ scope.row.publicModelCreated ? '本次自动新增' : '已存在' }}</el-tag>
+              </div>
+            </template>
+          </el-table-column>
         </el-table>
 
-        <div class="subsection-heading"><div><h3>模型映射与价格</h3><p>价格单位为 USD / 百万 Token</p></div><el-button :icon="Plus" :disabled="discoveredModels.length === 0" @click="addMapping">添加映射</el-button></div>
-        <div v-if="mappings.length === 0" class="mapping-empty">当前渠道未配置模型映射</div>
-        <div v-for="(mapping, index) in mappings" :key="mapping.id ?? `new-${index}`" class="mapping-row">
-          <el-select v-model="mapping.modelId" aria-label="公开模型" placeholder="公开模型"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.id" /></el-select>
-          <el-select v-model="mapping.upstreamModel" aria-label="上游模型" filterable placeholder="上游模型">
-            <el-option v-for="model in modelOptionsForMapping(mapping)" :key="model.id" :label="model.id" :value="model.id">
-              <div class="upstream-model-option"><span>{{ model.id }}</span><small v-if="model.ownedBy">{{ model.ownedBy }}</small></div>
-            </el-option>
-          </el-select>
-          <el-input-number v-model="mapping.priority" :min="-1000" :max="1000" controls-position="right" aria-label="优先级" />
-          <el-input-number v-model="mapping.weight" :min="1" :max="10000" controls-position="right" aria-label="权重" />
-          <el-input-number v-model="mapping.inputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" aria-label="输入价格" />
-          <el-input-number v-model="mapping.outputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" aria-label="输出价格" />
-          <el-input-number v-model="mapping.cachedInputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" aria-label="缓存输入价格" placeholder="同输入" />
-          <el-checkbox v-model="mapping.enabled">启用</el-checkbox>
-          <el-button :icon="Delete" title="删除映射" circle @click="mappings.splice(index, 1)" />
+        <div class="subsection-heading mapping-heading">
+          <div><h3>模型映射与价格</h3><p>新发现映射默认停用；默认使用 Standard 短上下文价，仅按精确模型 ID 匹配</p></div>
+          <div class="mapping-heading-actions">
+            <label class="multiplier-control"><span>渠道官方价倍率</span><el-input-number v-model="priceMultiplier" :min="0" :max="100" :precision="2" :step="0.1" controls-position="right" /></label>
+            <el-button :icon="RefreshRight" :disabled="discoveredModels.length === 0" @click="applyOfficialPriceMultiplier">应用倍率</el-button>
+            <el-button :icon="RefreshLeft" :disabled="discoveredModels.length === 0" @click="restoreAllOfficialPrices">全部恢复默认</el-button>
+            <el-button :icon="Plus" :disabled="discoveredModels.length === 0" @click="addMapping">添加映射</el-button>
+          </div>
         </div>
+        <div v-if="mappings.length === 0" class="mapping-empty">当前渠道未配置模型映射</div>
+        <article v-for="(mapping, index) in mappings" :key="mapping.id ?? `new-${index}`" class="mapping-editor">
+          <header class="mapping-editor-header">
+            <div><strong>映射 {{ index + 1 }}</strong><span>{{ mapping.upstreamModel || '未选择上游模型' }}</span></div>
+            <div class="mapping-editor-actions"><el-checkbox v-model="mapping.enabled">启用该映射</el-checkbox><el-button :icon="Delete" title="删除映射" circle @click="mappings.splice(index, 1)" /></div>
+          </header>
+
+          <div class="mapping-model-grid">
+            <el-form-item label="上游模型">
+              <el-select v-model="mapping.upstreamModel" filterable placeholder="选择供应商返回的模型" @change="selectUpstreamModel(mapping, $event)">
+                <el-option v-for="model in modelOptionsForMapping(mapping)" :key="model.id" :label="model.id" :value="model.id">
+                  <div class="upstream-model-option"><span>{{ model.id }}</span><small v-if="model.ownedBy">{{ model.ownedBy }}</small></div>
+                </el-option>
+              </el-select>
+              <small class="field-note">实际发送到该供应商接口的模型 ID</small>
+            </el-form-item>
+            <el-form-item label="本站公开模型">
+              <el-select v-model="mapping.modelId" filterable placeholder="客户端请求使用的模型名"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.id" /></el-select>
+              <small class="field-note">Codex 和 OpenAI 客户端请求时使用的模型名称</small>
+            </el-form-item>
+          </div>
+
+          <div class="mapping-routing-grid">
+            <el-form-item label="调度优先级">
+              <el-input-number v-model="mapping.priority" :min="-1000" :max="1000" controls-position="right" />
+              <small class="field-note">数值越大越优先；只有最高优先级组参与选择</small>
+            </el-form-item>
+            <el-form-item label="同级选择权重">
+              <el-input-number v-model="mapping.weight" :min="1" :max="10000" controls-position="right" />
+              <small class="field-note">仅优先级相同时生效，数值越大被选中概率越高</small>
+            </el-form-item>
+          </div>
+
+          <section class="mapping-price-section" aria-label="Token 计费单价">
+            <div class="mapping-price-heading">
+              <div class="mapping-price-title"><strong>Token 计费单价</strong><span>USD / 百万 Token</span></div>
+              <div class="mapping-price-actions">
+                <label class="multiplier-control"><span>当前价倍率</span><el-input-number v-model="mapping.adjustmentMultiplier" :min="0" :max="100" :precision="2" :step="0.1" controls-position="right" /></label>
+                <el-button :icon="RefreshRight" @click="applyMappingPriceMultiplier(mapping)">按倍率调整</el-button>
+                <el-button :icon="RefreshLeft" :disabled="!officialPriceForMapping(mapping)" @click="restoreMappingOfficialPrice(mapping)">恢复默认</el-button>
+              </div>
+            </div>
+            <div class="mapping-price-grid">
+              <el-form-item label="输入价格">
+                <el-input-number v-model="mapping.inputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" />
+                <small class="field-note">未使用缓存读写的普通输入 Token</small>
+              </el-form-item>
+              <el-form-item label="输出价格">
+                <el-input-number v-model="mapping.outputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" />
+                <small class="field-note">供应商模型生成的输出 Token</small>
+              </el-form-item>
+              <el-form-item label="缓存读取价格">
+                <el-input-number v-model="mapping.cachedInputPrice" :min="0" :precision="4" :step="0.1" controls-position="right" placeholder="留空则同输入" />
+                <small class="field-note">从供应商上下文缓存读取的输入 Token；留空沿用输入价</small>
+              </el-form-item>
+              <el-form-item label="缓存写入价格">
+                <el-input-number v-model="mapping.cacheWritePrice" :min="0" :precision="4" :step="0.1" controls-position="right" placeholder="留空则同输入" />
+                <small class="field-note">写入供应商上下文缓存的输入 Token；留空沿用输入价</small>
+              </el-form-item>
+            </div>
+          </section>
+        </article>
       </el-form>
       <template #footer><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></template>
     </el-drawer>
@@ -341,6 +573,9 @@ onMounted(loadData)
 .model-discovery-actions { display: flex; align-items: center; gap: 8px; }
 .model-discovery-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 0; }
 .supported-model-table { margin-bottom: 4px; border: 1px solid var(--rose-border); }
+.public-model-cell { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
+.public-model-cell code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.official-price { font-family: var(--rose-font-mono); font-size: 11px; white-space: nowrap; }
 .upstream-model-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
 .upstream-model-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upstream-model-option small { flex-shrink: 0; color: var(--rose-text-subtle); font-size: 11px; }
@@ -351,9 +586,29 @@ onMounted(loadData)
 .cache-metric { width: 132px; }
 .cache-meter { width: 100%; height: 4px; overflow: hidden; border-radius: 2px; background: var(--rose-border); }
 .cache-meter span { display: block; height: 100%; background: var(--rose-amber); }
-.mapping-row { display: grid; grid-template-columns: 1.1fr 1.25fr repeat(5, minmax(92px, .7fr)) auto 34px; align-items: center; gap: 8px; padding: 10px 0; border-bottom: 1px solid var(--rose-border); overflow-x: auto; }
-.mapping-row > * { min-width: 92px; }
-.mapping-row > :last-child, .mapping-row > :nth-last-child(2) { min-width: auto; }
+.mapping-editor { margin-bottom: 12px; padding: 14px; border: 1px solid var(--rose-border); border-radius: 6px; background: var(--rose-surface); }
+.mapping-editor-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--rose-border); }
+.mapping-editor-header > div:first-child { display: grid; min-width: 0; gap: 2px; }
+.mapping-editor-header strong { color: var(--rose-text); font-size: 13px; }
+.mapping-editor-header span { overflow: hidden; color: var(--rose-text-muted); font-family: var(--rose-font-mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.mapping-editor-actions { display: flex; flex-shrink: 0; align-items: center; gap: 10px; }
+.mapping-heading-actions, .mapping-price-actions, .multiplier-control { display: flex; align-items: center; gap: 8px; }
+.mapping-heading-actions { flex-wrap: wrap; justify-content: flex-end; }
+.mapping-price-actions { flex-wrap: wrap; justify-content: flex-end; }
+.multiplier-control span { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
+.multiplier-control :deep(.el-input-number) { width: 116px; }
+.mapping-model-grid, .mapping-routing-grid, .mapping-price-grid { display: grid; gap: 12px; }
+.mapping-model-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.mapping-routing-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.mapping-price-section { margin-top: 2px; padding-top: 12px; border-top: 1px dashed var(--rose-border-strong); }
+.mapping-price-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+.mapping-price-title { display: grid; gap: 2px; }
+.mapping-price-title strong { color: var(--rose-text); font-size: 12px; }
+.mapping-price-title span { color: var(--rose-text-muted); font-size: 11px; }
+.mapping-price-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.mapping-editor :deep(.el-form-item) { margin-bottom: 12px; }
+.mapping-editor :deep(.el-select), .mapping-editor :deep(.el-input-number) { width: 100%; }
+.field-note { display: block; min-height: 30px; margin-top: 5px; color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; }
 .mapping-empty { padding: 24px; border: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); text-align: center; }
-@media (max-width: 720px) { .model-discovery-heading { align-items: flex-start; } .model-discovery-actions { flex-wrap: wrap; justify-content: flex-end; } .mapping-row { grid-template-columns: 1fr 1fr; overflow: visible; } .mapping-row > * { width: 100%; } }
+@media (max-width: 720px) { .model-discovery-heading, .mapping-editor-header, .mapping-heading, .mapping-price-heading { align-items: flex-start; flex-direction: column; } .model-discovery-actions, .mapping-heading-actions, .mapping-price-actions { width: 100%; justify-content: flex-start; } .mapping-model-grid, .mapping-routing-grid, .mapping-price-grid { grid-template-columns: 1fr; } .mapping-editor-header { flex-direction: column; } .mapping-editor-actions { width: 100%; justify-content: space-between; } .field-note { min-height: 0; } }
 </style>

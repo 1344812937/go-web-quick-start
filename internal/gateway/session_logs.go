@@ -61,10 +61,14 @@ type SessionLogSummary struct {
 	SuccessRate       float64             `json:"successRate"`
 	AttemptCount      int64               `json:"attemptCount"`
 	InputTokens       int64               `json:"inputTokens"`
+	NormalInputTokens int64               `json:"normalInputTokens"`
 	OutputTokens      int64               `json:"outputTokens"`
 	CachedTokens      int64               `json:"cachedTokens"`
+	CacheWriteTokens  int64               `json:"cacheWriteTokens"`
+	SentTokens        int64               `json:"sentTokens"`
 	CacheHitRate      float64             `json:"cacheHitRate"`
 	EstimatedCost     int64               `json:"estimatedCostMicros"`
+	UpstreamCost      int64               `json:"upstreamCostMicros"`
 	AverageDurationMS float64             `json:"averageDurationMs"`
 	FirstSeenAt       time.Time           `json:"firstSeenAt"`
 	LastSeenAt        time.Time           `json:"lastSeenAt"`
@@ -114,8 +118,11 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		"CASE WHEN codex_session_id = '' THEN id ELSE '' END AS fallback_request_id, token_id, " +
 		"COUNT(*) AS request_count, SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
 		"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
+		"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 		"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
-		"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
+		"COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, " +
+		"COALESCE(SUM(sent_tokens), 0) AS sent_tokens, " +
+		"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
 		"MIN(unixepoch(created_at)) AS first_seen_unix, MAX(unixepoch(created_at)) AS last_seen_unix"
 	type aggregateRow struct {
 		SessionLogSummary
@@ -173,8 +180,12 @@ func finishSessionSummary(summary *SessionLogSummary, totalDurationMS int64) {
 		summary.AverageDurationMS = float64(totalDurationMS) / float64(summary.RequestCount)
 	}
 	summary.InputTokens = max(summary.InputTokens, 0)
+	summary.NormalInputTokens = max(summary.NormalInputTokens, 0)
 	summary.OutputTokens = max(summary.OutputTokens, 0)
 	summary.CachedTokens = min(max(summary.CachedTokens, 0), summary.InputTokens)
+	summary.CacheWriteTokens = min(max(summary.CacheWriteTokens, 0), summary.InputTokens-summary.CachedTokens)
+	summary.NormalInputTokens = min(summary.NormalInputTokens, summary.InputTokens-summary.CachedTokens-summary.CacheWriteTokens)
+	summary.SentTokens = max(summary.SentTokens, 0)
 	if summary.InputTokens > 0 {
 		summary.CacheHitRate = float64(summary.CachedTokens) / float64(summary.InputTokens)
 	}
@@ -198,22 +209,29 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	}
 
 	type detailAggregate struct {
-		SuccessCount    int64
-		AttemptCount    int64
-		InputTokens     int64
-		OutputTokens    int64
-		CachedTokens    int64
-		EstimatedCost   int64
-		TotalDurationMS int64
-		FirstSeenUnix   int64
-		LastSeenUnix    int64
+		SuccessCount      int64
+		AttemptCount      int64
+		InputTokens       int64
+		NormalInputTokens int64
+		OutputTokens      int64
+		CachedTokens      int64
+		CacheWriteTokens  int64
+		SentTokens        int64
+		EstimatedCost     int64
+		UpstreamCost      int64
+		TotalDurationMS   int64
+		FirstSeenUnix     int64
+		LastSeenUnix      int64
 	}
 	var aggregate detailAggregate
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
 		Select("SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
 			"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
+			"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 			"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
-			"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
+			"COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, " +
+			"COALESCE(SUM(sent_tokens), 0) AS sent_tokens, " +
+			"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
 			"MIN(unixepoch(created_at)) AS first_seen_unix, MAX(unixepoch(created_at)) AS last_seen_unix").Scan(&aggregate).Error; err != nil {
 		return nil, err
 	}
@@ -226,9 +244,13 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		SuccessCount:      aggregate.SuccessCount,
 		AttemptCount:      aggregate.AttemptCount,
 		InputTokens:       aggregate.InputTokens,
+		NormalInputTokens: aggregate.NormalInputTokens,
 		OutputTokens:      aggregate.OutputTokens,
 		CachedTokens:      aggregate.CachedTokens,
+		CacheWriteTokens:  aggregate.CacheWriteTokens,
+		SentTokens:        aggregate.SentTokens,
 		EstimatedCost:     aggregate.EstimatedCost,
+		UpstreamCost:      aggregate.UpstreamCost,
 		FirstSeenAt:       time.Unix(aggregate.FirstSeenUnix, 0).UTC(),
 		LastSeenAt:        time.Unix(aggregate.LastSeenUnix, 0).UTC(),
 	}

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 const (
@@ -21,11 +22,12 @@ const (
 )
 
 type ChannelInput struct {
-	Name                string `json:"name"`
-	BaseURL             string `json:"baseUrl"`
-	APIKey              string `json:"apiKey"`
-	Enabled             bool   `json:"enabled"`
-	SupportsStreamUsage bool   `json:"supportsStreamUsage"`
+	Name                       string `json:"name"`
+	BaseURL                    string `json:"baseUrl"`
+	APIKey                     string `json:"apiKey"`
+	Enabled                    bool   `json:"enabled"`
+	SupportsStreamUsage        bool   `json:"supportsStreamUsage"`
+	PriceMultiplierBasisPoints *int64 `json:"priceMultiplierBasisPoints"`
 }
 
 type ChannelModelDiscoveryInput struct {
@@ -35,9 +37,12 @@ type ChannelModelDiscoveryInput struct {
 }
 
 type UpstreamModelView struct {
-	ID      string `json:"id"`
-	OwnedBy string `json:"ownedBy"`
-	Created int64  `json:"created"`
+	ID                 string              `json:"id"`
+	OwnedBy            string              `json:"ownedBy"`
+	Created            int64               `json:"created"`
+	PublicModelID      uint64              `json:"publicModelId"`
+	PublicModelCreated bool                `json:"publicModelCreated"`
+	OfficialPrice      *OfficialModelPrice `json:"officialPrice"`
 }
 
 type ChannelModelDiscovery struct {
@@ -75,14 +80,16 @@ type GatewayModelInput struct {
 }
 
 type ChannelModelInput struct {
-	ModelID                uint64 `json:"modelId"`
-	UpstreamModel          string `json:"upstreamModel"`
-	Priority               int    `json:"priority"`
-	Weight                 int    `json:"weight"`
-	InputPriceMicros       int64  `json:"inputPriceMicros"`
-	OutputPriceMicros      int64  `json:"outputPriceMicros"`
-	CachedInputPriceMicros *int64 `json:"cachedInputPriceMicros"`
-	Enabled                bool   `json:"enabled"`
+	ModelID                    uint64 `json:"modelId"`
+	UpstreamModel              string `json:"upstreamModel"`
+	Priority                   int    `json:"priority"`
+	Weight                     int    `json:"weight"`
+	InputPriceMicros           int64  `json:"inputPriceMicros"`
+	OutputPriceMicros          int64  `json:"outputPriceMicros"`
+	CachedInputPriceMicros     *int64 `json:"cachedInputPriceMicros"`
+	CacheWritePriceMicros      *int64 `json:"cacheWritePriceMicros"`
+	PriceMultiplierBasisPoints *int64 `json:"priceMultiplierBasisPoints"`
+	Enabled                    bool   `json:"enabled"`
 }
 
 type ClientTokenInput struct {
@@ -101,14 +108,18 @@ type ClientTokenView struct {
 }
 
 type TokenStatistics struct {
-	Requests       int64   `json:"requests"`
-	Successes      int64   `json:"successes"`
-	InputTokens    int64   `json:"inputTokens"`
-	OutputTokens   int64   `json:"outputTokens"`
-	CachedTokens   int64   `json:"cachedTokens"`
-	EstimatedCost  int64   `json:"estimatedCostMicros"`
-	AverageLatency float64 `json:"averageLatencyMs"`
-	Attempts       int64   `json:"attempts"`
+	Requests          int64   `json:"requests"`
+	Successes         int64   `json:"successes"`
+	InputTokens       int64   `json:"inputTokens"`
+	NormalInputTokens int64   `json:"normalInputTokens"`
+	OutputTokens      int64   `json:"outputTokens"`
+	CachedTokens      int64   `json:"cachedTokens"`
+	CacheWriteTokens  int64   `json:"cacheWriteTokens"`
+	SentTokens        int64   `json:"sentTokens"`
+	EstimatedCost     int64   `json:"estimatedCostMicros"`
+	UpstreamCost      int64   `json:"upstreamCostMicros"`
+	AverageLatency    float64 `json:"averageLatencyMs"`
+	Attempts          int64   `json:"attempts"`
 }
 
 type IssuedClientToken struct {
@@ -122,6 +133,7 @@ type DashboardSummary struct {
 	InputTokens    int64                `json:"inputTokens"`
 	OutputTokens   int64                `json:"outputTokens"`
 	EstimatedCost  int64                `json:"estimatedCostMicros"`
+	UpstreamCost   int64                `json:"upstreamCostMicros"`
 	AverageLatency float64              `json:"averageLatencyMs"`
 	Daily          []DashboardDaily     `json:"daily"`
 	Channels       []DashboardBreakdown `json:"channels"`
@@ -135,12 +147,14 @@ type DashboardDaily struct {
 	InputTokens   int64  `json:"inputTokens"`
 	OutputTokens  int64  `json:"outputTokens"`
 	EstimatedCost int64  `json:"estimatedCostMicros"`
+	UpstreamCost  int64  `json:"upstreamCostMicros"`
 }
 
 type DashboardBreakdown struct {
 	Name          string `json:"name"`
 	Requests      int64  `json:"requests"`
 	EstimatedCost int64  `json:"estimatedCostMicros"`
+	UpstreamCost  int64  `json:"upstreamCostMicros"`
 }
 
 type LogQuery struct {
@@ -202,6 +216,9 @@ func validateChannelInput(input ChannelInput, requireKey bool) (ChannelInput, er
 	input.BaseURL = baseURL
 	if requireKey && strings.TrimSpace(input.APIKey) == "" {
 		return input, errors.New("channel API key is required")
+	}
+	if input.PriceMultiplierBasisPoints != nil && (*input.PriceMultiplierBasisPoints < 0 || *input.PriceMultiplierBasisPoints > MaxPriceMultiplierBasisPoints) {
+		return input, errors.New("price multiplier must be between 0 and 100")
 	}
 	return input, nil
 }
@@ -311,12 +328,17 @@ func (s *ManagementService) CreateChannel(ctx context.Context, input ChannelInpu
 	if err != nil {
 		return nil, err
 	}
+	priceMultiplierBasisPoints := DefaultPriceMultiplierBasisPoints
+	if input.PriceMultiplierBasisPoints != nil {
+		priceMultiplierBasisPoints = *input.PriceMultiplierBasisPoints
+	}
 	channel := Channel{
-		Name:                input.Name,
-		BaseURL:             input.BaseURL,
-		APIKeyCipher:        cipherText,
-		Enabled:             input.Enabled,
-		SupportsStreamUsage: input.SupportsStreamUsage,
+		Name:                       input.Name,
+		BaseURL:                    input.BaseURL,
+		APIKeyCipher:               cipherText,
+		Enabled:                    input.Enabled,
+		SupportsStreamUsage:        input.SupportsStreamUsage,
+		PriceMultiplierBasisPoints: priceMultiplierBasisPoints,
 	}
 	if err := s.store.db.WithContext(ctx).Create(&channel).Error; err != nil {
 		return nil, err
@@ -342,6 +364,9 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 	channel.BaseURL = input.BaseURL
 	channel.Enabled = input.Enabled
 	channel.SupportsStreamUsage = input.SupportsStreamUsage
+	if input.PriceMultiplierBasisPoints != nil {
+		channel.PriceMultiplierBasisPoints = *input.PriceMultiplierBasisPoints
+	}
 	if strings.TrimSpace(input.APIKey) != "" {
 		channel.APIKeyCipher, err = s.store.secretBox.Encrypt(strings.TrimSpace(input.APIKey))
 		if err != nil {
@@ -399,23 +424,34 @@ func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID 
 		if input.Weight < 1 || input.Weight > 10000 {
 			return nil, errors.New("weight must be between 1 and 10000")
 		}
-		if input.InputPriceMicros < 0 || input.OutputPriceMicros < 0 || (input.CachedInputPriceMicros != nil && *input.CachedInputPriceMicros < 0) {
+		if input.InputPriceMicros < 0 || input.OutputPriceMicros < 0 ||
+			(input.CachedInputPriceMicros != nil && *input.CachedInputPriceMicros < 0) ||
+			(input.CacheWritePriceMicros != nil && *input.CacheWritePriceMicros < 0) {
 			return nil, errors.New("model prices cannot be negative")
+		}
+		priceMultiplierBasisPoints := DefaultPriceMultiplierBasisPoints
+		if input.PriceMultiplierBasisPoints != nil {
+			if *input.PriceMultiplierBasisPoints < 0 || *input.PriceMultiplierBasisPoints > MaxPriceMultiplierBasisPoints {
+				return nil, errors.New("price multiplier must be between 0 and 100")
+			}
+			priceMultiplierBasisPoints = *input.PriceMultiplierBasisPoints
 		}
 		var count int64
 		if err := s.store.db.WithContext(ctx).Model(&GatewayModel{}).Where("id = ?", input.ModelID).Count(&count).Error; err != nil || count == 0 {
 			return nil, fmt.Errorf("model %d does not exist", input.ModelID)
 		}
 		models = append(models, ChannelModel{
-			ChannelID:              channelID,
-			ModelID:                input.ModelID,
-			UpstreamModel:          strings.TrimSpace(input.UpstreamModel),
-			Priority:               input.Priority,
-			Weight:                 input.Weight,
-			InputPriceMicros:       input.InputPriceMicros,
-			OutputPriceMicros:      input.OutputPriceMicros,
-			CachedInputPriceMicros: input.CachedInputPriceMicros,
-			Enabled:                input.Enabled,
+			ChannelID:                  channelID,
+			ModelID:                    input.ModelID,
+			UpstreamModel:              strings.TrimSpace(input.UpstreamModel),
+			Priority:                   input.Priority,
+			Weight:                     input.Weight,
+			InputPriceMicros:           input.InputPriceMicros,
+			OutputPriceMicros:          input.OutputPriceMicros,
+			CachedInputPriceMicros:     input.CachedInputPriceMicros,
+			CacheWritePriceMicros:      input.CacheWritePriceMicros,
+			PriceMultiplierBasisPoints: priceMultiplierBasisPoints,
+			Enabled:                    input.Enabled,
 		})
 	}
 	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
@@ -524,8 +560,12 @@ func (s *ManagementService) tokenStatistics(ctx context.Context, tokenID uint64)
 	var total totals
 	err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).Select(
 		"COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, "+
-			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, "+
-			"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, "+
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, "+
+			"COALESCE(SUM(output_tokens),0) AS output_tokens, "+
+			"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, "+
+			"COALESCE(SUM(sent_tokens),0) AS sent_tokens, "+
+			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, "+
+			"COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
 			"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempts",
 	).Where("token_id = ?", tokenID).Scan(&total).Error
 	if err != nil {
@@ -690,7 +730,7 @@ func (s *ManagementService) DeleteToken(ctx context.Context, id uint64) error {
 }
 
 func (s *ManagementService) TestChannel(ctx context.Context, id uint64) (int64, int, error) {
-	discovery, err := s.DiscoverChannelModels(ctx, ChannelModelDiscoveryInput{ChannelID: id})
+	discovery, err := s.discoverChannelModels(ctx, ChannelModelDiscoveryInput{ChannelID: id}, false)
 	if discovery == nil {
 		return 0, 0, err
 	}
@@ -698,6 +738,10 @@ func (s *ManagementService) TestChannel(ctx context.Context, id uint64) (int64, 
 }
 
 func (s *ManagementService) DiscoverChannelModels(ctx context.Context, input ChannelModelDiscoveryInput) (*ChannelModelDiscovery, error) {
+	return s.discoverChannelModels(ctx, input, true)
+}
+
+func (s *ManagementService) discoverChannelModels(ctx context.Context, input ChannelModelDiscoveryInput, registerPublicModels bool) (*ChannelModelDiscovery, error) {
 	baseURL := strings.TrimSpace(input.BaseURL)
 	apiKey := strings.TrimSpace(input.APIKey)
 	var channel *Channel
@@ -729,7 +773,57 @@ func (s *ManagementService) DiscoverChannelModels(ctx context.Context, input Cha
 	if channel != nil {
 		s.updateDiscoveryHealth(channel.ID, discovery, discoverErr)
 	}
-	return discovery, discoverErr
+	if discoverErr != nil {
+		return discovery, discoverErr
+	}
+	if registerPublicModels {
+		if err := s.registerDiscoveredPublicModels(ctx, discovery); err != nil {
+			return discovery, fmt.Errorf("register discovered public models: %w", err)
+		}
+	}
+	return discovery, nil
+}
+
+func (s *ManagementService) registerDiscoveredPublicModels(ctx context.Context, discovery *ChannelModelDiscovery) error {
+	if discovery == nil || len(discovery.Models) == 0 {
+		return nil
+	}
+	return s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		for index := range discovery.Models {
+			modelView := &discovery.Models[index]
+			var publicModel GatewayModel
+			if err := db.Where("name = ?", modelView.ID).Limit(1).Find(&publicModel).Error; err != nil {
+				return err
+			}
+			if publicModel.ID != 0 {
+				modelView.PublicModelID = publicModel.ID
+				continue
+			}
+
+			publicModel = GatewayModel{
+				Name:            modelView.ID,
+				RoutingStrategy: RoutingPriorityWeighted,
+				Enabled:         true,
+			}
+			result := db.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "name"}},
+				DoNothing: true,
+			}).Create(&publicModel)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected > 0 {
+				modelView.PublicModelID = publicModel.ID
+				modelView.PublicModelCreated = true
+				continue
+			}
+			if err := db.Where("name = ?", modelView.ID).First(&publicModel).Error; err != nil {
+				return err
+			}
+			modelView.PublicModelID = publicModel.ID
+		}
+		return nil
+	})
 }
 
 func fetchUpstreamModels(ctx context.Context, baseURL string, apiKey string) (*ChannelModelDiscovery, error) {
@@ -793,7 +887,7 @@ func fetchUpstreamModels(ctx context.Context, baseURL string, apiKey string) (*C
 			continue
 		}
 		seen[model.ID] = struct{}{}
-		discovery.Models = append(discovery.Models, UpstreamModelView{ID: model.ID, OwnedBy: model.OwnedBy, Created: model.Created})
+		discovery.Models = append(discovery.Models, UpstreamModelView{ID: model.ID, OwnedBy: model.OwnedBy, Created: model.Created, OfficialPrice: OpenAIOfficialPrice(model.ID)})
 	}
 	sort.Slice(discovery.Models, func(i, j int) bool { return discovery.Models[i].ID < discovery.Models[j].ID })
 	return discovery, nil
@@ -822,13 +916,14 @@ func (s *ManagementService) Dashboard(ctx context.Context) (*DashboardSummary, e
 		InputTokens   int64
 		OutputTokens  int64
 		EstimatedCost int64
+		UpstreamCost  int64
 		DurationMS    int64
 	}
 	var total totals
 	err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).Select(
 		"COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, " +
 			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, " +
-			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(duration_ms),0) AS duration_ms",
+			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, COALESCE(SUM(duration_ms),0) AS duration_ms",
 	).Scan(&total).Error
 	if err != nil {
 		return nil, err
@@ -837,26 +932,27 @@ func (s *ManagementService) Dashboard(ctx context.Context) (*DashboardSummary, e
 	summary.InputTokens = total.InputTokens
 	summary.OutputTokens = total.OutputTokens
 	summary.EstimatedCost = total.EstimatedCost
+	summary.UpstreamCost = total.UpstreamCost
 	if total.Requests > 0 {
 		summary.SuccessRate = float64(total.Successes) / float64(total.Requests)
 		summary.AverageLatency = float64(total.DurationMS) / float64(total.Requests)
 	}
 	dailyCutoff := time.Now().UTC().AddDate(0, 0, -13).Format(time.DateOnly)
 	if err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).
-		Select("date, COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost").
+		Select("date, COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
 		Where("date >= ?", dailyCutoff).Group("date").Order("date asc").Scan(&summary.Daily).Error; err != nil {
 		return nil, err
 	}
 	detailCutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	if err := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
-		Select("c.name AS name, COUNT(*) AS requests, COALESCE(SUM(a.estimated_cost),0) AS estimated_cost").
+		Select("c.name AS name, COUNT(*) AS requests, COALESCE(SUM(a.estimated_cost),0) AS estimated_cost, COALESCE(SUM(a.upstream_cost),0) AS upstream_cost").
 		Joins("JOIN channels AS c ON c.id = a.channel_id").Where("a.created_at >= ?", detailCutoff).
-		Group("c.name").Order("estimated_cost desc").Limit(8).Scan(&summary.Channels).Error; err != nil {
+		Group("c.name").Order("upstream_cost desc").Limit(8).Scan(&summary.Channels).Error; err != nil {
 		return nil, err
 	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
-		Select("requested_model AS name, COUNT(*) AS requests, COALESCE(SUM(estimated_cost),0) AS estimated_cost").
-		Where("created_at >= ?", detailCutoff).Group("requested_model").Order("estimated_cost desc").Limit(8).Scan(&summary.Models).Error; err != nil {
+		Select("requested_model AS name, COUNT(*) AS requests, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
+		Where("created_at >= ?", detailCutoff).Group("requested_model").Order("upstream_cost desc").Limit(8).Scan(&summary.Models).Error; err != nil {
 		return nil, err
 	}
 	return summary, nil

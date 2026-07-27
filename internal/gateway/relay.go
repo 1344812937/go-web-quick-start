@@ -53,17 +53,24 @@ type relayExecution struct {
 	startedAt                time.Time
 	attempts                 int
 	usage                    Usage
-	totalCost                int64
+	normalInputTokens        int64
+	sentTokens               int64
+	estimatedCost            int64
+	upstreamCost             int64
 	usageSources             map[string]struct{}
+	costSources              map[string]struct{}
 }
 
 type attemptResult struct {
-	response    *http.Response
-	body        []byte
-	usage       Usage
-	cost        int64
-	latencyMS   int64
-	streamError error
+	response      *http.Response
+	body          []byte
+	usage         Usage
+	sentTokens    int64
+	estimatedCost int64
+	upstreamCost  int64
+	costSource    string
+	latencyMS     int64
+	streamError   error
 }
 
 func NewRelayService(store *Store, router *Router, estimator *TokenEstimator, configManager *config.ApplicationConfigManager) *RelayService {
@@ -99,6 +106,7 @@ func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, he
 		inputTokens:  s.estimator.EstimateJSON(rawBody),
 		startedAt:    time.Now(),
 		usageSources: make(map[string]struct{}),
+		costSources:  make(map[string]struct{}),
 	}
 	writer.Header().Set("X-Request-Id", execution.requestID)
 
@@ -123,7 +131,7 @@ func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, he
 		execution.attempts++
 		result, attemptErr := s.performAttempt(ctx, writer, headers, rawQuery, execution, candidate, index == maxAttempts-1, plan.Affinity)
 		if result != nil {
-			s.addUsage(execution, result.usage, result.cost)
+			s.addUsage(execution, result.usage, result.estimatedCost, result.upstreamCost, result.costSource, false)
 		}
 		if attemptErr == nil {
 			return nil
@@ -190,6 +198,8 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Gateway-Request-Id", execution.requestID)
 
+	sentTokens := s.estimator.EstimateJSON(body)
+	execution.sentTokens += sentTokens
 	started := time.Now()
 	response, requestErr := s.client.Do(request)
 	latency := time.Since(started).Milliseconds()
@@ -198,7 +208,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 		if ctx.Err() == nil && !errors.Is(requestErr, context.Canceled) {
 			s.recordChannelFailure(logCtx, candidate.Channel.ID, requestErr.Error())
 		}
-		s.recordAttempt(logCtx, execution, candidate, attemptResult{latencyMS: latency}, 0, false, requestErr)
+		s.recordAttempt(logCtx, execution, candidate, attemptResult{sentTokens: sentTokens, latencyMS: latency}, 0, false, requestErr)
 		return nil, requestErr
 	}
 
@@ -207,15 +217,14 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 		responseBody, readErr := io.ReadAll(response.Body)
 		_ = response.Body.Close()
 		usage, _ := ParseUsage(responseBody)
-		cost := CalculateCostMicros(candidate.Mapping, usage)
-		result := &attemptResult{response: response, body: responseBody, usage: usage, cost: cost, latencyMS: latency}
+		result := &attemptResult{response: response, body: responseBody, usage: usage, sentTokens: sentTokens, costSource: CostSourceFailedZero, latencyMS: latency}
 		s.recordChannelFailure(logCtx, candidate.Channel.ID, fmt.Sprintf("HTTP %d", response.StatusCode))
 		s.recordAttempt(logCtx, execution, candidate, *result, response.StatusCode, false, readErr)
 		if readErr != nil {
 			return result, readErr
 		}
 		if lastAttempt && !affinity {
-			s.addUsage(execution, usage, cost)
+			s.addUsage(execution, usage, 0, 0, CostSourceFailedZero, false)
 			s.recordRequest(logCtx, execution, response.StatusCode, upstreamErrorCode(responseBody))
 			writeBufferedResponse(writer, response, responseBody)
 			return nil, nil
@@ -224,7 +233,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	}
 
 	if execution.payload.Stream && isEventStream(response.Header) && response.StatusCode >= 200 && response.StatusCode < 300 {
-		return s.streamResponse(ctx, writer, execution, candidate, response, latency)
+		return s.streamResponse(ctx, writer, execution, candidate, response, latency, sentTokens)
 	}
 
 	responseBody, readErr := io.ReadAll(response.Body)
@@ -233,9 +242,9 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	if !hasUsage && response.StatusCode >= 200 && response.StatusCode < 300 {
 		usage = Usage{InputTokens: execution.inputTokens, OutputTokens: s.estimator.EstimateJSON(responseBody), Source: "estimated_tiktoken"}
 	}
-	cost := CalculateCostMicros(candidate.Mapping, usage)
-	result := &attemptResult{response: response, body: responseBody, usage: usage, cost: cost, latencyMS: latency}
 	success := response.StatusCode >= 200 && response.StatusCode < 300 && readErr == nil
+	estimatedCost, upstreamCost, costSource := attemptCosts(candidate.Mapping, usage, responseBody, success)
+	result := &attemptResult{response: response, body: responseBody, usage: usage, sentTokens: sentTokens, estimatedCost: estimatedCost, upstreamCost: upstreamCost, costSource: costSource, latencyMS: latency}
 	if readErr != nil {
 		s.recordChannelFailure(logCtx, candidate.Channel.ID, readErr.Error())
 	} else if success {
@@ -247,7 +256,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	if readErr != nil {
 		return result, readErr
 	}
-	s.addUsage(execution, usage, cost)
+	s.addUsage(execution, usage, estimatedCost, upstreamCost, costSource, success)
 	code := upstreamErrorCode(responseBody)
 	s.recordRequest(logCtx, execution, response.StatusCode, code)
 	if execution.endpoint == "responses" && success {
@@ -260,7 +269,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	return nil, nil
 }
 
-func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseWriter, execution *relayExecution, candidate RouteCandidate, response *http.Response, latency int64) (*attemptResult, error) {
+func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseWriter, execution *relayExecution, candidate RouteCandidate, response *http.Response, latency int64, sentTokens int64) (*attemptResult, error) {
 	reader := bufio.NewReader(response.Body)
 	firstEvent, err := readSSEEvent(reader)
 	if err != nil || len(firstEvent) == 0 {
@@ -272,7 +281,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 		if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
 			s.recordChannelFailure(logCtx, candidate.Channel.ID, err.Error())
 		}
-		result := attemptResult{response: response, latencyMS: latency, streamError: err}
+		result := attemptResult{response: response, sentTokens: sentTokens, latencyMS: latency, streamError: err}
 		s.recordAttempt(logCtx, execution, candidate, result, response.StatusCode, false, err)
 		return &result, err
 	}
@@ -281,12 +290,13 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	writer.WriteHeader(response.StatusCode)
 	flusher, _ := writer.(http.Flusher)
 	usage := Usage{}
+	upstreamCost := upstreamCostSnapshot{}
 	outputEstimate := int64(0)
 	responseID := ""
-	consumeSSEEvent(firstEvent, s.estimator, &usage, &outputEstimate, &responseID)
+	consumeSSEEvent(firstEvent, s.estimator, &usage, &upstreamCost, &outputEstimate, &responseID)
 	if _, writeErr := writer.Write(firstEvent); writeErr != nil {
 		_ = response.Body.Close()
-		s.finishStream(ctx, execution, candidate, response, latency, usage, outputEstimate, responseID, writeErr, true)
+		s.finishStream(ctx, execution, candidate, response, latency, sentTokens, usage, upstreamCost, outputEstimate, responseID, writeErr, true)
 		return nil, nil
 	}
 	if flusher != nil {
@@ -298,7 +308,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	for {
 		event, readErr := readSSEEvent(reader)
 		if len(event) > 0 {
-			consumeSSEEvent(event, s.estimator, &usage, &outputEstimate, &responseID)
+			consumeSSEEvent(event, s.estimator, &usage, &upstreamCost, &outputEstimate, &responseID)
 			if _, writeErr := writer.Write(event); writeErr != nil {
 				streamErr = writeErr
 				downstreamError = true
@@ -316,25 +326,37 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 		}
 	}
 	_ = response.Body.Close()
-	s.finishStream(ctx, execution, candidate, response, latency, usage, outputEstimate, responseID, streamErr, downstreamError)
+	s.finishStream(ctx, execution, candidate, response, latency, sentTokens, usage, upstreamCost, outputEstimate, responseID, streamErr, downstreamError)
 	return nil, nil
 }
 
-func (s *RelayService) finishStream(ctx context.Context, execution *relayExecution, candidate RouteCandidate, response *http.Response, latency int64, usage Usage, outputEstimate int64, responseID string, streamErr error, downstreamError bool) {
+func (s *RelayService) finishStream(ctx context.Context, execution *relayExecution, candidate RouteCandidate, response *http.Response, latency int64, sentTokens int64, usage Usage, upstreamSnapshot upstreamCostSnapshot, outputEstimate int64, responseID string, streamErr error, downstreamError bool) {
 	if usage.Source == "" {
 		usage = Usage{InputTokens: execution.inputTokens, OutputTokens: outputEstimate, Source: "estimated_tiktoken"}
 	}
-	cost := CalculateCostMicros(candidate.Mapping, usage)
-	result := attemptResult{response: response, usage: usage, cost: cost, latencyMS: latency, streamError: streamErr}
 	logCtx := context.WithoutCancel(ctx)
 	clientCanceled := downstreamError || ctx.Err() != nil || errors.Is(streamErr, context.Canceled)
+	success := streamErr == nil && !clientCanceled
+	estimatedCost := int64(0)
+	upstreamCost := int64(0)
+	costSource := CostSourceFailedZero
+	if success {
+		estimatedCost = CalculateCostMicros(candidate.Mapping, usage)
+		upstreamCost = estimatedCost
+		costSource = CostSourceFallback
+		if upstreamSnapshot.valid {
+			upstreamCost = upstreamSnapshot.micros
+			costSource = CostSourceUpstream
+		}
+	}
+	result := attemptResult{response: response, usage: usage, sentTokens: sentTokens, estimatedCost: estimatedCost, upstreamCost: upstreamCost, costSource: costSource, latencyMS: latency, streamError: streamErr}
 	if streamErr == nil || clientCanceled {
 		s.recordChannelSuccess(logCtx, candidate.Channel.ID, latency)
 	} else {
 		s.recordChannelFailure(logCtx, candidate.Channel.ID, streamErr.Error())
 	}
-	s.recordAttempt(logCtx, execution, candidate, result, response.StatusCode, streamErr == nil, streamErr)
-	s.addUsage(execution, usage, cost)
+	s.recordAttempt(logCtx, execution, candidate, result, response.StatusCode, success, streamErr)
+	s.addUsage(execution, usage, estimatedCost, upstreamCost, costSource, success)
 	requestStatus := response.StatusCode
 	errorCode := ""
 	if clientCanceled {
@@ -383,7 +405,12 @@ func readSSEEvent(reader *bufio.Reader) ([]byte, error) {
 	}
 }
 
-func consumeSSEEvent(event []byte, estimator *TokenEstimator, usage *Usage, outputEstimate *int64, responseID *string) {
+type upstreamCostSnapshot struct {
+	micros int64
+	valid  bool
+}
+
+func consumeSSEEvent(event []byte, estimator *TokenEstimator, usage *Usage, upstreamCost *upstreamCostSnapshot, outputEstimate *int64, responseID *string) {
 	for _, line := range bytes.Split(event, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -395,6 +422,10 @@ func consumeSSEEvent(event []byte, estimator *TokenEstimator, usage *Usage, outp
 		}
 		if parsed, ok := ParseUsage(data); ok {
 			*usage = parsed
+		}
+		if micros, ok := ParseUpstreamCostMicros(data); ok {
+			upstreamCost.micros = micros
+			upstreamCost.valid = true
 		}
 		*outputEstimate += estimator.EstimateJSON(data)
 		if *responseID == "" {
@@ -480,13 +511,32 @@ func (r *idleReadCloser) Read(buffer []byte) (int, error) {
 	}
 }
 
-func (s *RelayService) addUsage(execution *relayExecution, usage Usage, cost int64) {
+func attemptCosts(mapping ChannelModel, usage Usage, responseBody []byte, success bool) (int64, int64, string) {
+	if !success {
+		return 0, 0, CostSourceFailedZero
+	}
+	estimatedCost := CalculateCostMicros(mapping, usage)
+	if upstreamCost, ok := ParseUpstreamCostMicros(responseBody); ok {
+		return estimatedCost, upstreamCost, CostSourceUpstream
+	}
+	return estimatedCost, estimatedCost, CostSourceFallback
+}
+
+func (s *RelayService) addUsage(execution *relayExecution, usage Usage, estimatedCost int64, upstreamCost int64, costSource string, billable bool) {
 	execution.usage.InputTokens += usage.InputTokens
+	execution.normalInputTokens += normalInputTokens(usage)
 	execution.usage.OutputTokens += usage.OutputTokens
 	execution.usage.CachedTokens += usage.CachedTokens
-	execution.totalCost += cost
+	execution.usage.CacheWriteTokens += usage.CacheWriteTokens
 	if usage.Source != "" {
 		execution.usageSources[usage.Source] = struct{}{}
+	}
+	if billable {
+		execution.estimatedCost += estimatedCost
+		execution.upstreamCost += upstreamCost
+		if costSource != "" {
+			execution.costSources[costSource] = struct{}{}
+		}
 	}
 }
 
@@ -498,22 +548,32 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 			message = message[:2000]
 		}
 	}
+	if !success {
+		result.estimatedCost = 0
+		result.upstreamCost = 0
+		result.costSource = CostSourceFailedZero
+	}
 	log := RelayAttemptLog{
-		RequestID:      execution.requestID,
-		ChannelID:      candidate.Channel.ID,
-		ChannelName:    candidate.Channel.Name,
-		ChannelBaseURL: candidate.Channel.BaseURL,
-		ChannelModelID: candidate.Mapping.ID,
-		UpstreamModel:  candidate.Mapping.UpstreamModel,
-		StatusCode:     status,
-		InputTokens:    result.usage.InputTokens,
-		OutputTokens:   result.usage.OutputTokens,
-		CachedTokens:   result.usage.CachedTokens,
-		EstimatedCost:  result.cost,
-		UsageSource:    result.usage.Source,
-		LatencyMS:      result.latencyMS,
-		Success:        success,
-		ErrorMessage:   message,
+		RequestID:         execution.requestID,
+		ChannelID:         candidate.Channel.ID,
+		ChannelName:       candidate.Channel.Name,
+		ChannelBaseURL:    candidate.Channel.BaseURL,
+		ChannelModelID:    candidate.Mapping.ID,
+		UpstreamModel:     candidate.Mapping.UpstreamModel,
+		StatusCode:        status,
+		InputTokens:       result.usage.InputTokens,
+		NormalInputTokens: normalInputTokens(result.usage),
+		OutputTokens:      result.usage.OutputTokens,
+		CachedTokens:      result.usage.CachedTokens,
+		CacheWriteTokens:  result.usage.CacheWriteTokens,
+		SentTokens:        result.sentTokens,
+		EstimatedCost:     result.estimatedCost,
+		UpstreamCost:      result.upstreamCost,
+		CostSource:        result.costSource,
+		UsageSource:       result.usage.Source,
+		LatencyMS:         result.latencyMS,
+		Success:           success,
+		ErrorMessage:      message,
 	}
 	_ = s.store.db.WithContext(ctx).Create(&log).Error
 }
@@ -526,6 +586,21 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		}
 	} else if len(execution.usageSources) > 1 {
 		usageSource = "mixed"
+	}
+	costSource := CostSourceFailedZero
+	if len(execution.costSources) == 1 {
+		for source := range execution.costSources {
+			costSource = source
+		}
+	} else if len(execution.costSources) > 1 {
+		costSource = CostSourceMixed
+	}
+	estimatedCost := execution.estimatedCost
+	upstreamCost := execution.upstreamCost
+	if status < 200 || status >= 300 {
+		estimatedCost = 0
+		upstreamCost = 0
+		costSource = CostSourceFailedZero
 	}
 	now := time.Now().UTC()
 	log := RelayRequestLog{
@@ -540,9 +615,14 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		RequestParametersJSON: execution.payload.RequestParametersJSON,
 		StatusCode:            status,
 		InputTokens:           execution.usage.InputTokens,
+		NormalInputTokens:     execution.normalInputTokens,
 		OutputTokens:          execution.usage.OutputTokens,
 		CachedTokens:          execution.usage.CachedTokens,
-		EstimatedCost:         execution.totalCost,
+		CacheWriteTokens:      execution.usage.CacheWriteTokens,
+		SentTokens:            execution.sentTokens,
+		EstimatedCost:         estimatedCost,
+		UpstreamCost:          upstreamCost,
+		CostSource:            costSource,
 		UsageSource:           usageSource,
 		AttemptCount:          execution.attempts,
 		DurationMS:            time.Since(execution.startedAt).Milliseconds(),
@@ -555,18 +635,22 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		successCount = 1
 	}
 	stat := TokenDailyStat{
-		Date:          now.Format(time.DateOnly),
-		TokenID:       execution.token.ID,
-		RequestCount:  1,
-		SuccessCount:  successCount,
-		InputTokens:   log.InputTokens,
-		OutputTokens:  log.OutputTokens,
-		CachedTokens:  log.CachedTokens,
-		EstimatedCost: log.EstimatedCost,
-		DurationMS:    log.DurationMS,
-		AttemptCount:  int64(log.AttemptCount),
-		CreatedAt:     now,
-		UpdatedAt:     now,
+		Date:              now.Format(time.DateOnly),
+		TokenID:           execution.token.ID,
+		RequestCount:      1,
+		SuccessCount:      successCount,
+		InputTokens:       log.InputTokens,
+		NormalInputTokens: log.NormalInputTokens,
+		OutputTokens:      log.OutputTokens,
+		CachedTokens:      log.CachedTokens,
+		CacheWriteTokens:  log.CacheWriteTokens,
+		SentTokens:        log.SentTokens,
+		EstimatedCost:     log.EstimatedCost,
+		UpstreamCost:      log.UpstreamCost,
+		DurationMS:        log.DurationMS,
+		AttemptCount:      int64(log.AttemptCount),
+		CreatedAt:         now,
+		UpdatedAt:         now,
 	}
 	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
 		if err := db.Create(&log).Error; err != nil {
@@ -575,15 +659,19 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		return db.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "date"}, {Name: "token_id"}},
 			DoUpdates: clause.Assignments(map[string]any{
-				"request_count":  gorm.Expr("request_count + excluded.request_count"),
-				"success_count":  gorm.Expr("success_count + excluded.success_count"),
-				"input_tokens":   gorm.Expr("input_tokens + excluded.input_tokens"),
-				"output_tokens":  gorm.Expr("output_tokens + excluded.output_tokens"),
-				"cached_tokens":  gorm.Expr("cached_tokens + excluded.cached_tokens"),
-				"estimated_cost": gorm.Expr("estimated_cost + excluded.estimated_cost"),
-				"duration_ms":    gorm.Expr("duration_ms + excluded.duration_ms"),
-				"attempt_count":  gorm.Expr("attempt_count + excluded.attempt_count"),
-				"updated_at":     now,
+				"request_count":       gorm.Expr("request_count + excluded.request_count"),
+				"success_count":       gorm.Expr("success_count + excluded.success_count"),
+				"input_tokens":        gorm.Expr("input_tokens + excluded.input_tokens"),
+				"normal_input_tokens": gorm.Expr("normal_input_tokens + excluded.normal_input_tokens"),
+				"output_tokens":       gorm.Expr("output_tokens + excluded.output_tokens"),
+				"cached_tokens":       gorm.Expr("cached_tokens + excluded.cached_tokens"),
+				"cache_write_tokens":  gorm.Expr("cache_write_tokens + excluded.cache_write_tokens"),
+				"sent_tokens":         gorm.Expr("sent_tokens + excluded.sent_tokens"),
+				"estimated_cost":      gorm.Expr("estimated_cost + excluded.estimated_cost"),
+				"upstream_cost":       gorm.Expr("upstream_cost + excluded.upstream_cost"),
+				"duration_ms":         gorm.Expr("duration_ms + excluded.duration_ms"),
+				"attempt_count":       gorm.Expr("attempt_count + excluded.attempt_count"),
+				"updated_at":          now,
 			}),
 		}).Create(&stat).Error
 	})

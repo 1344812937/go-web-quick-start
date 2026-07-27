@@ -14,6 +14,9 @@ const dialogOpen = ref(false)
 const secretDialogOpen = ref(false)
 const issuedSecret = ref('')
 const editingId = ref<number | null>(null)
+const rotatingTokenId = ref<number | null>(null)
+const revokingTokenId = ref<number | null>(null)
+const copyingSecret = ref(false)
 const form = reactive({ name: '', enabled: true, allowAllModels: true, rpm: 60, maxConcurrency: 10, modelIds: [] as number[] })
 const dialogTitle = computed(() => editingId.value ? '编辑访问令牌' : '签发访问令牌')
 
@@ -88,27 +91,34 @@ function showSecret(secret: string) {
 }
 
 async function copySecret() {
+  copyingSecret.value = true
   try {
     await navigator.clipboard.writeText(issuedSecret.value)
     ElMessage.success('令牌已复制')
   } catch {
     ElMessage.error('无法访问剪贴板，请手动选择令牌')
+  } finally {
+    copyingSecret.value = false
   }
 }
 
 async function rotateToken(token: ClientToken) {
   await ElMessageBox.confirm(`轮换“${token.name}”后，旧令牌会立即失效。`, '轮换令牌', { type: 'warning', confirmButtonText: '轮换', cancelButtonText: '取消' })
+  rotatingTokenId.value = token.id
   try {
     const issued = await request<IssuedClientToken>(`/admin/gateway/tokens/${token.id}/rotate`, { method: 'POST' })
     showSecret(issued.secret)
     await loadData()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '令牌轮换失败')
+  } finally {
+    rotatingTokenId.value = null
   }
 }
 
 async function revokeToken(token: ClientToken) {
   await ElMessageBox.confirm(`吊销“${token.name}”？现有客户端将无法继续调用。`, '吊销令牌', { type: 'warning', confirmButtonText: '吊销', cancelButtonText: '取消' })
+  revokingTokenId.value = token.id
   try {
     await request<ClientToken>(`/admin/gateway/tokens/${token.id}`, {
       method: 'PUT',
@@ -118,6 +128,8 @@ async function revokeToken(token: ClientToken) {
     await loadData()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '令牌吊销失败')
+  } finally {
+    revokingTokenId.value = null
   }
 }
 
@@ -143,7 +155,7 @@ onMounted(loadData)
       <div class="page-actions"><el-button :icon="Refresh" :loading="loading" @click="loadData">刷新</el-button><el-button type="primary" :icon="Plus" @click="openEditor()">签发令牌</el-button></div>
     </header>
 
-    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>访问令牌加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadData">重试</el-button></div>
+    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>访问令牌加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="tokens" row-key="id" empty-text="还没有访问令牌">
         <el-table-column label="令牌" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small><code>{{ scope.row.keyPrefix }}</code></small></div></template></el-table-column>
@@ -151,9 +163,9 @@ onMounted(loadData)
         <el-table-column label="模型权限" min-width="190"><template #default="scope"><span class="clamped-text">{{ modelNames(scope.row) }}</span></template></el-table-column>
         <el-table-column label="RPM" width="88" align="right" prop="rpm" />
         <el-table-column label="并发" width="88" align="right" prop="maxConcurrency" />
-        <el-table-column label="累计统计" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ formatInteger(scope.row.statistics.requests) }} 次 · {{ formatUSD(scope.row.statistics.estimatedCostMicros) }}</strong><small>{{ formatInteger(scope.row.statistics.inputTokens + scope.row.statistics.outputTokens) }} Tokens</small></div></template></el-table-column>
+        <el-table-column label="累计统计" min-width="220"><template #default="scope"><div class="primary-cell"><strong>{{ formatInteger(scope.row.statistics.requests) }} 次 · {{ formatUSD(scope.row.statistics.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.statistics.estimatedCostMicros) }} · {{ formatInteger(scope.row.statistics.inputTokens + scope.row.statistics.outputTokens) }} Tokens</small></div></template></el-table-column>
         <el-table-column label="最近使用" width="154"><template #default="scope">{{ formatDate(scope.row.lastUsedAt) }}</template></el-table-column>
-        <el-table-column label="操作" width="252" fixed="right"><template #default="scope"><el-button text :icon="Edit" @click="openEditor(scope.row)">编辑</el-button><el-button text :icon="RefreshRight" @click="rotateToken(scope.row)">轮换</el-button><el-button v-if="scope.row.enabled" text type="danger" :icon="CircleClose" @click="revokeToken(scope.row)">吊销</el-button></template></el-table-column>
+        <el-table-column label="操作" width="252" fixed="right"><template #default="scope"><el-button text :icon="Edit" :disabled="rotatingTokenId === scope.row.id || revokingTokenId === scope.row.id" @click="openEditor(scope.row)">编辑</el-button><el-button text :icon="RefreshRight" :loading="rotatingTokenId === scope.row.id" :disabled="revokingTokenId === scope.row.id" @click="rotateToken(scope.row)">轮换</el-button><el-button v-if="scope.row.enabled" text type="danger" :icon="CircleClose" :loading="revokingTokenId === scope.row.id" :disabled="rotatingTokenId === scope.row.id" @click="revokeToken(scope.row)">吊销</el-button></template></el-table-column>
       </el-table>
       <div v-if="!loading && tokens.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="openEditor()">签发第一个令牌</el-button></div>
     </section>
@@ -172,7 +184,7 @@ onMounted(loadData)
     </el-dialog>
 
     <el-dialog v-model="secretDialogOpen" title="令牌已签发" width="min(600px, calc(100vw - 32px))" :close-on-click-modal="false">
-      <div class="secret-once"><strong>完整令牌仅显示一次</strong><p>关闭后只能轮换，无法再次查看。</p><code>{{ issuedSecret }}</code><el-button type="primary" :icon="CopyDocument" @click="copySecret">复制令牌</el-button></div>
+      <div class="secret-once"><strong>完整令牌仅显示一次</strong><p>关闭后只能轮换，无法再次查看。</p><code>{{ issuedSecret }}</code><el-button type="primary" :icon="CopyDocument" :loading="copyingSecret" @click="copySecret">复制令牌</el-button></div>
       <template #footer><el-button type="primary" @click="secretDialogOpen = false">我已保存</el-button></template>
     </el-dialog>
   </div>

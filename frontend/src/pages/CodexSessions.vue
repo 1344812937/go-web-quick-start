@@ -116,10 +116,10 @@ onMounted(async () => {
       <el-select v-model="filters.channelId" clearable placeholder="全部渠道"><el-option v-for="channel in channels" :key="channel.id" :label="channel.name" :value="String(channel.id)" /></el-select>
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
-      <el-button type="primary" :icon="Search" @click="searchSessions">查询</el-button>
+      <el-button class="filter-action" type="primary" :icon="Search" :loading="loading" @click="searchSessions">查询</el-button>
     </section>
 
-    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadSessions">重试</el-button></div>
+    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="sessions" :row-key="sessionRowKey" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
         <el-table-column label="Codex 会话" min-width="240">
@@ -138,12 +138,22 @@ onMounted(async () => {
         </el-table-column>
         <el-table-column label="模型 / 调用令牌" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.latestModel }}</strong><small>{{ scope.row.tokenName || `令牌 #${scope.row.tokenId}` }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
         <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ scope.row.requestCount }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ scope.row.attemptCount }} 次尝试</small></div></template></el-table-column>
-        <el-table-column label="Token（入 / 出 / 缓存）" min-width="190" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatTokens(scope.row.inputTokens) }} / {{ formatTokens(scope.row.outputTokens) }} / {{ formatTokens(scope.row.cachedTokens) }}</strong><small>缓存命中 {{ formatPercent(scope.row.cacheHitRate) }}</small></div></template></el-table-column>
-        <el-table-column label="费用 / 平均耗时" width="148" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.estimatedCostMicros) }}</strong><small>{{ Math.round(scope.row.averageDurationMs) }} ms</small></div></template></el-table-column>
+        <el-table-column label="Token 明细" min-width="280">
+          <template #default="scope">
+            <div class="session-tokens">
+              <span><small>普通输入</small><strong>{{ formatTokens(scope.row.normalInputTokens) }}</strong></span>
+              <span><small>输出</small><strong>{{ formatTokens(scope.row.outputTokens) }}</strong></span>
+              <span><small>缓存读</small><strong>{{ formatTokens(scope.row.cachedTokens) }}</strong></span>
+              <span><small>缓存写</small><strong>{{ formatTokens(scope.row.cacheWriteTokens) }}</strong></span>
+              <span class="session-sent"><small>真实发送（本地分词）</small><strong>{{ formatTokens(scope.row.sentTokens) }}</strong></span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="费用 / 平均耗时" width="170" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }} · {{ Math.round(scope.row.averageDurationMs) }} ms</small></div></template></el-table-column>
         <el-table-column label="最近调用" width="168"><template #default="scope">{{ formatDate(scope.row.lastSeenAt) }}</template></el-table-column>
         <el-table-column label="详情" width="70" fixed="right"><template #default="scope"><el-button text :icon="View" title="查看会话详情" @click.stop="openSession(scope.row)" /></template></el-table-column>
       </el-table>
-      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
+      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
     </section>
 
     <SessionLogDrawer v-model="drawerOpen" :summary="selectedSession" />
@@ -158,4 +168,9 @@ onMounted(async () => {
 .numeric-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
 .numeric-cell strong { color: var(--rose-text); }
 .numeric-cell small { color: var(--rose-text-muted); font-size: 11px; }
+.session-tokens { display: grid; grid-template-columns: repeat(4, minmax(52px, 1fr)); gap: 4px 9px; font-variant-numeric: tabular-nums; }
+.session-tokens > span { display: grid; gap: 1px; }
+.session-tokens small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
+.session-tokens strong { color: var(--rose-text); font-size: 12px; }
+.session-sent { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
 </style>

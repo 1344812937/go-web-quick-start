@@ -7,17 +7,20 @@ import AdminLogin from '@/components/AdminLogin.vue'
 import ChangePasswordDialog from '@/components/ChangePasswordDialog.vue'
 import SidebarMenuItem from '@/components/SidebarMenuItem.vue'
 import { useAdminAuth } from '@/composables/useAdminAuth'
+import { useRequestActivity } from '@/composables/useRequestActivity'
 import projectMeta from '@/config/project.generated.js'
 import { navigationGroups, type NavigationItem } from '@/navigation'
 
 const route = useRoute()
 const auth = useAdminAuth()
+const { isRequestActive } = useRequestActivity()
 const { checking, authenticated, user } = auth
 const sidebarCollapsed = ref(false)
 const mobileOpen = ref(false)
 const isMobileViewport = ref(false)
 const searchQuery = ref('')
 const passwordDialogOpen = ref(false)
+const logoutLoading = ref(false)
 let mobileMediaQuery: MediaQueryList | null = null
 
 function filterNavigationItems(items: NavigationItem[], query: string): NavigationItem[] {
@@ -75,12 +78,15 @@ async function handleAccountCommand(command: string) {
     passwordDialogOpen.value = true
     return
   }
-  if (command === 'logout') {
-    try {
-      await auth.logout()
+	if (command === 'logout') {
+		logoutLoading.value = true
+		try {
+			await auth.logout()
     } catch (error) {
       ElMessage.error(error instanceof Error ? error.message : '退出登录失败')
-    }
+		} finally {
+			logoutLoading.value = false
+		}
   }
 }
 
@@ -108,11 +114,12 @@ watch(() => route.path, () => {
 
   <AdminLogin v-else-if="!authenticated" />
 
-  <div
+	<div
     v-else
     class="app-shell"
     :class="{ 'is-sidebar-collapsed': sidebarCollapsed, 'is-mobile-open': mobileOpen }"
-  >
+	>
+		<div v-show="isRequestActive" class="request-progress" role="progressbar" aria-label="接口请求处理中"><span></span></div>
     <a class="skip-link" href="#workspace-content">跳到主内容</a>
     <header class="app-header">
       <div class="header-brand">
@@ -129,7 +136,7 @@ watch(() => route.path, () => {
       <div class="header-actions">
         <span class="header-status"><i aria-hidden="true"></i>网关就绪</span>
         <el-dropdown trigger="click" @command="handleAccountCommand">
-          <button class="account-button" type="button">
+			<button class="account-button" type="button" :disabled="logoutLoading">
             <span class="account-avatar" aria-hidden="true">{{ user?.username.slice(0, 1).toUpperCase() }}</span>
             <span>{{ user?.username }}</span>
             <ArrowDown />
@@ -137,7 +144,7 @@ watch(() => route.path, () => {
           <template #dropdown>
             <el-dropdown-menu>
               <el-dropdown-item command="password">修改密码</el-dropdown-item>
-              <el-dropdown-item command="logout" divided>退出登录</el-dropdown-item>
+				<el-dropdown-item command="logout" divided :disabled="logoutLoading">{{ logoutLoading ? '正在退出' : '退出登录' }}</el-dropdown-item>
             </el-dropdown-menu>
           </template>
         </el-dropdown>
@@ -204,3 +211,11 @@ watch(() => route.path, () => {
     <ChangePasswordDialog v-model="passwordDialogOpen" />
   </div>
 </template>
+
+<style scoped>
+.request-progress { position: fixed; z-index: 3000; top: 0; right: 0; left: 0; height: 2px; overflow: hidden; pointer-events: none; }
+.request-progress span { display: block; width: 38%; height: 100%; background: var(--rose-primary); animation: request-progress-slide 1s ease-in-out infinite; }
+.account-button:disabled { cursor: wait; opacity: 0.72; }
+@keyframes request-progress-slide { from { transform: translateX(-110%); } to { transform: translateX(360%); } }
+@media (prefers-reduced-motion: reduce) { .request-progress span { width: 100%; animation: none; } }
+</style>

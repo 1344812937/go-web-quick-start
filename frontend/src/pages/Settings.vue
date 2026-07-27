@@ -61,7 +61,7 @@ onMounted(loadSettings)
       <el-button :icon="Refresh" :loading="loading" @click="loadSettings">重新加载</el-button>
     </header>
 
-    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>系统设置加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadSettings">重试</el-button></div>
+    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>系统设置加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSettings">重试</el-button></div>
     <el-skeleton v-else-if="loading" :rows="10" animated />
     <el-form v-else label-position="top" class="settings-form" @submit.prevent="saveSettings">
       <section class="surface-panel settings-section">

@@ -41,6 +41,19 @@ function usageSource(value: string): string {
   return '未知'
 }
 
+function costSource(value: RelayRequestLog['costSource']): string {
+  if (value === 'upstream') return '上游返回'
+  if (value === 'estimated_fallback') return '估算回退'
+  if (value === 'mixed') return '混合'
+  return '失败为零'
+}
+
+function costSourceType(value: RelayRequestLog['costSource']): 'success' | 'warning' | 'danger' | 'info' {
+  if (value === 'upstream') return 'success'
+  if (value === 'estimated_fallback' || value === 'mixed') return 'warning'
+  return 'info'
+}
+
 function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
   if (status >= 200 && status < 300) return 'success'
   if (status === 408 || status === 429) return 'warning'
@@ -97,7 +110,7 @@ onMounted(async () => {
 <template>
   <div class="page-stack">
     <header class="page-heading">
-      <div><h1>调用日志</h1><p>查看最近 5 天的请求状态、重试尝试、usage 来源与估算费用</p></div>
+      <div><h1>调用日志</h1><p>查看最近 5 天的请求状态、重试尝试、usage 来源与双费用口径</p></div>
       <el-button :icon="Refresh" :loading="loading" @click="loadLogs">刷新</el-button>
     </header>
 
@@ -107,10 +120,10 @@ onMounted(async () => {
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
       <el-select v-model="filters.status" clearable placeholder="全部状态"><el-option label="成功 2xx" value="200" /><el-option label="限流 429" value="429" /><el-option label="服务不可用 503" value="503" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
-      <el-button type="primary" :icon="Search" @click="searchLogs">查询</el-button>
+      <el-button class="filter-action" type="primary" :icon="Search" :loading="loading" @click="searchLogs">查询</el-button>
     </section>
 
-    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button @click="loadLogs">重试</el-button></div>
+    <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="logs" row-key="id" empty-text="当前筛选条件下没有调用日志">
         <el-table-column type="expand">
@@ -123,9 +136,15 @@ onMounted(async () => {
                 <div><strong>{{ attempt.channelName || channelName(attempt.channelId) }}</strong><small><code>{{ attempt.upstreamModel }}</code></small></div>
                 <el-tag :type="statusType(attempt.statusCode)" effect="plain">{{ attempt.statusCode || '网络错误' }}</el-tag>
                 <span>{{ attempt.latencyMs }} ms</span>
-                <span>{{ formatTokens(attempt.inputTokens) }} / {{ formatTokens(attempt.outputTokens) }} / {{ formatTokens(attempt.cachedTokens) }}</span>
-                <span>{{ formatUSD(attempt.estimatedCostMicros) }}</span>
-                <span>{{ usageSource(attempt.usageSource) }}</span>
+                <div class="token-breakdown attempt-tokens">
+                  <span><small>普通输入</small><strong>{{ formatTokens(attempt.normalInputTokens) }}</strong></span>
+                  <span><small>输出</small><strong>{{ formatTokens(attempt.outputTokens) }}</strong></span>
+                  <span><small>缓存读</small><strong>{{ formatTokens(attempt.cachedTokens) }}</strong></span>
+                  <span><small>缓存写</small><strong>{{ formatTokens(attempt.cacheWriteTokens) }}</strong></span>
+                  <span class="sent-token"><small>真实发送（本地分词）</small><strong>{{ formatTokens(attempt.sentTokens) }}</strong></span>
+                </div>
+                <div class="cost-breakdown"><strong>{{ formatUSD(attempt.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(attempt.estimatedCostMicros) }}</small></div>
+                <div class="source-breakdown"><el-tag :type="costSourceType(attempt.costSource)" effect="plain" size="small">{{ costSource(attempt.costSource) }}</el-tag><small>{{ usageSource(attempt.usageSource) }}</small></div>
                 <small v-if="attempt.errorMessage" class="attempt-error">{{ attempt.errorMessage }}</small>
               </div>
             </div>
@@ -135,13 +154,23 @@ onMounted(async () => {
         <el-table-column label="会话 / 调用令牌" min-width="210"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.codexSessionId || '未识别会话' }}</strong><small>{{ tokenName(scope.row) }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
         <el-table-column label="端点 / 模型" min-width="180"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</strong><small><code>{{ scope.row.requestedModel }}</code></small></div></template></el-table-column>
         <el-table-column label="状态" width="92"><template #default="scope"><el-tag :type="statusType(scope.row.statusCode)" effect="plain">{{ scope.row.statusCode }}</el-tag></template></el-table-column>
-        <el-table-column label="Token（入 / 出 / 缓存）" min-width="178" align="right"><template #default="scope">{{ formatTokens(scope.row.inputTokens) }} / {{ formatTokens(scope.row.outputTokens) }} / {{ formatTokens(scope.row.cachedTokens) }}</template></el-table-column>
-        <el-table-column label="费用" width="126" align="right"><template #default="scope">{{ formatUSD(scope.row.estimatedCostMicros) }}</template></el-table-column>
-        <el-table-column label="用量来源" width="142"><template #default="scope">{{ usageSource(scope.row.usageSource) }}</template></el-table-column>
+        <el-table-column label="Token 明细" min-width="300">
+          <template #default="scope">
+            <div class="token-breakdown">
+              <span><small>普通输入</small><strong>{{ formatTokens(scope.row.normalInputTokens) }}</strong></span>
+              <span><small>输出</small><strong>{{ formatTokens(scope.row.outputTokens) }}</strong></span>
+              <span><small>缓存读</small><strong>{{ formatTokens(scope.row.cachedTokens) }}</strong></span>
+              <span><small>缓存写</small><strong>{{ formatTokens(scope.row.cacheWriteTokens) }}</strong></span>
+              <span class="sent-token"><small>真实发送（本地分词）</small><strong>{{ formatTokens(scope.row.sentTokens) }}</strong></span>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="费用" width="158" align="right"><template #default="scope"><div class="cost-breakdown"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>自行估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
+        <el-table-column label="来源" width="142"><template #default="scope"><div class="source-breakdown"><el-tag :type="costSourceType(scope.row.costSource)" effect="plain" size="small">{{ costSource(scope.row.costSource) }}</el-tag><small>{{ usageSource(scope.row.usageSource) }}</small></div></template></el-table-column>
         <el-table-column label="耗时" width="96" align="right"><template #default="scope">{{ scope.row.durationMs }} ms</template></el-table-column>
         <el-table-column label="尝试" width="72" align="right" prop="attemptCount" />
       </el-table>
-      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadLogs" /></footer>
+      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadLogs" /></footer>
     </section>
   </div>
 </template>
@@ -150,9 +179,20 @@ onMounted(async () => {
 .attempt-list { display: grid; gap: 8px; padding: 14px 24px 18px 54px; background: var(--rose-surface-muted); }
 .attempt-list > header { display: flex; justify-content: space-between; color: var(--rose-text-muted); font-size: 12px; }
 .attempt-list > header strong { color: var(--rose-text); }
-.attempt-row { display: grid; grid-template-columns: 28px minmax(140px, 1.2fr) 94px 90px minmax(150px, 1fr) 110px 132px; align-items: center; gap: 12px; min-width: 820px; padding: 9px 0; border-top: 1px solid var(--rose-border); font-size: 12px; }
+.attempt-row { display: grid; grid-template-columns: 28px minmax(140px, 1.2fr) 94px 90px minmax(300px, 1.4fr) 142px 132px; align-items: center; gap: 12px; min-width: 1060px; padding: 9px 0; border-top: 1px solid var(--rose-border); font-size: 12px; }
 .attempt-row > div { display: grid; }
+.token-breakdown { display: grid; grid-template-columns: repeat(4, minmax(58px, 1fr)); gap: 5px 10px; font-variant-numeric: tabular-nums; }
+.token-breakdown > span { display: grid; gap: 1px; min-width: 0; }
+.token-breakdown small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
+.token-breakdown strong { color: var(--rose-text); font-size: 12px; }
+.token-breakdown .sent-token { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
+.attempt-tokens { grid-template-columns: repeat(5, minmax(58px, 1fr)); }
+.attempt-tokens .sent-token { grid-column: auto; padding-top: 0; border-top: 0; }
 .attempt-index { display: grid; width: 22px; height: 22px; place-items: center; background: var(--rose-primary-soft); color: var(--rose-primary-hover); font-variant-numeric: tabular-nums; }
 .attempt-error { grid-column: 2 / -1; color: var(--rose-danger); overflow-wrap: anywhere; }
+.cost-breakdown, .source-breakdown { display: grid; gap: 3px; }
+.cost-breakdown strong { color: var(--rose-text); font-variant-numeric: tabular-nums; }
+.cost-breakdown small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; }
+.source-breakdown { justify-items: start; }
 @media (max-width: 720px) { .attempt-list { padding: 10px; overflow-x: auto; } }
 </style>

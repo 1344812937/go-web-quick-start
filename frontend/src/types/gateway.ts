@@ -1,4 +1,5 @@
 export type RoutingStrategy = 'priority_weighted' | 'lowest_cost' | 'lowest_latency'
+export type CostSource = 'upstream' | 'estimated_fallback' | 'mixed' | 'failed_zero'
 
 export interface AdminSession {
   /** Persistent administrator identifier. */
@@ -26,6 +27,10 @@ export interface ChannelModel {
   outputPriceMicros: number
   /** Cached input price in micro-USD per one million tokens, or null to use input price. */
   cachedInputPriceMicros: number | null
+  /** Cache-write input price in micro-USD per one million tokens, or null to use input price. */
+  cacheWritePriceMicros: number | null
+  /** Persisted price multiplier in basis points; 10000 represents 1.00x. */
+  priceMultiplierBasisPoints: number
   /** Whether this mapping can receive new requests. */
   enabled: boolean
   /** Mapping creation timestamp in RFC 3339 format. */
@@ -67,6 +72,8 @@ export interface Channel {
   enabled: boolean
   /** Whether Chat streaming requests may include stream_options.include_usage. */
   supportsStreamUsage: boolean
+  /** Channel-wide official-price multiplier in basis points; 10000 represents 1.00x. */
+  priceMultiplierBasisPoints: number
   /** Number of consecutive retryable failures. */
   consecutiveFailures: number
   /** Circuit reopening timestamp, or null when the circuit is closed. */
@@ -98,6 +105,29 @@ export interface ChannelModelDiscoveryRequest {
   apiKey: string
 }
 
+export interface OfficialModelPrice {
+  /** Official regular-input price in micro-USD per one million tokens. */
+  inputPriceMicros: number
+  /** Official output price in micro-USD per one million tokens. */
+  outputPriceMicros: number
+  /** Official cached-input price in micro-USD per one million tokens. */
+  cachedInputPriceMicros: number | null
+  /** Official cache-write price in micro-USD per one million tokens, or null when the catalog shows no price. */
+  cacheWritePriceMicros: number | null
+  /** Official catalog source URL embedded by this gateway build. */
+  source: string
+  /** ISO currency code used by every catalog price. */
+  currency: 'USD'
+  /** Billing unit used by every catalog price. */
+  unit: 'per_1m_tokens'
+  /** OpenAI processing and context tier represented by this price. */
+  contextTier: 'standard_short_context'
+  /** Immutable version identifier for the embedded price catalog. */
+  catalogVersion: string
+  /** Catalog review date in YYYY-MM-DD format. */
+  updatedAt: string
+}
+
 export interface UpstreamModel {
   /** Model identifier returned by the upstream /models endpoint. */
   id: string
@@ -105,6 +135,12 @@ export interface UpstreamModel {
   ownedBy: string
   /** Upstream Unix creation timestamp, or zero when omitted by the provider. */
   created: number
+  /** Public model identifier registered for this upstream model. */
+  publicModelId: number
+  /** Whether the public model was automatically created by this discovery request. */
+  publicModelCreated: boolean
+  /** Exact-match OpenAI Standard short-context text-token price, or null for an unlisted model. */
+  officialPrice: OfficialModelPrice | null
 }
 
 export interface ChannelModelDiscovery {
@@ -167,12 +203,20 @@ export interface TokenStatistics {
   successes: number
   /** Total reported or estimated input tokens. */
   inputTokens: number
+  /** Non-cached input tokens billed at the regular input price. */
+  normalInputTokens: number
   /** Total reported or estimated output tokens. */
   outputTokens: number
   /** Cached input tokens included in inputTokens. */
   cachedTokens: number
+  /** Cache-write input tokens included in inputTokens. */
+  cacheWriteTokens: number
+  /** Gateway-local token count of request bodies actually sent upstream, including retries. */
+  sentTokens: number
   /** Total estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Total upstream-reported cost in micro-USD, with estimate fallback when the upstream omits cost. */
+  upstreamCostMicros: number
   /** Average end-to-end request latency in milliseconds. */
   averageLatencyMs: number
   /** Total upstream attempts across requests. */
@@ -199,6 +243,8 @@ export interface DashboardDaily {
   outputTokens: number
   /** Estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Upstream cost in micro-USD, with estimate fallback when the upstream omits cost. */
+  upstreamCostMicros: number
 }
 
 export interface DashboardBreakdown {
@@ -208,6 +254,8 @@ export interface DashboardBreakdown {
   requests: number
   /** Estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Upstream cost in micro-USD, with estimate fallback when the upstream omits cost. */
+  upstreamCostMicros: number
 }
 
 export interface DashboardSummary {
@@ -221,6 +269,8 @@ export interface DashboardSummary {
   outputTokens: number
   /** Total estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Primary total cost in micro-USD, reported by upstream or estimated when absent. */
+  upstreamCostMicros: number
   /** Mean end-to-end request latency in milliseconds. */
   averageLatencyMs: number
   /** Daily metrics for the most recent 14 days. */
@@ -250,12 +300,22 @@ export interface RelayAttemptLog {
   statusCode: number
   /** Input tokens charged or estimated for this attempt. */
   inputTokens: number
+  /** Non-cached input tokens charged or estimated for this attempt. */
+  normalInputTokens: number
   /** Output tokens charged or estimated for this attempt. */
   outputTokens: number
   /** Cached input tokens within inputTokens. */
   cachedTokens: number
+  /** Cache-write input tokens within inputTokens. */
+  cacheWriteTokens: number
+  /** Gateway-local token count of the request body sent for this network attempt. */
+  sentTokens: number
   /** Attempt estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Attempt upstream cost in micro-USD, falling back to estimated cost only for successful attempts. */
+  upstreamCostMicros: number
+  /** Monetary origin; failed attempts are always failed_zero. */
+  costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
   /** Time to upstream response headers in milliseconds. */
@@ -291,12 +351,22 @@ export interface RelayRequestLog {
   statusCode: number
   /** Total input tokens across known attempts. */
   inputTokens: number
+  /** Total non-cached input tokens across known attempts. */
+  normalInputTokens: number
   /** Total output tokens across known attempts. */
   outputTokens: number
   /** Total cached input tokens across known attempts. */
   cachedTokens: number
+  /** Total cache-write input tokens across known attempts. */
+  cacheWriteTokens: number
+  /** Gateway-local token count of request bodies actually sent upstream, including retries. */
+  sentTokens: number
   /** Total estimated cost in micro-USD across known attempts. */
   estimatedCostMicros: number
+  /** Total upstream cost in micro-USD across successful attempts, with per-attempt estimate fallback. */
+  upstreamCostMicros: number
+  /** Aggregate monetary origin across successful attempts, or failed_zero for a failed request. */
+  costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
   /** Number of upstream attempts made. */
@@ -376,14 +446,22 @@ export interface CodexSessionSummary {
   attemptCount: number
   /** Total input tokens across retained requests. */
   inputTokens: number
+  /** Total non-cached input tokens across retained requests. */
+  normalInputTokens: number
   /** Total output tokens across retained requests. */
   outputTokens: number
   /** Cached input tokens included in inputTokens. */
   cachedTokens: number
+  /** Cache-write input tokens included in inputTokens. */
+  cacheWriteTokens: number
+  /** Gateway-local token count of request bodies actually sent upstream, including retries. */
+  sentTokens: number
   /** cachedTokens divided by inputTokens, or zero without input usage. */
   cacheHitRate: number
   /** Total estimated cost in micro-USD. */
   estimatedCostMicros: number
+  /** Total upstream cost in micro-USD, with estimate fallback when absent. */
+  upstreamCostMicros: number
   /** Mean end-to-end request latency in milliseconds. */
   averageDurationMs: number
   /** Earliest retained request timestamp in RFC 3339 format. */
