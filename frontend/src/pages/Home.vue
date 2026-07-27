@@ -5,6 +5,7 @@ import { Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tic
 import { ElMessage } from 'element-plus'
 import type { Channel, ClientToken, DashboardSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
 
 const router = useRouter()
 const loading = ref(true)
@@ -149,19 +150,19 @@ onMounted(loadDashboard)
         </article>
         <article class="metric-cell">
           <span><Timer />平均首 Token</span>
-          <strong v-if="!loading">{{ dashboard?.firstTokenSampleCount ? `${Math.round(dashboard.averageFirstTokenMs)} ms` : '--' }}</strong>
+          <strong v-if="!loading">{{ dashboard?.firstTokenSampleCount ? formatDuration(dashboard.averageFirstTokenMs) : '--' }}</strong>
           <el-skeleton v-else :rows="1" animated />
           <small>{{ dashboard?.firstTokenSampleCount ?? 0 }} 个流式样本</small>
         </article>
         <article class="metric-cell">
           <span><Odometer />平均请求延迟</span>
-          <strong v-if="!loading">{{ dashboard?.latencySampleCount ? `${Math.round(dashboard.averageLatencyMs)} ms` : '--' }}</strong>
+          <strong v-if="!loading">{{ dashboard?.latencySampleCount ? formatDuration(dashboard.averageLatencyMs) : '--' }}</strong>
           <el-skeleton v-else :rows="1" animated />
           <small>{{ dashboard?.latencySampleCount ?? 0 }} 个响应头样本</small>
         </article>
         <article class="metric-cell">
           <span><Clock />平均请求耗时</span>
-          <strong v-if="!loading">{{ Math.round(dashboard?.averageDurationMs ?? 0) }} ms</strong>
+          <strong v-if="!loading">{{ formatDuration(dashboard?.averageDurationMs ?? 0) }}</strong>
           <el-skeleton v-else :rows="1" animated />
           <small>{{ dashboard?.durationSampleCount ?? 0 }} 个完整请求</small>
         </article>

@@ -1,19 +1,26 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Refresh, RefreshLeft, Search, View } from '@element-plus/icons-vue'
+import { Coin, Connection, DataLine, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
-import type { Channel, ClientToken, GatewayModel, LogPage, RelayRequestLog } from '@/types/gateway'
+import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
+
+function defaultLogRange(): [Date, Date] {
+  const to = new Date()
+  return [new Date(to.getTime() - 24 * 60 * 60 * 1000), to]
+}
 
 const loading = ref(true)
 const errorMessage = ref('')
 const logs = ref<RelayRequestLog[]>([])
+const summary = ref<LogAggregateSummary | null>(null)
 const total = ref(0)
 const models = ref<GatewayModel[]>([])
 const channels = ref<Channel[]>([])
 const tokens = ref<ClientToken[]>([])
-const filters = reactive({ model: '', channelId: '', tokenId: '', status: '', range: [] as Date[] })
+const filters = reactive({ model: '', channelId: '', tokenId: '', status: '', range: defaultLogRange() as Date[] })
 const pagination = reactive({ page: 1, pageSize: 50 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
@@ -27,12 +34,20 @@ function formatTokens(value: number): string {
   return new Intl.NumberFormat('zh-CN').format(value)
 }
 
+function formatPercent(value: number): string {
+  return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
+}
+
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
 }
 
 function formatTiming(value: number): string {
-  return value > 0 ? `${value} ms` : '--'
+  return value > 0 ? formatDuration(value) : '--'
+}
+
+function formatAverageTiming(value: number, samples: number): string {
+  return samples > 0 ? formatDuration(value) : '--'
 }
 
 function channelName(id: number): string {
@@ -110,6 +125,7 @@ async function loadLogs() {
   try {
     const page = await request<LogPage>(`/admin/gateway/logs?${query}`)
     logs.value = page.items
+    summary.value = page.summary
     total.value = page.total
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '调用日志加载失败'
@@ -124,7 +140,7 @@ function searchLogs() {
 }
 
 function resetLogs() {
-  Object.assign(filters, { model: '', channelId: '', tokenId: '', status: '', range: [] })
+  Object.assign(filters, { model: '', channelId: '', tokenId: '', status: '', range: defaultLogRange() })
   pagination.page = 1
   void loadLogs()
 }
@@ -142,7 +158,7 @@ onMounted(async () => {
 <template>
   <div class="page-stack">
     <header class="page-heading">
-      <div><h1>调用日志</h1><p>查看最近 5 天的请求状态、重试尝试、usage 来源与双费用口径</p></div>
+      <div><h1>调用日志</h1><p>默认显示最近 24 小时，可查询 5 天内的请求状态、重试尝试与费用</p></div>
       <div class="page-actions"><el-tooltip content="刷新调用日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新调用日志" @click="loadLogs" /></el-tooltip></div>
     </header>
 
@@ -153,6 +169,39 @@ onMounted(async () => {
       <el-select v-model="filters.status" clearable placeholder="全部状态"><el-option label="成功 2xx" value="200" /><el-option label="限流 429" value="429" /><el-option label="服务不可用 503" value="503" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
       <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetLogs">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchLogs">查询</el-button></div>
+    </section>
+
+    <section v-if="!errorMessage" class="metric-strip" aria-label="调用日志汇总">
+      <article class="metric-cell">
+        <span><Tickets />请求量</span>
+        <strong v-if="!loading">{{ formatTokens(summary?.requestCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>当前筛选范围</small>
+      </article>
+      <article class="metric-cell">
+        <span><DataLine />成功率</span>
+        <strong v-if="!loading">{{ formatPercent(summary?.successRate ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>成功 {{ formatTokens(summary?.successCount ?? 0) }} · 失败 {{ formatTokens((summary?.requestCount ?? 0) - (summary?.successCount ?? 0)) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Connection />上游尝试</span>
+        <strong v-if="!loading">{{ formatTokens(summary?.attemptCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>包含重试调用</small>
+      </article>
+      <article class="metric-cell">
+        <span><Coin />Token</span>
+        <strong v-if="!loading">{{ formatTokens((summary?.inputTokens ?? 0) + (summary?.outputTokens ?? 0)) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>输入 {{ formatTokens(summary?.inputTokens ?? 0) }} · 输出 {{ formatTokens(summary?.outputTokens ?? 0) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Coin />上游费用</span>
+        <strong v-if="!loading">{{ formatUSD(summary?.upstreamCostMicros ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>自行估算 {{ formatUSD(summary?.estimatedCostMicros ?? 0) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Timer />平均请求耗时</span>
+        <strong v-if="!loading">{{ formatAverageTiming(summary?.averageDurationMs ?? 0, summary?.durationSampleCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>首 Token {{ formatAverageTiming(summary?.averageFirstTokenMs ?? 0, summary?.firstTokenSampleCount ?? 0) }} · 延迟 {{ formatAverageTiming(summary?.averageLatencyMs ?? 0, summary?.latencySampleCount ?? 0) }}</small>
+      </article>
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>

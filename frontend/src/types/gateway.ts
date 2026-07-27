@@ -375,7 +375,7 @@ export interface RelayAttemptLog {
   selectionReason: AttemptSelectionReason
   /** Sanitized, bounded diagnostic detail for the selection reason. */
   selectionDetail: string
-  /** Transformed request body sent to this upstream attempt. */
+  /** Transformed request body or a gateway delta envelope relative to the public request. */
   requestBody: string
   /** Whether requestBody was truncated at the four MiB retention limit. */
   requestBodyTruncated: boolean
@@ -436,11 +436,11 @@ export interface RelayRequestLog {
   codexSessionId: string
   /** Payload field used to identify the Codex session, or unavailable. */
   codexSessionSource: string
-  /** First user text from this request, normalized and limited to ten Unicode characters. */
+  /** Latest real user text from this request, normalized and limited to ten Unicode characters. */
   sessionName: string
   /** Allowlisted non-content API parameters retained for five-day diagnostics. */
   requestParameters: Record<string, unknown>
-  /** Original request body, including the client-sent context. */
+  /** Original request body or a gateway delta envelope with already-retained context omitted. */
   requestBody: string
   /** Whether requestBody was truncated at the four MiB retention limit. */
   requestBodyTruncated: boolean
@@ -488,9 +488,50 @@ export interface RelayRequestLog {
   attempts: RelayAttemptLog[]
 }
 
+export interface LogAggregateSummary {
+  /** Matching request count across the full filtered time range. */
+  requestCount: number
+  /** Matching requests completed with a final 2xx status. */
+  successCount: number
+  /** Successful matching requests divided by all matching requests. */
+  successRate: number
+  /** Total upstream attempts made by matching requests. */
+  attemptCount: number
+  /** Total input tokens across matching requests. */
+  inputTokens: number
+  /** Total non-cached input tokens across matching requests. */
+  normalInputTokens: number
+  /** Total output tokens across matching requests. */
+  outputTokens: number
+  /** Total cached input tokens across matching requests. */
+  cachedTokens: number
+  /** Total cache-write input tokens across matching requests. */
+  cacheWriteTokens: number
+  /** Gateway-local tokens sent upstream, including retries. */
+  sentTokens: number
+  /** Estimated cost for matching requests in micro-USD. */
+  estimatedCostMicros: number
+  /** Upstream cost for matching requests in micro-USD, with estimate fallback. */
+  upstreamCostMicros: number
+  /** Mean time to the first generated output token in milliseconds. */
+  averageFirstTokenMs: number
+  /** Matching requests with an observed first output token. */
+  firstTokenSampleCount: number
+  /** Mean time to final upstream response headers in milliseconds. */
+  averageLatencyMs: number
+  /** Matching requests with an observed final upstream response header. */
+  latencySampleCount: number
+  /** Mean end-to-end request duration in milliseconds. */
+  averageDurationMs: number
+  /** Matching requests included in the duration average. */
+  durationSampleCount: number
+}
+
 export interface LogPage {
   /** Request logs for the selected page. */
   items: RelayRequestLog[]
+  /** Aggregate metrics across every request matching the active filters. */
+  summary: LogAggregateSummary
   /** Total matching request count. */
   total: number
   /** One-based page number. */
@@ -525,7 +566,7 @@ export interface SessionChannel {
 export interface CodexSessionSummary {
   /** Extracted Codex session identifier, blank for an unidentified request. */
   sessionId: string
-  /** Name derived from the first retained request's first user text. */
+  /** Automatically derived title or administrator-customized session title. */
   sessionName: string
   /** Payload field used to identify the session, or unavailable. */
   sessionSource: string
@@ -592,6 +633,8 @@ export interface CodexSessionSummary {
 export interface CodexSessionPage {
   /** Session aggregates for the selected page. */
   items: CodexSessionSummary[]
+  /** Request-level aggregate metrics across every session matching the active filters. */
+  summary: LogAggregateSummary
   /** Total matching session groups. */
   total: number
   /** One-based page number. */

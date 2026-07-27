@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
-import { Right, View } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { EditPen, Right, View } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import type { CodexSessionDetail, CodexSessionSummary, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
 
 interface SessionLogDrawerProps {
   /** Session aggregate selected from the session log table. */
@@ -18,6 +19,8 @@ interface ChannelSwitch {
   detail: string
 }
 
+type SessionDetailStatus = 'all' | 'success' | 'failure'
+
 const { summary } = defineProps<SessionLogDrawerProps>()
 const open = defineModel<boolean>({ required: true })
 const loading = ref(false)
@@ -27,6 +30,45 @@ const pagination = ref({ page: 1, pageSize: 25 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
+const detailStatus = ref<SessionDetailStatus>('all')
+const detailStatusOptions: Array<{ label: string; value: SessionDetailStatus }> = [
+  { label: '全部', value: 'all' },
+  { label: '成功', value: 'success' },
+  { label: '失败', value: 'failure' },
+]
+
+async function renameCurrentSession() {
+  if (!summary) return
+  try {
+    const result = await ElMessageBox.prompt('输入新的会话名称，最多 80 个字符', '修改会话名称', {
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputValue: detail.value?.summary.sessionName || summary.sessionName,
+      inputValidator: (value) => {
+        const title = value.trim()
+        if (!title) return '会话名称不能为空'
+        if ([...title].length > 80) return '会话名称最多 80 个字符'
+        return true
+      },
+    })
+    await request<null>('/admin/gateway/sessions/title', {
+      method: 'PUT',
+      body: JSON.stringify({
+        sessionId: summary.identified ? summary.sessionId : '',
+        requestId: summary.identified ? '' : summary.fallbackRequestId,
+        tokenId: summary.tokenId,
+        title: result.value,
+      }),
+    })
+    const normalized = result.value.trim().replace(/\s+/g, ' ')
+    summary.sessionName = normalized
+    if (detail.value) detail.value.summary.sessionName = normalized
+    ElMessage.success('会话名称已保存')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '会话名称保存失败')
+  }
+}
 
 const drawerTitle = computed(() => summary?.sessionName || (summary?.identified ? `会话 ${summary.sessionId}` : `未识别请求 ${summary?.fallbackRequestId ?? ''}`))
 const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requestItem, requestIndex, requests) => ({
@@ -54,7 +96,7 @@ function formatPercent(value: number): string {
 }
 
 function formatTiming(value: number): string {
-  return value > 0 ? `${Math.round(value)} ms` : '--'
+  return value > 0 ? formatDuration(value) : '--'
 }
 
 function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
@@ -132,7 +174,7 @@ function resolveChannelSwitch(requests: RelayRequestLog[], requestIndex: number,
   const attempt = requestItem?.attempts[attemptIndex]
   if (!requestItem || !attempt) return null
   const sameRequestPrevious = attemptIndex > 0 ? requestItem.attempts[attemptIndex - 1] : undefined
-  const previousRequestAttempt = attemptIndex === 0 ? lastAttempt(requests[requestIndex - 1]) : undefined
+  const previousRequestAttempt = attemptIndex === 0 ? lastAttempt(requests[requestIndex + 1]) : undefined
   const adjacentPrevious = sameRequestPrevious ?? previousRequestAttempt
 
   let from = attempt.previousChannelName || (attempt.previousChannelId > 0 ? `渠道 #${attempt.previousChannelId}` : '')
@@ -209,6 +251,7 @@ async function loadDetail() {
   } else {
     query.set('requestId', summary.fallbackRequestId)
   }
+  if (detailStatus.value !== 'all') query.set('status', detailStatus.value)
   try {
     detail.value = await request<CodexSessionDetail>(`/admin/gateway/sessions/detail?${query}`)
   } catch (error) {
@@ -218,6 +261,11 @@ async function loadDetail() {
   }
 }
 
+function filterDetailByStatus() {
+  pagination.value.page = 1
+  void loadDetail()
+}
+
 watch(
   () => [open.value, summary?.sessionId, summary?.fallbackRequestId, summary?.tokenId],
   ([isOpen], previous) => {
@@ -225,6 +273,7 @@ watch(
     const identityChanged = !previous || previous[1] !== summary?.sessionId || previous[2] !== summary?.fallbackRequestId || previous[3] !== summary?.tokenId
     if (identityChanged) {
       pagination.value.page = 1
+      detailStatus.value = 'all'
       detail.value = null
       selectedRequest.value = null
     }
@@ -234,7 +283,10 @@ watch(
 </script>
 
 <template>
-  <el-drawer v-model="open" :title="drawerTitle" size="min(1180px, 100vw)" destroy-on-close>
+  <el-drawer v-model="open" size="min(1180px, 100vw)" destroy-on-close>
+    <template #header>
+      <div class="drawer-title"><strong>{{ drawerTitle }}</strong><el-tooltip content="修改会话名称" placement="bottom"><el-button text :icon="EditPen" aria-label="修改会话名称" @click="renameCurrentSession" /></el-tooltip></div>
+    </template>
     <el-skeleton v-if="loading && !detail" :rows="8" animated />
     <div v-else-if="errorMessage" class="state-panel state-error" role="alert">
       <strong>会话详情加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadDetail">重试</el-button>
@@ -269,8 +321,11 @@ watch(
 
       <section class="timeline-section" aria-label="会话调用时间线">
         <header class="timeline-heading">
-          <div><h3>调用时间线</h3><p>按调用发生时间从旧到新排列</p></div>
-          <span>{{ detail.requestTotal }} 个请求 · {{ detail.summary.attemptCount }} 次上游尝试</span>
+          <div><h3>调用时间线</h3><p>按调用发生时间从新到旧排列</p></div>
+          <div class="timeline-heading-actions">
+            <el-segmented v-model="detailStatus" :options="detailStatusOptions" size="small" aria-label="筛选调用状态" @change="filterDetailByStatus" />
+            <span>{{ detail.requestTotal }} 个匹配请求 · 会话共 {{ detail.summary.attemptCount }} 次上游尝试</span>
+          </div>
         </header>
         <div v-if="timelineRequests.length === 0" class="timeline-empty">当前页没有调用记录</div>
         <ol v-else class="request-timeline">
@@ -354,6 +409,8 @@ watch(
 
 <style scoped>
 .session-detail { display: grid; gap: 22px; }
+.drawer-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.drawer-title strong { overflow: hidden; color: var(--rose-text); text-overflow: ellipsis; white-space: nowrap; }
 .session-summary-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); border-block: 1px solid var(--rose-border); }
 .session-summary-strip > div { display: grid; gap: 5px; padding: 13px 14px; border-right: 1px solid var(--rose-border); }
 .session-summary-strip > div:last-child { border-right: 0; }
@@ -370,7 +427,8 @@ watch(
 .current-channel-grid code, .request-timeline code { overflow-wrap: anywhere; }
 .timeline-section { min-width: 0; }
 .timeline-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
-.timeline-heading > span { color: var(--rose-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.timeline-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
+.timeline-heading-actions > span { color: var(--rose-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .timeline-empty { padding: 32px 16px; color: var(--rose-text-muted); text-align: center; }
 .request-timeline { display: grid; margin: 0; padding: 0; list-style: none; }
 .request-timings { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
@@ -410,5 +468,5 @@ watch(
 .attempt-error { grid-column: 2 / -1; margin: -2px 0 0; color: var(--rose-danger); font-size: 11px; overflow-wrap: anywhere; }
 @media (max-width: 1040px) { .attempt-event { grid-template-columns: 58px minmax(160px, 1fr) 92px; } .attempt-metrics { grid-column: 1 / -1; grid-row: 2; } .attempt-source { grid-column: 3; } .attempt-error { grid-column: 1 / -1; } }
 @media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
-@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .attempt-event { grid-template-columns: minmax(0, 1fr) auto; padding: 10px; } .attempt-index { grid-column: 1; } .attempt-channel { grid-column: 1 / -1; } .attempt-event > .el-tag { grid-column: 2; grid-row: 1; } .attempt-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-column: 1 / -1; grid-row: auto; } .attempt-source { grid-column: 1 / -1; justify-self: start; } .attempt-error { grid-column: 1 / -1; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .attempt-event { grid-template-columns: minmax(0, 1fr) auto; padding: 10px; } .attempt-index { grid-column: 1; } .attempt-channel { grid-column: 1 / -1; } .attempt-event > .el-tag { grid-column: 2; grid-row: 1; } .attempt-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-column: 1 / -1; grid-row: auto; } .attempt-source { grid-column: 1 / -1; justify-self: start; } .attempt-error { grid-column: 1 / -1; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
 </style>

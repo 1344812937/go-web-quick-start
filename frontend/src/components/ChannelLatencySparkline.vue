@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import type { ChannelLatencyPoint } from '@/types/gateway'
+import { formatDuration } from '@/utils/formatters'
 
 interface ChannelLatencySparklineProps {
   /** Chronological successful-attempt latency samples rendered by the chart. */
@@ -34,7 +35,7 @@ const latestPoint = computed(() => {
   const renderedPoints = polylinePoints.value.split(' ')
   return renderedPoints[renderedPoints.length - 1]?.split(',') ?? []
 })
-const chartLabel = computed(() => `${channelName} 最近延迟曲线，最低 ${minimumLatency.value} 毫秒，最高 ${maximumLatency.value} 毫秒，最新 ${points[points.length - 1]?.latencyMs ?? 0} 毫秒`)
+const chartLabel = computed(() => `${channelName} 最近延迟曲线，最低 ${formatDuration(minimumLatency.value)}，最高 ${formatDuration(maximumLatency.value)}，最新 ${formatDuration(points[points.length - 1]?.latencyMs ?? 0)}`)
 </script>
 
 <template>

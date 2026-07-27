@@ -4,6 +4,7 @@ import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Channel, ChannelModel, GatewayModel, RoutingStrategy } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
 
 interface CandidateRow {
   channel: Channel
@@ -25,6 +26,7 @@ const editingId = ref<number | null>(null)
 const deletingModelId = ref<number | null>(null)
 const form = reactive<{ name: string; routingStrategy: RoutingStrategy; enabled: boolean }>({ name: '', routingStrategy: 'priority_weighted', enabled: true })
 const dialogTitle = computed(() => editingId.value ? '编辑公开模型' : '新增公开模型')
+const sortedModels = computed(() => [...models.value].sort((left, right) => right.name.localeCompare(left.name, undefined, { numeric: true, sensitivity: 'base' })))
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
   { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按配置权重和近 30 分钟成功率分配' },
   { value: 'lowest_cost', label: '最低成本', note: '按本次预计成本优势和近 30 分钟成功率动态分配' },
@@ -152,7 +154,7 @@ onMounted(loadData)
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>模型路由加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="models" row-key="id" empty-text="还没有公开模型">
+      <el-table v-loading="loading" :data="sortedModels" row-key="id" empty-text="还没有公开模型">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="candidate-matrix">
@@ -177,7 +179,7 @@ onMounted(loadData)
                 <el-table-column label="输出" width="104" align="right"><template #default="candidate">{{ formatPrice(candidate.row.mapping.outputPriceMicros) }}</template></el-table-column>
                 <el-table-column label="缓存读" width="104" align="right"><template #default="candidate">{{ formatPrice(candidate.row.mapping.cachedInputPriceMicros) }}</template></el-table-column>
                 <el-table-column label="缓存写" width="104" align="right"><template #default="candidate">{{ formatPrice(candidate.row.mapping.cacheWritePriceMicros) }}</template></el-table-column>
-                <el-table-column label="延迟" width="96" align="right"><template #default="candidate">{{ candidate.row.channel.latencyEwmaMs ? `${Math.round(candidate.row.channel.latencyEwmaMs)} ms` : '待采样' }}</template></el-table-column>
+                <el-table-column label="延迟" width="96" align="right"><template #default="candidate">{{ candidate.row.channel.latencyEwmaMs ? formatDuration(candidate.row.channel.latencyEwmaMs) : '待采样' }}</template></el-table-column>
               </el-table>
             </div>
           </template>

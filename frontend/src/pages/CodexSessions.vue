@@ -1,18 +1,26 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Refresh, RefreshLeft, Search, View } from '@element-plus/icons-vue'
+import { Coin, Connection, DataLine, EditPen, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import SessionLogDrawer from '@/components/SessionLogDrawer.vue'
-import type { Channel, ClientToken, CodexSessionPage, CodexSessionSummary, GatewayModel } from '@/types/gateway'
+import type { Channel, ClientToken, CodexSessionPage, CodexSessionSummary, GatewayModel, LogAggregateSummary } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
+
+function defaultLogRange(): [Date, Date] {
+  const to = new Date()
+  return [new Date(to.getTime() - 24 * 60 * 60 * 1000), to]
+}
 
 const loading = ref(true)
 const errorMessage = ref('')
 const sessions = ref<CodexSessionSummary[]>([])
+const summary = ref<LogAggregateSummary | null>(null)
 const total = ref(0)
 const models = ref<GatewayModel[]>([])
 const channels = ref<Channel[]>([])
 const tokens = ref<ClientToken[]>([])
-const filters = reactive({ session: '', model: '', channelId: '', tokenId: '', range: [] as Date[] })
+const filters = reactive({ session: '', model: '', channelId: '', tokenId: '', range: defaultLogRange() as Date[] })
 const pagination = reactive({ page: 1, pageSize: 25 })
 const drawerOpen = ref(false)
 const selectedSession = ref<CodexSessionSummary | null>(null)
@@ -34,7 +42,7 @@ function formatUSD(micros: number): string {
 }
 
 function formatTiming(value: number, samples: number): string {
-  return samples > 0 ? `${Math.round(value)} ms` : '--'
+  return samples > 0 ? formatDuration(value) : '--'
 }
 
 function sessionSourceLabel(value: string): string {
@@ -75,6 +83,7 @@ async function loadSessions() {
   try {
     const page = await request<CodexSessionPage>(`/admin/gateway/sessions?${query}`)
     sessions.value = page.items
+    summary.value = page.summary
     total.value = page.total
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '会话日志加载失败'
@@ -89,7 +98,7 @@ function searchSessions() {
 }
 
 function resetSessions() {
-  Object.assign(filters, { session: '', model: '', channelId: '', tokenId: '', range: [] })
+  Object.assign(filters, { session: '', model: '', channelId: '', tokenId: '', range: defaultLogRange() })
   pagination.page = 1
   void loadSessions()
 }
@@ -97,6 +106,40 @@ function resetSessions() {
 function openSession(session: CodexSessionSummary) {
   selectedSession.value = session
   drawerOpen.value = true
+}
+
+async function renameSession(session: CodexSessionSummary) {
+  try {
+    const result = await ElMessageBox.prompt('输入新的会话名称，最多 80 个字符', '修改会话名称', {
+      confirmButtonText: '保存',
+      cancelButtonText: '取消',
+      inputValue: session.sessionName,
+      inputValidator: (value) => {
+        const title = value.trim()
+        if (!title) return '会话名称不能为空'
+        if ([...title].length > 80) return '会话名称最多 80 个字符'
+        return true
+      },
+    })
+    await request<null>('/admin/gateway/sessions/title', {
+      method: 'PUT',
+      body: JSON.stringify({
+        sessionId: session.identified ? session.sessionId : '',
+        requestId: session.identified ? '' : session.fallbackRequestId,
+        tokenId: session.tokenId,
+        title: result.value,
+      }),
+    })
+    const normalized = result.value.trim().replace(/\s+/g, ' ')
+    session.sessionName = normalized
+    if (selectedSession.value && sessionRowKey(selectedSession.value) === sessionRowKey(session)) {
+      selectedSession.value.sessionName = normalized
+    }
+    ElMessage.success('会话名称已保存')
+  } catch (error) {
+    if (error === 'cancel' || error === 'close') return
+    ElMessage.error(error instanceof Error ? error.message : '会话名称保存失败')
+  }
 }
 
 function sessionRowKey(session: CodexSessionSummary): string {
@@ -116,7 +159,7 @@ onMounted(async () => {
 <template>
   <div class="page-stack">
     <header class="page-heading">
-      <div><h1>会话日志</h1><p>按首次调用时间查看最近 5 天的会话、渠道、模型、令牌与用量</p></div>
+      <div><h1>会话日志</h1><p>默认显示最近 24 小时，可查询 5 天内的会话、渠道、模型、令牌与用量</p></div>
       <div class="page-actions"><el-tooltip content="刷新会话日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新会话日志" @click="loadSessions" /></el-tooltip></div>
     </header>
 
@@ -127,6 +170,39 @@ onMounted(async () => {
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
       <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetSessions">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchSessions">查询</el-button></div>
+    </section>
+
+    <section v-if="!errorMessage" class="metric-strip" aria-label="会话日志汇总">
+      <article class="metric-cell">
+        <span><Tickets />会话数</span>
+        <strong v-if="!loading">{{ formatTokens(total) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>当前筛选范围</small>
+      </article>
+      <article class="metric-cell">
+        <span><Connection />请求量</span>
+        <strong v-if="!loading">{{ formatTokens(summary?.requestCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>{{ formatTokens(summary?.attemptCount ?? 0) }} 次上游尝试</small>
+      </article>
+      <article class="metric-cell">
+        <span><DataLine />成功率</span>
+        <strong v-if="!loading">{{ formatPercent(summary?.successRate ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>成功 {{ formatTokens(summary?.successCount ?? 0) }} · 失败 {{ formatTokens((summary?.requestCount ?? 0) - (summary?.successCount ?? 0)) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Coin />Token</span>
+        <strong v-if="!loading">{{ formatTokens((summary?.inputTokens ?? 0) + (summary?.outputTokens ?? 0)) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>输入 {{ formatTokens(summary?.inputTokens ?? 0) }} · 输出 {{ formatTokens(summary?.outputTokens ?? 0) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Coin />上游费用</span>
+        <strong v-if="!loading">{{ formatUSD(summary?.upstreamCostMicros ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>自行估算 {{ formatUSD(summary?.estimatedCostMicros ?? 0) }}</small>
+      </article>
+      <article class="metric-cell">
+        <span><Timer />平均请求耗时</span>
+        <strong v-if="!loading">{{ formatTiming(summary?.averageDurationMs ?? 0, summary?.durationSampleCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>首 Token {{ formatTiming(summary?.averageFirstTokenMs ?? 0, summary?.firstTokenSampleCount ?? 0) }} · 延迟 {{ formatTiming(summary?.averageLatencyMs ?? 0, summary?.latencySampleCount ?? 0) }}</small>
+      </article>
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
@@ -162,7 +238,7 @@ onMounted(async () => {
         <el-table-column label="费用" width="150" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
         <el-table-column label="平均性能" min-width="250"><template #default="scope"><div class="numeric-cell"><strong>首 Token {{ formatTiming(scope.row.averageFirstTokenMs, scope.row.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.averageLatencyMs, scope.row.latencySampleCount) }}</strong><small>请求耗时 {{ formatTiming(scope.row.averageDurationMs, scope.row.durationSampleCount) }}</small></div></template></el-table-column>
         <el-table-column label="首次 / 最近调用" width="180"><template #default="scope"><div class="numeric-cell"><strong>{{ formatDate(scope.row.firstSeenAt) }}</strong><small>最近 {{ formatDate(scope.row.lastSeenAt) }}</small></div></template></el-table-column>
-        <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="查看会话详情" placement="top"><el-button class="table-action-button" text :icon="View" aria-label="查看会话详情" @click.stop="openSession(scope.row)" /></el-tooltip></div></template></el-table-column>
+        <el-table-column label="操作" width="96" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="修改会话名称" placement="top"><el-button class="table-action-button" text :icon="EditPen" aria-label="修改会话名称" @click.stop="renameSession(scope.row)" /></el-tooltip><el-tooltip content="查看会话详情" placement="top"><el-button class="table-action-button" text :icon="View" aria-label="查看会话详情" @click.stop="openSession(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
     </section>

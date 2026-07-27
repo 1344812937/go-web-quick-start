@@ -4,6 +4,7 @@ import { CircleClose, CopyDocument, Edit, Plus, Refresh, RefreshRight } from '@e
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { ClientToken, GatewayModel, IssuedClientToken } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
 
 const loading = ref(true)
 const saving = ref(false)
@@ -146,7 +147,7 @@ function formatUSD(micros: number): string {
 }
 
 function formatTiming(value: number, samples: number): string {
-  return samples > 0 ? `${Math.round(value)} ms` : '--'
+  return samples > 0 ? formatDuration(value) : '--'
 }
 
 onMounted(loadData)

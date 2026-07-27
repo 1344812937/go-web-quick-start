@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import type { CSSProperties } from 'vue'
 import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ChannelLatencySparkline from '@/components/ChannelLatencySparkline.vue'
@@ -12,8 +13,10 @@ import type {
   UpstreamModel,
 } from '@/types/gateway'
 import { request } from '@/utils/api'
+import { formatDuration } from '@/utils/formatters'
 
 interface MappingDraft {
+  clientKey: string
   id?: number
   modelId: number | null
   upstreamModel: string
@@ -25,6 +28,13 @@ interface MappingDraft {
   cacheWritePrice: number | null
   adjustmentMultiplier: number
   enabled: boolean
+}
+
+interface MappingGroup {
+  key: 'enabled' | 'disabled'
+  label: string
+  emptyText: string
+  items: MappingDraft[]
 }
 
 const maxVisibleChannelModels = 3
@@ -46,7 +56,43 @@ const testingChannelId = ref<number | null>(null)
 const deletingChannelId = ref<number | null>(null)
 const drawerTitle = computed(() => editingId.value ? '编辑渠道' : '新增渠道')
 const createdPublicModelCount = computed(() => discoveredModels.value.filter((model) => model.publicModelCreated).length)
+const sortedPublicModels = computed(() => [...models.value].sort((left, right) => compareModelNamesDescending(left.name, right.name)))
+const sortedDiscoveredModels = computed(() => [...discoveredModels.value].sort((left, right) => compareModelNamesDescending(left.id, right.id)))
+const mappingGroups = computed<MappingGroup[]>(() => [
+  { key: 'enabled', label: '已启用', emptyText: '暂无已启用映射', items: sortedMappings(true) },
+  { key: 'disabled', label: '未启用', emptyText: '暂无未启用映射', items: sortedMappings(false) },
+])
+const modelHueByName = computed(() => {
+  const usedHues = new Set<number>()
+  const hues = new Map<string, number>()
+  const names = [...new Set(models.value.map((model) => model.name))].sort((left, right) => left.localeCompare(right))
+  for (const name of names) {
+    let hue = hashModelName(name) % 360
+    while (usedHues.has(hue)) hue = (hue + 47) % 360
+    usedHues.add(hue)
+    hues.set(name, hue)
+  }
+  return hues
+})
+let mappingDraftSequence = 0
 let discoveryRequestVersion = 0
+
+function compareModelNamesDescending(left: string, right: string): number {
+  return right.localeCompare(left, undefined, { numeric: true, sensitivity: 'base' })
+}
+
+function hashModelName(value: string): number {
+  let hash = 2166136261
+  for (const character of value) {
+    hash ^= character.codePointAt(0) ?? 0
+    hash = Math.imul(hash, 16777619)
+  }
+  return hash >>> 0
+}
+
+function nextMappingClientKey(id?: number): string {
+  return id ? `saved-${id}` : `draft-${++mappingDraftSequence}`
+}
 
 function fromMicros(value: number | null): number | null {
   return value === null ? null : value / 1_000_000
@@ -54,6 +100,7 @@ function fromMicros(value: number | null): number | null {
 
 function mappingDraft(mapping: ChannelModel): MappingDraft {
   return {
+    clientKey: nextMappingClientKey(mapping.id),
     id: mapping.id,
     modelId: mapping.modelId,
     upstreamModel: mapping.upstreamModel,
@@ -71,6 +118,7 @@ function mappingDraft(mapping: ChannelModel): MappingDraft {
 function discoveredMappingDraft(model: UpstreamModel): MappingDraft {
   const price = model.officialPrice
   return {
+    clientKey: nextMappingClientKey(),
     modelId: model.publicModelId || null,
     upstreamModel: model.id,
     priority: 0,
@@ -119,14 +167,14 @@ function addMapping() {
     ElMessage.warning('当前没有可选择的上游模型')
     return
   }
-  const upstreamModel = discoveredModels.value.find((model) => !mappings.value.some((mapping) => mapping.upstreamModel === model.id)) ?? discoveredModels.value[0]
+  const upstreamModel = sortedDiscoveredModels.value.find((model) => !mappings.value.some((mapping) => mapping.upstreamModel === model.id)) ?? sortedDiscoveredModels.value[0]
   mappings.value.push(discoveredMappingDraft(upstreamModel))
 }
 
 function modelOptionsForMapping(mapping: MappingDraft): UpstreamModel[] {
   const current = mapping.upstreamModel.trim()
-  if (!current || discoveredModels.value.some((model) => model.id === current)) return discoveredModels.value
-  return [{ id: current, ownedBy: '已配置', created: 0, publicModelId: mapping.modelId ?? 0, publicModelCreated: false, officialPrice: null }, ...discoveredModels.value]
+  if (!current || discoveredModels.value.some((model) => model.id === current)) return sortedDiscoveredModels.value
+  return [{ id: current, ownedBy: '已配置', created: 0, publicModelId: mapping.modelId ?? 0, publicModelCreated: false, officialPrice: null }, ...sortedDiscoveredModels.value]
 }
 
 function selectUpstreamModel(mapping: MappingDraft, upstreamModelId: string) {
@@ -280,12 +328,38 @@ function modelName(modelId: number): string {
   return models.value.find((model) => model.id === modelId)?.name ?? `#${modelId}`
 }
 
+function sortedMappings(enabled: boolean): MappingDraft[] {
+  return mappings.value
+    .filter((mapping) => mapping.enabled === enabled)
+    .sort((left, right) => compareModelNamesDescending(modelName(left.modelId ?? 0), modelName(right.modelId ?? 0))
+      || compareModelNamesDescending(left.upstreamModel, right.upstreamModel))
+}
+
+function sortedChannelModels(channel: Channel): ChannelModel[] {
+  return [...channel.models].sort((left, right) => compareModelNamesDescending(modelName(left.modelId), modelName(right.modelId)))
+}
+
 function visibleChannelModels(channel: Channel): ChannelModel[] {
-  return channel.models.slice(0, maxVisibleChannelModels)
+  return sortedChannelModels(channel).slice(0, maxVisibleChannelModels)
 }
 
 function hiddenChannelModels(channel: Channel): ChannelModel[] {
-  return channel.models.slice(maxVisibleChannelModels)
+  return sortedChannelModels(channel).slice(maxVisibleChannelModels)
+}
+
+function modelTagStyle(modelId: number): CSSProperties {
+  const name = modelName(modelId)
+  const hue = modelHueByName.value.get(name) ?? hashModelName(name) % 360
+  return {
+    '--el-tag-bg-color': `hsl(${hue} 70% 96%)`,
+    '--el-tag-border-color': `hsl(${hue} 48% 76%)`,
+    '--el-tag-text-color': `hsl(${hue} 48% 30%)`,
+  }
+}
+
+function removeMapping(mapping: MappingDraft) {
+  const index = mappings.value.indexOf(mapping)
+  if (index >= 0) mappings.value.splice(index, 1)
 }
 
 function formatPercent(value: number): string {
@@ -297,7 +371,7 @@ function formatTokens(value: number): string {
 }
 
 function formatTiming(value: number, samples: number): string {
-  return samples > 0 ? `${Math.round(value)} ms` : '--'
+  return samples > 0 ? formatDuration(value) : '--'
 }
 
 function timingSampleLabel(channel: Channel): string {
@@ -381,7 +455,7 @@ async function testChannel(channel: Channel) {
   testingChannelId.value = channel.id
   try {
     const result = await request<{ latencyMs: number; status: number }>(`/admin/gateway/channels/${channel.id}/test`, { method: 'POST' })
-    ElMessage.success(`连接成功，HTTP ${result.status}，${result.latencyMs} ms`)
+    ElMessage.success(`连接成功，HTTP ${result.status}，${formatDuration(result.latencyMs)}`)
     await loadData()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '连接测试失败')
@@ -440,14 +514,14 @@ onMounted(loadData)
           <template #default="scope">
             <div v-if="scope.row.models.length" class="channel-model-tags">
               <el-tooltip v-for="item in visibleChannelModels(scope.row)" :key="item.id" :content="modelName(item.modelId)" placement="top" :show-after="300">
-                <el-tag class="channel-model-tag" effect="plain" type="info" tabindex="0">
+                <el-tag class="channel-model-tag" effect="plain" :style="modelTagStyle(item.modelId)" tabindex="0">
                   <span class="channel-model-tag-label">{{ modelName(item.modelId) }}</span>
                 </el-tag>
               </el-tooltip>
               <el-tooltip v-if="hiddenChannelModels(scope.row).length" placement="top" :show-after="200" popper-class="channel-model-overflow-popper">
                 <template #content>
                   <div class="channel-model-overflow-content">
-                    <el-tag v-for="item in hiddenChannelModels(scope.row)" :key="item.id" effect="plain" type="info" size="small">{{ modelName(item.modelId) }}</el-tag>
+                    <el-tag v-for="item in hiddenChannelModels(scope.row)" :key="item.id" effect="plain" :style="modelTagStyle(item.modelId)" size="small">{{ modelName(item.modelId) }}</el-tag>
                   </div>
                 </template>
                 <el-tag
@@ -470,7 +544,7 @@ onMounted(loadData)
                 <strong>首 Token {{ formatTiming(scope.row.metrics.averageFirstTokenMs, scope.row.metrics.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.metrics.averageLatencyMs, scope.row.metrics.latencySampleCount) }}</strong>
                 <small>请求耗时 {{ formatTiming(scope.row.metrics.averageDurationMs, scope.row.metrics.durationSampleCount) }}</small>
                 <small>{{ timingSampleLabel(scope.row) }}</small>
-                <small v-if="scope.row.latencyEwmaMs > 0">EWMA {{ Math.round(scope.row.latencyEwmaMs) }} ms</small>
+                <small v-if="scope.row.latencyEwmaMs > 0">EWMA {{ formatDuration(scope.row.latencyEwmaMs) }}</small>
               </div>
             </div>
             <span v-else class="muted-text">近 5 天无成功采样</span>
@@ -515,7 +589,7 @@ onMounted(loadData)
         <div class="subsection-heading model-discovery-heading">
           <div>
             <h3>上游可用模型</h3>
-            <p v-if="discoverySummary">HTTP {{ discoverySummary.status }} · {{ discoverySummary.latencyMs }} ms · {{ formatDiscoveryTime(discoverySummary.fetchedAt) }}</p>
+            <p v-if="discoverySummary">HTTP {{ discoverySummary.status }} · {{ formatDuration(discoverySummary.latencyMs) }} · {{ formatDiscoveryTime(discoverySummary.fetchedAt) }}</p>
             <p v-else>尚未获取</p>
           </div>
           <div class="model-discovery-actions">
@@ -527,7 +601,7 @@ onMounted(loadData)
         <el-skeleton v-if="discoveringModels" :rows="3" animated />
         <div v-else-if="discoveryError" class="model-discovery-error inline-error" role="alert"><span>{{ discoveryError }}</span><el-button text @click="discoverChannelModels()">重试</el-button></div>
         <div v-else-if="discoveredModels.length === 0" class="mapping-empty">{{ discoverySummary ? '上游未返回可用模型' : '尚未获取上游模型' }}</div>
-        <el-table v-else :data="discoveredModels" row-key="id" max-height="240" class="supported-model-table">
+        <el-table v-else :data="sortedDiscoveredModels" row-key="id" max-height="240" class="supported-model-table">
           <el-table-column label="模型 ID" min-width="200"><template #default="scope"><code>{{ scope.row.id }}</code></template></el-table-column>
           <el-table-column label="所属方" min-width="100"><template #default="scope">{{ scope.row.ownedBy || '未提供' }}</template></el-table-column>
           <el-table-column label="官方短上下文价（USD / 百万 Token）" min-width="430"><template #default="scope"><span class="official-price" :class="{ 'muted-text': !scope.row.officialPrice }">{{ formatOfficialPrice(scope.row) }}</span></template></el-table-column>
@@ -551,10 +625,17 @@ onMounted(loadData)
           </div>
         </div>
         <div v-if="mappings.length === 0" class="mapping-empty">当前渠道未配置模型映射</div>
-        <article v-for="(mapping, index) in mappings" :key="mapping.id ?? `new-${index}`" class="mapping-editor">
+        <template v-else>
+        <section v-for="group in mappingGroups" :key="group.key" class="mapping-group" :aria-label="`${group.label}模型映射`">
+          <header class="mapping-group-heading">
+            <h4>{{ group.label }}</h4>
+            <span>{{ group.items.length }} 条映射</span>
+          </header>
+          <div v-if="group.items.length === 0" class="mapping-group-empty">{{ group.emptyText }}</div>
+          <article v-for="(mapping, index) in group.items" :key="mapping.clientKey" class="mapping-editor">
           <header class="mapping-editor-header">
-            <div><strong>映射 {{ index + 1 }}</strong><span>{{ mapping.upstreamModel || '未选择上游模型' }}</span></div>
-            <div class="mapping-editor-actions"><el-checkbox v-model="mapping.enabled">启用该映射</el-checkbox><el-button :icon="Delete" title="删除映射" circle @click="mappings.splice(index, 1)" /></div>
+            <div><strong>{{ group.label }}映射 {{ index + 1 }}</strong><span>{{ mapping.upstreamModel || '未选择上游模型' }}</span></div>
+            <div class="mapping-editor-actions"><el-checkbox v-model="mapping.enabled">启用该映射</el-checkbox><el-button :icon="Delete" title="删除映射" circle @click="removeMapping(mapping)" /></div>
           </header>
 
           <div class="mapping-model-grid">
@@ -567,7 +648,7 @@ onMounted(loadData)
               <small class="field-note">实际发送到该供应商接口的模型 ID</small>
             </el-form-item>
             <el-form-item label="本站公开模型">
-              <el-select v-model="mapping.modelId" filterable placeholder="客户端请求使用的模型名"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.id" /></el-select>
+              <el-select v-model="mapping.modelId" filterable placeholder="客户端请求使用的模型名"><el-option v-for="model in sortedPublicModels" :key="model.id" :label="model.name" :value="model.id" /></el-select>
               <small class="field-note">Codex 和 OpenAI 客户端请求时使用的模型名称</small>
             </el-form-item>
           </div>
@@ -611,7 +692,9 @@ onMounted(loadData)
               </el-form-item>
             </div>
           </section>
-        </article>
+          </article>
+        </section>
+        </template>
       </el-form>
       <template #footer><div class="drawer-actions"><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></div></template>
     </el-drawer>
@@ -643,6 +726,11 @@ onMounted(loadData)
 .cache-metric { width: 132px; }
 .cache-meter { width: 100%; height: 4px; overflow: hidden; border-radius: 2px; background: var(--rose-border); }
 .cache-meter span { display: block; height: 100%; background: var(--rose-amber); }
+.mapping-group { display: grid; gap: 10px; margin-top: 14px; }
+.mapping-group-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--rose-border); }
+.mapping-group-heading h4 { color: var(--rose-text); font-size: 13px; font-weight: 650; }
+.mapping-group-heading span { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.mapping-group-empty { padding: 14px; border: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); font-size: 12px; text-align: center; }
 .mapping-editor { margin-bottom: 12px; padding: 14px; border: 1px solid var(--rose-border); border-radius: 6px; background: var(--rose-surface); }
 .mapping-editor-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--rose-border); }
 .mapping-editor-header > div:first-child { display: grid; min-width: 0; gap: 2px; }
