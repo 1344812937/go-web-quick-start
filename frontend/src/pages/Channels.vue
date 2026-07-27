@@ -27,6 +27,7 @@ interface MappingDraft {
   enabled: boolean
 }
 
+const maxVisibleChannelModels = 3
 const loading = ref(true)
 const saving = ref(false)
 const errorMessage = ref('')
@@ -279,6 +280,14 @@ function modelName(modelId: number): string {
   return models.value.find((model) => model.id === modelId)?.name ?? `#${modelId}`
 }
 
+function visibleChannelModels(channel: Channel): ChannelModel[] {
+  return channel.models.slice(0, maxVisibleChannelModels)
+}
+
+function hiddenChannelModels(channel: Channel): ChannelModel[] {
+  return channel.models.slice(maxVisibleChannelModels)
+}
+
 function formatPercent(value: number): string {
   return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
 }
@@ -427,7 +436,32 @@ onMounted(loadData)
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="模型" min-width="160"><template #default="scope"><span v-if="scope.row.models.length">{{ scope.row.models.map((item: ChannelModel) => modelName(item.modelId)).join('、') }}</span><span v-else class="muted-text">未映射</span></template></el-table-column>
+        <el-table-column label="模型" min-width="280">
+          <template #default="scope">
+            <div v-if="scope.row.models.length" class="channel-model-tags">
+              <el-tooltip v-for="item in visibleChannelModels(scope.row)" :key="item.id" :content="modelName(item.modelId)" placement="top" :show-after="300">
+                <el-tag class="channel-model-tag" effect="plain" type="info" tabindex="0">
+                  <span class="channel-model-tag-label">{{ modelName(item.modelId) }}</span>
+                </el-tag>
+              </el-tooltip>
+              <el-tooltip v-if="hiddenChannelModels(scope.row).length" placement="top" :show-after="200" popper-class="channel-model-overflow-popper">
+                <template #content>
+                  <div class="channel-model-overflow-content">
+                    <el-tag v-for="item in hiddenChannelModels(scope.row)" :key="item.id" effect="plain" type="info" size="small">{{ modelName(item.modelId) }}</el-tag>
+                  </div>
+                </template>
+                <el-tag
+                  class="channel-model-more-tag"
+                  effect="plain"
+                  type="info"
+                  tabindex="0"
+                  :aria-label="`还有 ${hiddenChannelModels(scope.row).length} 个模型，悬停查看`"
+                >+{{ hiddenChannelModels(scope.row).length }}</el-tag>
+              </el-tooltip>
+            </div>
+            <span v-else class="muted-text">未映射</span>
+          </template>
+        </el-table-column>
         <el-table-column label="近 5 天性能" min-width="390">
           <template #default="scope">
             <div v-if="scope.row.metrics.latencySeries.length" class="latency-metric-cell">
@@ -595,6 +629,12 @@ onMounted(loadData)
 .upstream-model-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-width: 0; }
 .upstream-model-option span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upstream-model-option small { flex-shrink: 0; color: var(--rose-text-subtle); font-size: 11px; }
+.channel-model-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; max-width: 100%; }
+.channel-model-tag { max-width: 126px; }
+.channel-model-tag :deep(.el-tag__content) { min-width: 0; }
+.channel-model-tag-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-model-more-tag { flex-shrink: 0; cursor: help; font-variant-numeric: tabular-nums; }
+.channel-model-overflow-content { display: flex; flex-wrap: wrap; gap: 6px; max-width: 360px; max-height: 220px; overflow-y: auto; padding: 2px; }
 .latency-metric-cell { display: flex; align-items: center; gap: 12px; min-height: 48px; }
 .metric-copy { display: grid; min-width: 0; gap: 2px; font-variant-numeric: tabular-nums; }
 .metric-copy strong { color: var(--rose-text); font-size: 13px; font-weight: 650; }
