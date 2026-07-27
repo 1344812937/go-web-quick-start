@@ -69,6 +69,7 @@ func TestOpenBrowserOnce(t *testing.T) {
 
 	openCount := 0
 	manager := &AppWebManager{
+		openBrowser: true,
 		browserOpener: func(string) error {
 			openCount++
 			return nil
@@ -80,5 +81,22 @@ func TestOpenBrowserOnce(t *testing.T) {
 
 	if openCount != 1 {
 		t.Fatalf("browser opened %d times, want 1", openCount)
+	}
+}
+
+func TestOpenBrowserOnceDisabled(t *testing.T) {
+	openCount := 0
+	manager := &AppWebManager{
+		openBrowser: false,
+		browserOpener: func(string) error {
+			openCount++
+			return nil
+		},
+	}
+
+	manager.openBrowserOnce("http://127.0.0.1:8888/static/")
+
+	if openCount != 0 {
+		t.Fatalf("browser opened %d times, want 0", openCount)
 	}
 }

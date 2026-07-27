@@ -89,10 +89,29 @@ cd frontend
 pnpm install --frozen-lockfile
 pnpm build
 cd ..
+cp .env.example .env
+# Edit .env before the first startup.
 go run .
 ```
 
-后端默认监听 `0.0.0.0:8888`，启动后会调用一次系统默认浏览器并打开 `http://127.0.0.1:8888/static/`。
+后端默认监听 `0.0.0.0:8888`，启动后会调用一次系统默认浏览器并打开 `http://127.0.0.1:8888/static/`。不需要自动打开时，在 `.env` 或系统环境变量中设置 `GATEWAY_OPEN_BROWSER=false`。
+
+程序启动时会默认读取运行目录下的 `.env`。操作系统中已经存在的环境变量优先，`.env` 只补充缺失值；文件不存在时不会报错，格式错误时会拒绝启动。需要配置：
+
+| 环境变量 | 要求 | 用途 |
+| --- | --- | --- |
+| `GATEWAY_MASTER_KEY` | 每次启动必需；Base64 编码的 32 字节密钥 | AES-GCM 加密和解密上游渠道 API Key。已有渠道后不得更换 |
+| `GATEWAY_ADMIN_USERNAME` | 仅数据库没有管理员时必需 | 创建首个管理员账号 |
+| `GATEWAY_ADMIN_PASSWORD` | 仅数据库没有管理员时必需；至少 12 个字符 | 创建首个管理员密码，数据库已有管理员后不再读取 |
+| `GATEWAY_OPEN_BROWSER` | 可选；默认 `true`，支持 `true/false` 或 `1/0` | 启动后是否自动使用系统默认浏览器打开本地管理页面 |
+
+可使用 `openssl rand -base64 32` 生成主密钥。`.env` 已被 Git 忽略，建议将文件权限设置为仅当前用户可读写：
+
+```bash
+chmod 600 .env
+```
+
+监听地址、端口、请求限制、超时和管理会话参数仍由运行目录下的 `config/config.toml` 管理，该文件会在首次启动时自动生成。
 
 前后端联调使用两个终端：
 

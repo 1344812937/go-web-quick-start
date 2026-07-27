@@ -89,6 +89,7 @@ type AppWebManager struct {
 	rootApi         pkgApi.IRootApi
 	browserOpenOnce sync.Once
 	browserOpener   func(string) error
+	openBrowser     bool
 }
 
 func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi, rootApi pkgApi.IRootApi) *AppWebManager {
@@ -97,12 +98,17 @@ func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []
 	if appConfig != nil {
 		webConfig = &appConfig.WebConfig
 	}
+	openBrowser, err := config.OpenBrowserOnStart()
+	if err != nil {
+		panic(err)
+	}
 	return &AppWebManager{
 		WebServer:     getGin(),
 		WebConfig:     webConfig,
 		apis:          apis,
 		rootApi:       rootApi,
 		browserOpener: openDefaultBrowser,
+		openBrowser:   openBrowser,
 	}
 }
 
@@ -153,7 +159,11 @@ func (awm *AppWebManager) Run(assertFs embed.FS) {
 	}()
 	log.Infof("application listening on %s", listenAddress)
 	log.Infof("local interface available at %s", localURL)
-	go awm.openBrowserOnce(localURL)
+	if awm.openBrowser {
+		go awm.openBrowserOnce(localURL)
+	} else {
+		log.Infof("automatic browser opening is disabled by %s", config.OpenBrowserOnStartEnvKey)
+	}
 }
 
 func (awm *AppWebManager) RegisterRouter() {
