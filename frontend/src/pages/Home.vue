@@ -13,6 +13,7 @@ const dashboard = ref<DashboardSummary | null>(null)
 const channels = ref<Channel[]>([])
 const models = ref<GatewayModel[]>([])
 const tokens = ref<ClientToken[]>([])
+const defaultCodexModel = 'gpt-5.6-sol'
 const selectedModel = ref('')
 const serviceBaseUrl = ref(typeof window === 'undefined' ? '/v1' : `${window.location.origin}/v1`)
 const copyingConfig = ref(false)
@@ -25,14 +26,21 @@ const maxDailyRequests = computed(() => Math.max(1, ...(dashboard.value?.daily.m
 const readyChannels = computed(() => channels.value.filter((channel) => channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())))
 const readyModels = computed(() => models.value.filter((model) => model.enabled && readyChannels.value.some((channel) => channel.models.some((mapping) => mapping.enabled && mapping.modelId === model.id))))
 const readyTokens = computed(() => tokens.value.filter((token) => token.enabled))
-const codexConfig = computed(() => `model = "${selectedModel.value || 'YOUR_MODEL'}"
-model_provider = "gateway"
+const codexConfig = computed(() => `model_provider = "custom"
+model = "${selectedModel.value || defaultCodexModel}"
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+model_reasoning_effort = "xhigh"
+disable_response_storage = true
+preferred_auth_method = "apikey"
+personality = "pragmatic"
 
-[model_providers.gateway]
-name = "OpenAI Gateway"
-base_url = "${serviceBaseUrl.value.trim() || '/v1'}"
-env_key = "OPENAI_API_KEY"
-wire_api = "responses"`)
+[model_providers]
+[model_providers.custom]
+name = "custom"
+wire_api = "responses"
+requires_openai_auth = true
+base_url = "${serviceBaseUrl.value.trim() || '/v1'}"`)
 
 function formatInteger(value: number): string {
   return new Intl.NumberFormat('zh-CN', { notation: value >= 100000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
@@ -66,7 +74,10 @@ async function loadDashboard() {
     models.value = modelItems
     tokens.value = tokenItems
     if (!readyModels.value.some((model) => model.name === selectedModel.value)) {
-      selectedModel.value = readyModels.value[0]?.name ?? modelItems.find((model) => model.enabled)?.name ?? ''
+      selectedModel.value = readyModels.value.find((model) => model.name === defaultCodexModel)?.name
+        ?? readyModels.value[0]?.name
+        ?? modelItems.find((model) => model.enabled)?.name
+        ?? ''
     }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '仪表盘加载失败'
