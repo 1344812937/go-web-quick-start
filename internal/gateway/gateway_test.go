@@ -807,6 +807,104 @@ func TestRouterOrdersStrategies(t *testing.T) {
 	}
 }
 
+func TestRouterSmoothWeightedPriorityBalancesAllocations(t *testing.T) {
+	tests := []struct {
+		name        string
+		weights     []int
+		allocations int
+		want        []int
+	}{
+		{name: "equal weights", weights: []int{1, 1}, allocations: 20, want: []int{10, 10}},
+		{name: "four to one", weights: []int{4, 1}, allocations: 50, want: []int{40, 10}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			router := &Router{random: func(int) int { return 0 }}
+			base := make([]RouteCandidate, len(test.weights))
+			for index, weight := range test.weights {
+				id := uint64(index + 1)
+				base[index] = RouteCandidate{
+					Channel: Channel{ID: id},
+					Mapping: ChannelModel{ID: id, ModelID: 1, Priority: 10, Weight: weight},
+				}
+			}
+			counts := make([]int, len(test.weights))
+			for range test.allocations {
+				candidates := append([]RouteCandidate(nil), base...)
+				router.orderCandidates(RoutingPriorityWeighted, candidates)
+				counts[int(candidates[0].Mapping.ID)-1]++
+			}
+			for index, want := range test.want {
+				if counts[index] != want {
+					t.Fatalf("allocation counts = %v, want %v", counts, test.want)
+				}
+			}
+		})
+	}
+}
+
+func TestRouterSmoothWeightedPriorityBalancesConcurrentAllocations(t *testing.T) {
+	router := &Router{random: func(int) int { return 0 }}
+	base := []RouteCandidate{
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, ModelID: 1, Priority: 10, Weight: 1}},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, ModelID: 1, Priority: 10, Weight: 1}},
+	}
+	const allocations = 100
+	results := make(chan uint64, allocations)
+	for range allocations {
+		go func() {
+			candidates := append([]RouteCandidate(nil), base...)
+			router.orderCandidates(RoutingPriorityWeighted, candidates)
+			results <- candidates[0].Mapping.ID
+		}()
+	}
+	counts := [2]int{}
+	for range allocations {
+		counts[<-results-1]++
+	}
+	if counts != [2]int{50, 50} {
+		t.Fatalf("concurrent allocation counts = %v, want [50 50]", counts)
+	}
+}
+
+func TestRouterSessionAffinityDoesNotConsumeWeightedAllocation(t *testing.T) {
+	store := newTestStore(t)
+	token, model, _, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	if err := store.db.Model(&ChannelModel{}).Where("model_id = ?", model.ID).Update("priority", 100).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(store, NewClientAccessService(store))
+	router.random = func(int) int { return 0 }
+
+	firstPlan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "new-session-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstMappingID := firstPlan.Candidates[0].Mapping.ID
+	router.RecordSessionAffinity(context.Background(), token.ID, model.ID, "new-session-a", firstMappingID)
+	for range 5 {
+		stickyPlan, stickyErr := router.Plan(context.Background(), token, model.Name, 10, 10, "", "new-session-a")
+		if stickyErr != nil {
+			t.Fatal(stickyErr)
+		}
+		if stickyPlan.Candidates[0].Mapping.ID != firstMappingID {
+			t.Fatalf("sticky mapping = %d, want %d", stickyPlan.Candidates[0].Mapping.ID, firstMappingID)
+		}
+	}
+
+	secondPlan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "new-session-b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSecondMappingID := mappings[0].ID
+	if wantSecondMappingID == firstMappingID {
+		wantSecondMappingID = mappings[1].ID
+	}
+	if secondPlan.Candidates[0].Mapping.ID != wantSecondMappingID {
+		t.Fatalf("second new session mapping = %d, want %d", secondPlan.Candidates[0].Mapping.ID, wantSecondMappingID)
+	}
+}
+
 func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	payload, err := ParseRelayPayload([]byte(`{
 		"model":"public-model",

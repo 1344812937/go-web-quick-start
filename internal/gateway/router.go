@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"sort"
+	"sync"
 	"time"
 
 	"gorm.io/gorm"
@@ -40,14 +41,31 @@ type RouteSelection struct {
 	Detail              string
 }
 
+type weightedPriorityKey struct {
+	ModelID  uint64
+	Priority int
+}
+
+type weightedPriorityState struct {
+	Weights map[uint64]int64
+	Current map[uint64]int64
+}
+
 type Router struct {
-	store  *Store
-	access *ClientAccessService
-	random func(int) int
+	store          *Store
+	access         *ClientAccessService
+	random         func(int) int
+	weightedMu     sync.Mutex
+	weightedStates map[weightedPriorityKey]*weightedPriorityState
 }
 
 func NewRouter(store *Store, access *ClientAccessService) *Router {
-	return &Router{store: store, access: access, random: secureIntn}
+	return &Router{
+		store:          store,
+		access:         access,
+		random:         secureIntn,
+		weightedStates: make(map[weightedPriorityKey]*weightedPriorityState),
+	}
 }
 
 func secureIntn(limit int) int {
@@ -97,7 +115,6 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 	if len(candidates) == 0 {
 		return nil, ErrNoAvailableChannel
 	}
-	r.orderCandidates(model.RoutingStrategy, candidates)
 	initialSelection := RouteSelection{Reason: SelectionReasonInitialRoute}
 	if sessionKey != "" {
 		affinity, affinityErr := r.sessionAffinity(ctx, token.ID, model.ID, sessionKey)
@@ -105,9 +122,11 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 			return nil, affinityErr
 		}
 		if affinity != nil {
+			r.orderCandidatesWithoutWeightedAdvance(model.RoutingStrategy, candidates)
 			if pinCandidate(candidates, affinity.ChannelModelID) {
 				initialSelection = RouteSelection{Reason: SelectionReasonSessionAffinity}
 			} else {
+				r.orderCandidates(model.RoutingStrategy, candidates)
 				initialSelection = r.unavailableSessionSelection(ctx, token.ID, model, sessionKey, affinity.ChannelModelID)
 			}
 			return &RoutePlan{
@@ -119,6 +138,7 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 			}, nil
 		}
 	}
+	r.orderCandidates(model.RoutingStrategy, candidates)
 	return &RoutePlan{Model: model, Candidates: candidates, InitialSelection: initialSelection}, nil
 }
 
@@ -263,35 +283,116 @@ func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) {
 	}
 }
 
+func (r *Router) orderCandidatesWithoutWeightedAdvance(strategy string, candidates []RouteCandidate) {
+	if strategy != RoutingPriorityWeighted {
+		r.orderCandidates(strategy, candidates)
+		return
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Mapping.Priority != candidates[j].Mapping.Priority {
+			return candidates[i].Mapping.Priority > candidates[j].Mapping.Priority
+		}
+		if candidates[i].Mapping.Weight != candidates[j].Mapping.Weight {
+			return candidates[i].Mapping.Weight > candidates[j].Mapping.Weight
+		}
+		return routeCandidateKey(candidates[i]) < routeCandidateKey(candidates[j])
+	})
+}
+
 func (r *Router) weightedPriorityOrder(candidates []RouteCandidate) {
 	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Mapping.Priority > candidates[j].Mapping.Priority })
 	ordered := make([]RouteCandidate, 0, len(candidates))
+	r.weightedMu.Lock()
+	defer r.weightedMu.Unlock()
+	if r.weightedStates == nil {
+		r.weightedStates = make(map[weightedPriorityKey]*weightedPriorityState)
+	}
 	for start := 0; start < len(candidates); {
 		end := start + 1
 		for end < len(candidates) && candidates[end].Mapping.Priority == candidates[start].Mapping.Priority {
 			end++
 		}
 		group := append([]RouteCandidate(nil), candidates[start:end]...)
-		for len(group) > 0 {
-			total := 0
-			for _, candidate := range group {
-				total += max(candidate.Mapping.Weight, 1)
-			}
-			pick := r.random(total)
-			selected := 0
-			for index, candidate := range group {
-				pick -= max(candidate.Mapping.Weight, 1)
-				if pick < 0 {
-					selected = index
-					break
-				}
-			}
-			ordered = append(ordered, group[selected])
-			group = append(group[:selected], group[selected+1:]...)
-		}
+		ordered = append(ordered, r.smoothWeightedGroup(group)...)
 		start = end
 	}
 	copy(candidates, ordered)
+}
+
+func (r *Router) smoothWeightedGroup(group []RouteCandidate) []RouteCandidate {
+	key := weightedPriorityKey{ModelID: group[0].Mapping.ModelID, Priority: group[0].Mapping.Priority}
+	state := r.weightedStates[key]
+	if !weightedStateMatches(state, group) {
+		// Availability or weight changes start a fresh schedule for the active group.
+		state = &weightedPriorityState{
+			Weights: make(map[uint64]int64, len(group)),
+			Current: make(map[uint64]int64, len(group)),
+		}
+		for _, candidate := range group {
+			state.Weights[routeCandidateKey(candidate)] = int64(max(candidate.Mapping.Weight, 1))
+		}
+		r.weightedStates[key] = state
+	}
+
+	// Smooth weighted round-robin adds each weight, selects the largest balance,
+	// then charges the selected candidate the group's total weight.
+	totalWeight := int64(0)
+	selectedIndexes := make([]int, 0, len(group))
+	maxCurrent := int64(0)
+	for index, candidate := range group {
+		candidateKey := routeCandidateKey(candidate)
+		weight := state.Weights[candidateKey]
+		state.Current[candidateKey] += weight
+		totalWeight += weight
+		current := state.Current[candidateKey]
+		if len(selectedIndexes) == 0 || current > maxCurrent {
+			maxCurrent = current
+			selectedIndexes = []int{index}
+		} else if current == maxCurrent {
+			selectedIndexes = append(selectedIndexes, index)
+		}
+	}
+	selectedIndex := selectedIndexes[0]
+	if len(selectedIndexes) > 1 && r.random != nil {
+		selectedIndex = selectedIndexes[r.random(len(selectedIndexes))]
+	}
+	selectedKey := routeCandidateKey(group[selectedIndex])
+	state.Current[selectedKey] -= totalWeight
+
+	selected := group[selectedIndex]
+	remaining := append(group[:selectedIndex:selectedIndex], group[selectedIndex+1:]...)
+	sort.SliceStable(remaining, func(i, j int) bool {
+		leftKey := routeCandidateKey(remaining[i])
+		rightKey := routeCandidateKey(remaining[j])
+		if state.Current[leftKey] != state.Current[rightKey] {
+			return state.Current[leftKey] > state.Current[rightKey]
+		}
+		if state.Weights[leftKey] != state.Weights[rightKey] {
+			return state.Weights[leftKey] > state.Weights[rightKey]
+		}
+		return leftKey < rightKey
+	})
+	return append([]RouteCandidate{selected}, remaining...)
+}
+
+func weightedStateMatches(state *weightedPriorityState, group []RouteCandidate) bool {
+	if state == nil || len(state.Weights) != len(group) {
+		return false
+	}
+	for _, candidate := range group {
+		weight, ok := state.Weights[routeCandidateKey(candidate)]
+		if !ok || weight != int64(max(candidate.Mapping.Weight, 1)) {
+			return false
+		}
+	}
+	return true
+}
+
+func routeCandidateKey(candidate RouteCandidate) uint64 {
+	if candidate.Mapping.ID != 0 {
+		return candidate.Mapping.ID
+	}
+	return candidate.Channel.ID
 }
 
 func (r *Router) RecordAffinity(ctx context.Context, responseID string, channelModelID uint64) {
