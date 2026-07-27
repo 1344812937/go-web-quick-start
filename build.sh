@@ -62,20 +62,20 @@ build_target() {
 	local goos="$1"
 	local goarch="$2"
 	local output="$3"
-	GOOS="$goos" GOARCH="$goarch" go build -buildvcs=false -o "$output" .
+	CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -buildvcs=false -o "$output" .
 }
 
 echo "+ Linux！"
-# Linux 版本
-build_target linux amd64 "build/${APP_NAME}-linux-amd64-${VERSION}"
+build_target linux amd64 "build/${APP_NAME}-linux-x86-${VERSION}"
+build_target linux arm64 "build/${APP_NAME}-linux-arm64-${VERSION}"
 
 echo "+ Windows！"
-# Windows 版本
-build_target windows amd64 "build/${APP_NAME}-windows-amd64-${VERSION}.exe"
+build_target windows amd64 "build/${APP_NAME}-windows-x86-${VERSION}.exe"
+build_target windows arm64 "build/${APP_NAME}-windows-arm64-${VERSION}.exe"
 
 echo "+ macOS！"
-# macOS 版本（可选）
-build_target darwin amd64 "build/${APP_NAME}-darwin-amd64-${VERSION}"
+build_target darwin amd64 "build/${APP_NAME}-darwin-x86-${VERSION}"
+build_target darwin arm64 "build/${APP_NAME}-darwin-arm64-${VERSION}"
 
 echo "✅ 构建完成！"
 ls -lh build/
