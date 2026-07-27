@@ -1,197 +1,124 @@
-# Go + Vue 快速功能开发脚手架
+# OpenAI 网关控制台
 
-这是一个面向快速功能搭建的 Go + Vue 3 单仓库项目，目标是用尽量少的装配工作完成结构简单、便于修改的 Web 应用。它适合功能展示、原型验证、内部工具和其他轻量场景，也可以作为 Agent 持续开发的稳定起点。
+一个使用 Go、Gin、SQLite 和 Vue 3 构建的 OpenAI 兼容多渠道网关。它在单个管理控制台中提供上游渠道、模型映射、访问令牌、调用日志和会话时间线管理，适合本地部署、内部服务接入和网关能力验证。
 
 仓库地址：[1344812937/go-web-quick-start](https://github.com/1344812937/go-web-quick-start)
 
-## 项目包含什么
+当前功能分支：`codex/feature-openai-gateway`
 
-- Gin Web 服务与内嵌前端资源
-- Wire 依赖注入
-- GORM 与 SQLite 基础能力
-- Vue 3、Vue Router、Vite、Element Plus
-- 支持递归多级的功能菜单
-- 菜单与页面路由统一注册
-- 本地配置、站点信息和令牌示例
-- 项目身份生成、校验与批量重命名工具
-- 面向 Agent 的需求模板、开发规范和 SUPOS 工业主题规则
+## 主要功能
 
-Go 二进制会嵌入 `frontend/dist/`，发布时不需要单独部署前端目录。项目名称、模块路径、版本、描述、令牌前缀和 favicon 统一维护在 `project.json`。
-
-## 使用 Agent 开发
-
-让 Agent 在仓库根目录工作，并在开始前明确要求它读取 [AGENTS.md](AGENTS.md)。该文档包含环境检测、安装失败处理、分支建议、菜单注册、主题、测试、安全和打包规范。
-
-推荐的任务描述：
-
-```text
-请先读取 AGENTS.md，并根据任务读取 docs/prompts 下对应模板。
-在当前项目基础上实现 <功能目标>。
-新功能需要直接挂载到 <父菜单或菜单分组>，页面风格使用默认 SUPOS 工业主题。
-请完成构建、测试和实际页面验证，不要覆盖工作区已有修改。
-```
-
-需求还不完整时，可从以下模板选择：
-
-- [功能开发模板](docs/prompts/feature-request.md)
-- [模块开发模板](docs/prompts/module-request.md)
-- [页面调整模板](docs/prompts/page-change-request.md)
-
-模板不是开发前置条件。目标、范围和验收方式已经明确时，Agent 应直接实施，只对会改变实现的缺失信息提问。
-
-## 功能菜单开发约定
-
-所有面向用户的新功能都应成为功能菜单。新增页面直接登记在 `frontend/src/navigation/index.ts` 的 `navigationGroups` 中，Vue Router 会从同一配置自动生成路由，不需要再编辑独立路由表。
-
-菜单项支持任意实用层级的 `children`。一个可访问页面叶子需要提供：
-
-```ts
-{
-  key: 'device-monitoring',
-  path: '/device-monitoring',
-  routeName: 'device-monitoring',
-  label: '设备监控',
-  icon: Monitor,
-  component: () => import('@/pages/DeviceMonitoring.vue'),
-}
-```
-
-将该对象放到目标父菜单的 `children` 中即可形成多级菜单。菜单采用“配置即显示”，不做角色、权限、租户、隐藏或灰度过滤；登记后直接可见、可访问。菜单搜索会保留父级路径，访问子页面会展开父菜单并生成完整面包屑。
-
-## 项目结构
-
-```text
-.
-├── cmd/                         # Wire 定义与生成代码
-├── docs/
-│   ├── design/                  # SUPOS 工业主题规则
-│   └── prompts/                 # 功能、模块、页面需求模板
-├── frontend/
-│   ├── public/                  # 公共静态资源
-│   └── src/
-│       ├── components/          # Vue 组件
-│       ├── navigation/          # 功能菜单与路由注册源
-│       └── pages/               # 功能页面
-├── internal/                    # 应用、API、配置及基础设施实现
-├── pkg/                         # 可复用模型与服务能力
-├── tools/projectctl/            # 项目身份管理工具
-├── AGENTS.md                    # Agent 开发规范
-└── project.json                 # 项目身份清单
-```
+- 兼容 `GET /v1/models`、`POST /v1/chat/completions` 和 `POST /v1/responses`
+- 管理多个 OpenAI 兼容上游渠道及渠道模型映射
+- 按公开模型配置路由优先级、会话亲和、失败重试和熔断切换
+- 签发、轮换、停用客户端访问令牌，统计 Token 与费用
+- 查看运行总览、调用日志和最近五天的会话渠道时间线
+- 在时间线中展示渠道切换前后快照及停用、熔断、限流、5xx、网络或响应错误等原因
+- 管理员登录、密码修改、Cookie 安全属性及请求超时配置
+- 单个 Go 二进制嵌入前端资源，使用 SQLite 保存配置和运行数据
 
 ## 快速开始
 
-环境要求：Go `1.25.4`、Node.js `^20.19.0 || >=22.12.0`、pnpm `10.23.0`。多平台安装和故障处理见 [AGENTS.md](AGENTS.md#快速开始)。
+环境要求：Go `1.25.4`、Node.js `^20.19.0 || >=22.12.0`、pnpm `10.23.0`。
 
 ```bash
 go mod download
-cd frontend
-pnpm install --frozen-lockfile
-pnpm build
-cd ..
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
 cp .env.example .env
-# Edit .env before the first startup.
 go run .
 ```
 
-后端默认监听 `0.0.0.0:8888`，启动后会调用一次系统默认浏览器并打开 `http://127.0.0.1:8888/static/`。不需要自动打开时，在 `.env` 或系统环境变量中设置 `GATEWAY_OPEN_BROWSER=false`。
+服务默认监听 `0.0.0.0:8888`，管理控制台地址为 `http://127.0.0.1:8888/static/`。如不需要启动时自动打开浏览器，在 `.env` 中设置 `GATEWAY_OPEN_BROWSER=false`。
 
-程序启动时会默认读取运行目录下的 `.env`。操作系统中已经存在的环境变量优先，`.env` 只补充缺失值；文件不存在时不会报错，格式错误时会拒绝启动。需要配置：
+首次启动前需要配置以下环境变量：
 
 | 环境变量 | 要求 | 用途 |
 | --- | --- | --- |
-| `GATEWAY_MASTER_KEY` | 每次启动必需；Base64 编码的 32 字节密钥 | AES-GCM 加密和解密上游渠道 API Key。已有渠道后不得更换 |
-| `GATEWAY_ADMIN_USERNAME` | 仅数据库没有管理员时必需 | 创建首个管理员账号 |
-| `GATEWAY_ADMIN_PASSWORD` | 仅数据库没有管理员时必需；至少 12 个字符 | 创建首个管理员密码，数据库已有管理员后不再读取 |
-| `GATEWAY_OPEN_BROWSER` | 可选；默认 `true`，支持 `true/false` 或 `1/0` | 启动后是否自动使用系统默认浏览器打开本地管理页面 |
+| `GATEWAY_MASTER_KEY` | 必需；Base64 编码的 32 字节密钥 | AES-GCM 加密上游渠道 API Key；已有渠道后不得更换 |
+| `GATEWAY_ADMIN_USERNAME` | 数据库尚无管理员时必需 | 创建首个管理员账号 |
+| `GATEWAY_ADMIN_PASSWORD` | 数据库尚无管理员时必需；至少 12 个字符 | 创建首个管理员密码 |
+| `GATEWAY_OPEN_BROWSER` | 可选，默认 `true` | 控制启动后是否打开本地管理页面 |
 
-可使用 `openssl rand -base64 32` 生成主密钥。`.env` 已被 Git 忽略，建议将文件权限设置为仅当前用户可读写：
+可使用 `openssl rand -base64 32` 生成主密钥。`.env`、`config/config.toml`、数据库和运行日志均不应提交到版本库。
+
+## 调用网关
+
+在控制台中完成以下配置：
+
+1. 新增上游渠道并填写 Base URL 与 API Key。
+2. 为渠道发现或维护上游模型映射。
+3. 创建公开模型并关联可用渠道。
+4. 在“访问令牌”中签发客户端令牌。
+
+随后使用 OpenAI 兼容客户端访问本服务：
 
 ```bash
-chmod 600 .env
+curl http://127.0.0.1:8888/v1/chat/completions \
+  -H "Authorization: Bearer <gateway-token>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "<public-model>",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
 ```
 
-监听地址、端口、请求限制、超时和管理会话参数仍由运行目录下的 `config/config.toml` 管理，该文件会在首次启动时自动生成。
+网关保持现有请求格式并代理流式或非流式响应。一次请求最多尝试三次；重试状态、传输错误、响应读取错误和熔断切换会记录在调用明细中。
 
-前后端联调使用两个终端：
+## 数据与保留策略
+
+- 请求日志、上游尝试及会话时间线固定保留最近五天，并由每日清理任务删除更早明细。
+- 较早数据只保留按令牌汇总的每日统计，不保留完整请求、参数或渠道切换原因。
+- 会话详情按时间从旧到新展示。历史记录没有路由元数据时，只推断同一请求内可以确认的失败；跨请求原因不会根据渠道当前状态反推。
+- 渠道密钥使用 `GATEWAY_MASTER_KEY` 加密。主密钥丢失或更换后，已有渠道凭据无法恢复。
+
+## 开发与构建
+
+前后端联调需要同时启动 Go 服务和 Vite：
 
 ```bash
-# 终端一，首次运行前需保证 frontend/dist 已生成
+# 终端一
 go run .
 
 # 终端二
 pnpm --dir frontend dev
 ```
 
-Vite 将 `/api` 代理到 `http://127.0.0.1:8888`。仅启动 Vite 时只能查看前端外观，依赖 API 的页面会提示先启动 Go 服务。
+Vite 将 `/api` 代理到 `http://127.0.0.1:8888`。生产构建会自动读取当前 Git 分支并在“系统设置”中展示；CI 可通过 `GATEWAY_BUILD_BRANCH` 显式指定构建分支。
 
-## 构建与校验
+交付前执行：
 
 ```bash
-pnpm --dir frontend build
 go run ./tools/projectctl check
 go test ./...
 go vet ./...
 go build -buildvcs=false ./...
+pnpm --dir frontend build
 ```
 
-跨平台产物输出到 `build/`：
+使用 `./build.sh` 构建跨平台产物。可通过 `PACKAGE_NAME=<name> ./build.sh` 指定本次产物名，否则脚本会优先使用当前业务分支生成名称。
 
-```bash
-./build.sh
+## 项目结构
+
+```text
+.
+├── cmd/                         # Wire 依赖注入定义与生成代码
+├── frontend/src/
+│   ├── components/              # Vue 公共组件和会话时间线
+│   ├── navigation/              # 菜单与页面路由唯一注册源
+│   └── pages/                   # 网关运营与系统设置页面
+├── internal/api/                # 管理接口和 OpenAI 兼容入口
+├── internal/gateway/            # 路由、转发、熔断、计费与日志
+├── pkg/                         # 通用 API、Repository、Service 和事务能力
+├── tools/projectctl/            # 项目身份生成与一致性检查
+├── AGENTS.md                    # 开发、测试和安全约定
+└── project.json                 # 项目身份唯一来源
 ```
-
-可使用 `PACKAGE_NAME=my-app ./build.sh` 指定本次产物名。未指定时，脚本优先从具有业务含义的当前分支名生成。
-
-## 页面与 API
-
-| 功能 | 页面或接口 |
-| --- | --- |
-| 运行总览 | `/static/` |
-| 基础设置 | `/static/settings` |
-| 站点信息 | `GET /api/site/info` |
-| 读取设置 | `GET /api/settings` |
-| 保存设置 | `PUT /api/settings` |
-
-首次启动会在 `config/config.toml` 生成本地配置。该目录已被 Git 忽略，不要提交其中的令牌或环境配置。
-
-## 项目个性化
-
-编辑 `project.json` 后执行：
-
-```bash
-go run ./tools/projectctl generate
-go run ./tools/projectctl check
-```
-
-需要同时修改 Go module、内部 import 和生成元数据时：
-
-```bash
-go run ./tools/projectctl rename \
-  --module <module-path> \
-  --binary <binary-name> \
-  --app <application-name> \
-  --display "<display name>" \
-  --description "<application description>" \
-  --token-prefix <token_prefix> \
-  --favicon /favicon.svg
-```
-
-现有 `config/config.toml` 和已有令牌不会被自动迁移。
-
-## Agent 与界面规范
-
-- 开发前检查工作区状态并保留用户修改。
-- 新功能页面必须直接挂载到功能菜单。
-- 页面开发默认读取 `docs/design/supos-industrial/THEME.md`。
-- 当前 UI 只是功能示例，不限制后续业务布局；用户指定其他风格时可重新设计。
-- 修改后执行与风险匹配的构建、测试和桌面/移动端检查。
-- 系统安装、全局依赖、代理或管理员权限操作必须先取得用户批准。
 
 ## 免责声明
 
-本项目按现状提供，主要用于快速开发、功能演示和原型验证，不默认满足生产环境的安全性、稳定性、性能、可用性或合规要求。
+本项目按“现状”提供，不附带任何明示或暗示保证，包括但不限于适销性、特定用途适用性、稳定性、安全性、可用性或合规性保证。
 
-部署到正式环境前，使用者应自行完成身份认证、HTTPS、访问控制、输入校验、日志审计、备份恢复和监控告警，并更换示例令牌、默认配置及其他敏感信息。开放 `0.0.0.0` 监听时，应结合防火墙和网络边界限制访问范围。
+使用者应自行评估本项目及所接入模型服务是否适用于目标场景，并负责身份认证、访问控制、HTTPS、密钥管理、日志与隐私保护、数据跨境、内容合规、费用控制、备份恢复和监控告警。部署、配置、数据处理、第三方服务调用及其产生的费用、损失或法律责任均由使用者自行承担。
 
-第三方依赖遵循各自许可证。使用、修改、分发和部署本项目产生的风险及责任由使用者自行评估和承担。
+本项目与 OpenAI 无隶属、授权或背书关系。“OpenAI”是其权利人的商标。第三方依赖和上游服务分别遵循其自身许可证、服务条款及隐私政策。

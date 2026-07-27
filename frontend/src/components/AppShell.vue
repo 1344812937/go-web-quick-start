@@ -134,7 +134,7 @@ watch(() => route.path, () => {
       </div>
 
       <div class="header-actions">
-        <span class="header-status"><i aria-hidden="true"></i>网关就绪</span>
+        <span class="header-status" title="运行状态：网关就绪"><i aria-hidden="true"></i>{{ projectMeta.displayName }}</span>
         <el-dropdown trigger="click" @command="handleAccountCommand">
 			<button class="account-button" type="button" :disabled="logoutLoading">
             <span class="account-avatar" aria-hidden="true">{{ user?.username.slice(0, 1).toUpperCase() }}</span>

@@ -1,10 +1,13 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Check, Refresh } from '@element-plus/icons-vue'
+import { Check, Link, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import projectMeta from '@/config/project.generated.js'
 import type { ApplicationSettings } from '@/types/gateway'
 import { request } from '@/utils/api'
 
+const repositoryUrl = 'https://github.com/1344812937/go-web-quick-start'
+const buildBranch = __BUILD_BRANCH__
 const loading = ref(true)
 const saving = ref(false)
 const errorMessage = ref('')
@@ -92,6 +95,22 @@ onMounted(loadSettings)
 
       <div class="settings-actions"><el-button type="primary" :icon="Check" :loading="saving" native-type="submit">保存设置</el-button></div>
     </el-form>
+
+    <section class="surface-panel settings-section project-section">
+      <header class="panel-heading"><div><h2>项目与责任说明</h2><p>当前构建来源和使用边界</p></div></header>
+      <dl class="project-metadata">
+        <div><dt>项目名称</dt><dd>{{ projectMeta.displayName }}</dd></div>
+        <div><dt>构建分支</dt><dd><code>{{ buildBranch }}</code></dd></div>
+        <div class="repository-row">
+          <dt>GitHub 仓库</dt>
+          <dd><el-link :icon="Link" :href="repositoryUrl" target="_blank" rel="noreferrer">{{ repositoryUrl }}</el-link></dd>
+        </div>
+      </dl>
+      <div class="disclaimer" role="note" aria-label="免责声明">
+        <strong>免责声明</strong>
+        <p>本项目按“现状”提供，不附带任何明示或暗示保证。使用者应自行评估适用性、安全性与合规性，并承担部署、配置、数据处理及第三方服务调用产生的风险与责任。</p>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -100,6 +119,23 @@ onMounted(loadSettings)
 .settings-fields { padding: 20px 22px 8px; }
 .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 18px; }
 .settings-actions { display: flex; justify-content: flex-end; position: sticky; bottom: 12px; padding: 10px; border: 1px solid var(--rose-border); background: var(--rose-surface); }
+.project-section { margin-top: 16px; }
+.project-metadata { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 0; padding: 20px 22px; }
+.project-metadata > div { min-width: 0; }
+.project-metadata dt { margin-bottom: 6px; color: var(--rose-text-subtle); font-size: 11px; }
+.project-metadata dd { min-width: 0; margin: 0; color: var(--rose-text); font-size: 13px; font-weight: 650; overflow-wrap: anywhere; }
+.project-metadata code { font-family: var(--rose-font-mono); font-size: 12px; font-weight: 500; }
+.repository-row { grid-column: 1 / -1; }
+.repository-row :deep(.el-link) { max-width: 100%; font-size: 12px; vertical-align: top; }
+.repository-row :deep(.el-link__inner) { min-width: 0; overflow-wrap: anywhere; text-align: left; }
+.disclaimer { margin: 0 22px 22px; padding: 14px 16px; border-left: 3px solid var(--rose-warning); background: var(--rose-surface-muted); color: var(--rose-text-muted); }
+.disclaimer strong { display: block; margin-bottom: 5px; color: var(--rose-text); font-size: 12px; }
+.disclaimer p { margin: 0; font-size: 12px; line-height: 1.7; }
 @media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr 1fr; } }
-@media (max-width: 520px) { .settings-grid { grid-template-columns: 1fr; } }
+@media (max-width: 520px) {
+  .settings-grid, .project-metadata { grid-template-columns: 1fr; }
+  .repository-row { grid-column: auto; }
+  .project-metadata { gap: 14px; padding: 18px; }
+  .disclaimer { margin: 0 18px 18px; }
+}
 </style>

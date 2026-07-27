@@ -4,8 +4,8 @@ const projectMeta = Object.freeze({
   "goModule": "github.com/1344812937/go-web-quick-start",
   "binaryName": "go-web-quick-start",
   "appName": "go-web-quick-start",
-  "displayName": "Go Web Quick Start",
-  "description": "A Go and Vue 3 monorepo scaffold for rapid feature development.",
+  "displayName": "OpenAI 网关控制台",
+  "description": "OpenAI 兼容的多渠道网关控制台，支持模型路由、会话亲和、失败重试、熔断、令牌和五天调用时间线。",
   "version": "0.1.0",
   "tokenPrefix": "quickstart",
   "faviconPath": "/favicon.svg"

@@ -1,3 +1,5 @@
+declare const __BUILD_BRANCH__: string
+
 declare module '*.vue' {
     import type { DefineComponent } from 'vue'
     const component: DefineComponent<{}, {}, any>
