@@ -28,8 +28,16 @@ type SessionDetailQuery struct {
 	SessionID string
 	RequestID string
 	TokenID   uint64
+	Status    string
 	Page      int
 	PageSize  int
+}
+
+type SessionTitleInput struct {
+	SessionID string `json:"sessionId"`
+	RequestID string `json:"requestId"`
+	TokenID   uint64 `json:"tokenId"`
+	Title     string `json:"title"`
 }
 
 type SessionChannelView struct {
@@ -83,6 +91,7 @@ type SessionLogSummary struct {
 
 type SessionLogPage struct {
 	Items    []SessionLogSummary `json:"items"`
+	Summary  LogAggregateSummary `json:"summary"`
 	Total    int64               `json:"total"`
 	Page     int                 `json:"page"`
 	PageSize int                 `json:"pageSize"`
@@ -114,6 +123,10 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		Group("token_id, " + sessionGroupExpression)
 	var total int64
 	if err := s.store.db.WithContext(ctx).Table("(?) AS session_groups", grouped).Count(&total).Error; err != nil {
+		return nil, err
+	}
+	summary, err := aggregateLogSummary(applySessionLogFilters(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}), query, cutoff))
+	if err != nil {
 		return nil, err
 	}
 
@@ -158,14 +171,19 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		}
 		items = append(items, summary)
 	}
-	return &SessionLogPage{Items: items, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
+	return &SessionLogPage{Items: items, Summary: summary, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
 }
 
 func applySessionLogFilters(db *gorm.DB, query SessionLogQuery, cutoff time.Time) *gorm.DB {
 	db = db.Where("created_at >= ?", cutoff)
 	if value := strings.TrimSpace(query.Session); value != "" {
 		pattern := "%" + value + "%"
-		db = db.Where("(session_name LIKE ? OR codex_session_id LIKE ? OR id LIKE ?)", pattern, pattern, pattern)
+		db = db.Where(
+			"(session_name LIKE ? OR codex_session_id LIKE ? OR id LIKE ? OR EXISTS ("+
+				"SELECT 1 FROM relay_session_states s WHERE s.token_id = relay_request_logs.token_id "+
+				"AND s.session_id = relay_request_logs.codex_session_id AND s.title LIKE ?))",
+			pattern, pattern, pattern, pattern,
+		)
 	}
 	if value := strings.TrimSpace(query.Model); value != "" {
 		db = db.Where("requested_model = ?", value)
@@ -217,16 +235,14 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		return nil, errors.New("sessionId with tokenId or requestId is required")
 	}
 	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
-	base := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query)
+	base := applySessionDetailStatus(applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query), query.Status)
 	var requestTotal int64
 	if err := base.Count(&requestTotal).Error; err != nil {
 		return nil, err
 	}
-	if requestTotal == 0 {
-		return nil, gorm.ErrRecordNotFound
-	}
 
 	type detailAggregate struct {
+		RequestCount      int64
 		SuccessCount      int64
 		AttemptCount      int64
 		InputTokens       int64
@@ -247,7 +263,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	}
 	var aggregate detailAggregate
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
-		Select("SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
+		Select("COUNT(*) AS request_count, SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
 			"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
 			"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 			"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
@@ -260,12 +276,15 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 			"MIN(unixepoch(created_at)) AS first_seen_unix, MAX(unixepoch(created_at)) AS last_seen_unix").Scan(&aggregate).Error; err != nil {
 		return nil, err
 	}
+	if aggregate.RequestCount == 0 {
+		return nil, gorm.ErrRecordNotFound
+	}
 	summary := SessionLogSummary{
 		SessionID:             query.SessionID,
 		Identified:            query.SessionID != "",
 		FallbackRequestID:     query.RequestID,
 		TokenID:               query.TokenID,
-		RequestCount:          requestTotal,
+		RequestCount:          aggregate.RequestCount,
 		SuccessCount:          aggregate.SuccessCount,
 		AttemptCount:          aggregate.AttemptCount,
 		InputTokens:           aggregate.InputTokens,
@@ -278,7 +297,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		UpstreamCost:          aggregate.UpstreamCost,
 		FirstTokenSampleCount: aggregate.FirstTokenSamples,
 		LatencySampleCount:    aggregate.LatencySamples,
-		DurationSampleCount:   requestTotal,
+		DurationSampleCount:   aggregate.RequestCount,
 		FirstSeenAt:           time.Unix(aggregate.FirstSeenUnix, 0).UTC(),
 		LastSeenAt:            time.Unix(aggregate.LastSeenUnix, 0).UTC(),
 	}
@@ -288,9 +307,9 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	}
 
 	var logs []RelayRequestLog
-	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
+	if err := applySessionDetailStatus(applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query), query.Status).
 		Omit("request_body", "response_body").
-		Order("created_at ASC, id ASC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
+		Order("created_at DESC, id DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
 		Find(&logs).Error; err != nil {
 		return nil, err
 	}
@@ -312,6 +331,17 @@ func applySessionIdentity(db *gorm.DB, query SessionDetailQuery) *gorm.DB {
 	return db.Where("id = ? AND codex_session_id = ''", query.RequestID)
 }
 
+func applySessionDetailStatus(db *gorm.DB, status string) *gorm.DB {
+	switch strings.TrimSpace(status) {
+	case "success":
+		return db.Where("status_code BETWEEN 200 AND 299")
+	case "failure":
+		return db.Where("status_code < 200 OR status_code >= 300")
+	default:
+		return db
+	}
+}
+
 func (s *ManagementService) populateSessionSummary(ctx context.Context, summary *SessionLogSummary, cutoff time.Time) error {
 	latestDB := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff)
 	firstDB := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff)
@@ -327,6 +357,18 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 		return err
 	}
 	summary.SessionName = first.SessionName
+	if summary.Identified {
+		var state RelaySessionState
+		if err := s.store.db.WithContext(ctx).
+			Where("token_id = ? AND session_id = ?", summary.TokenID, summary.SessionID).
+			First(&state).Error; err == nil {
+			if strings.TrimSpace(state.Title) != "" {
+				summary.SessionName = state.Title
+			}
+		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+	}
 	var latest RelayRequestLog
 	if err := latestDB.Order("created_at DESC, id DESC").First(&latest).Error; err != nil {
 		return err
@@ -365,6 +407,66 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 	}
 	summary.CurrentChannel = current
 	return nil
+}
+
+func (s *ManagementService) RenameSession(ctx context.Context, input SessionTitleInput) error {
+	input.SessionID = strings.TrimSpace(input.SessionID)
+	input.RequestID = strings.TrimSpace(input.RequestID)
+	input.Title = normalizeSessionName(input.Title)
+	if input.Title == "" {
+		return errors.New("session title is required")
+	}
+	if len([]rune(input.Title)) > 80 {
+		return errors.New("session title must not exceed 80 characters")
+	}
+	if (input.SessionID == "" && input.RequestID == "") || (input.SessionID != "" && input.TokenID == 0) {
+		return errors.New("sessionId with tokenId or requestId is required")
+	}
+	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	return s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		if input.SessionID == "" {
+			result := db.Model(&RelayRequestLog{}).
+				Where("id = ? AND codex_session_id = '' AND created_at >= ?", input.RequestID, cutoff).
+				Update("session_name", input.Title)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				return gorm.ErrRecordNotFound
+			}
+			return nil
+		}
+
+		var count int64
+		if err := db.Model(&RelayRequestLog{}).
+			Where("token_id = ? AND codex_session_id = ? AND created_at >= ?", input.TokenID, input.SessionID, cutoff).
+			Count(&count).Error; err != nil {
+			return err
+		}
+		if count == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		now := time.Now().UTC()
+		var state RelaySessionState
+		err := db.Where("token_id = ? AND session_id = ?", input.TokenID, input.SessionID).First(&state).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			if err := db.Create(&RelaySessionState{
+				TokenID: input.TokenID, SessionID: input.SessionID, Title: input.Title, TitleCustomized: true,
+				CreatedAt: now, UpdatedAt: now,
+			}).Error; err != nil {
+				return err
+			}
+		} else if err != nil {
+			return err
+		} else if err := db.Model(&state).Updates(map[string]any{
+			"title": input.Title, "title_customized": true, "updated_at": now,
+		}).Error; err != nil {
+			return err
+		}
+		return db.Model(&RelayRequestLog{}).
+			Where("token_id = ? AND codex_session_id = ?", input.TokenID, input.SessionID).
+			Update("session_name", input.Title).Error
+	})
 }
 
 func (s *ManagementService) currentSessionChannel(ctx context.Context, summary SessionLogSummary, modelName string, cutoff time.Time) (*SessionChannelView, error) {

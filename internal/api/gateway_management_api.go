@@ -38,6 +38,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.GET("/logs/:requestId", a.logDetail)
 	admin.GET("/sessions", a.sessions)
 	admin.GET("/sessions/detail", a.sessionDetail)
+	admin.PUT("/sessions/title", a.renameSession)
 
 	admin.GET("/channels", a.listChannels)
 	admin.POST("/channels", a.createChannel)
@@ -366,6 +367,7 @@ func (a *GatewayManagementApi) sessionDetail(c *gin.Context) {
 	query := gateway.SessionDetailQuery{
 		SessionID: c.Query("sessionId"),
 		RequestID: c.Query("requestId"),
+		Status:    c.Query("status"),
 	}
 	query.TokenID, _ = strconv.ParseUint(c.Query("tokenId"), 10, 64)
 	query.Page, _ = strconv.Atoi(c.Query("page"))
@@ -376,4 +378,16 @@ func (a *GatewayManagementApi) sessionDetail(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, common.S(item))
+}
+
+func (a *GatewayManagementApi) renameSession(c *gin.Context) {
+	var input gateway.SessionTitleInput
+	if !bindManagementJSON(c, &input) {
+		return
+	}
+	if err := a.management.RenameSession(c.Request.Context(), input); err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S[any](nil))
 }

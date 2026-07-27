@@ -73,7 +73,7 @@ func newTestStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&AdminUser{}, &AdminSession{}, &Channel{}, &GatewayModel{}, &ChannelModel{},
-		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
+		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
 		&ResponseAffinity{}, &SessionAffinity{},
 	); err != nil {
 		t.Fatal(err)
@@ -1150,6 +1150,9 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if page.Total != 2 || len(page.Items) != 2 {
 		t.Fatalf("session page = %+v", page)
 	}
+	if page.Summary.RequestCount != 3 || page.Summary.SuccessCount != 2 || page.Summary.AttemptCount != 3 || page.Summary.InputTokens != 160 || page.Summary.OutputTokens != 30 {
+		t.Fatalf("session page summary = %+v", page.Summary)
+	}
 	var identified, unknown *SessionLogSummary
 	for index := range page.Items {
 		if page.Items[index].Identified {
@@ -1179,26 +1182,38 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.RequestTotal != 2 || len(detail.Requests) != 2 || detail.Requests[0].ID != "session-request-1" || len(detail.Requests[1].Attempts) != 2 {
+	if detail.RequestTotal != 2 || len(detail.Requests) != 2 || detail.Requests[0].ID != "session-request-2" || len(detail.Requests[0].Attempts) != 2 || detail.Requests[1].ID != "session-request-1" {
 		t.Fatalf("session detail = %+v", detail)
 	}
-	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Summary.AverageFirstTokenMS != 50 || detail.Summary.AverageLatencyMS != 30 || detail.Summary.AverageDurationMS != 200 || detail.Requests[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].SentTokens != 100 {
+	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Summary.AverageFirstTokenMS != 50 || detail.Summary.AverageLatencyMS != 30 || detail.Summary.AverageDurationMS != 200 || detail.Requests[1].CacheWriteTokens != 10 || detail.Requests[1].Attempts[0].CacheWriteTokens != 10 || detail.Requests[1].Attempts[0].SentTokens != 100 {
 		t.Fatalf("session cache-write detail = %+v", detail)
 	}
-	if detail.Requests[0].Attempts[0].SelectionReason != SelectionReasonInitialRoute || detail.Requests[1].Attempts[0].SelectionReason != "" || detail.Requests[1].Attempts[1].SelectionReason != SelectionReasonRetryableStatus || detail.Requests[1].Attempts[1].PreviousChannelID != channels[0].ID {
+	if detail.Requests[1].Attempts[0].SelectionReason != SelectionReasonInitialRoute || detail.Requests[0].Attempts[0].SelectionReason != "" || detail.Requests[0].Attempts[1].SelectionReason != SelectionReasonRetryableStatus || detail.Requests[0].Attempts[1].PreviousChannelID != channels[0].ID {
 		t.Fatalf("session selection metadata = %+v", detail.Requests)
 	}
 	secondPage, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{SessionID: "codex-session", TokenID: token.ID, Page: 2, PageSize: 1})
-	if err != nil || len(secondPage.Requests) != 1 || secondPage.Requests[0].ID != "session-request-2" || secondPage.RequestTotal != 2 {
+	if err != nil || len(secondPage.Requests) != 1 || secondPage.Requests[0].ID != "session-request-1" || secondPage.RequestTotal != 2 {
 		t.Fatalf("session detail second page = %+v, %v", secondPage, err)
 	}
-	reasoning, ok := detail.Requests[1].RequestParameters["reasoning"].(map[string]any)
+	reasoning, ok := detail.Requests[0].RequestParameters["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "high" {
 		t.Fatalf("detail parameters = %#v", detail.Requests[0].RequestParameters)
+	}
+	successDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{SessionID: "codex-session", TokenID: token.ID, Status: "success", Page: 1, PageSize: 25})
+	if err != nil || successDetail.RequestTotal != 1 || len(successDetail.Requests) != 1 || successDetail.Requests[0].ID != "session-request-1" || successDetail.Summary.RequestCount != 2 {
+		t.Fatalf("successful session detail = %+v, %v", successDetail, err)
+	}
+	failureDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{SessionID: "codex-session", TokenID: token.ID, Status: "failure", Page: 1, PageSize: 25})
+	if err != nil || failureDetail.RequestTotal != 1 || len(failureDetail.Requests) != 1 || failureDetail.Requests[0].ID != "session-request-2" || failureDetail.Summary.RequestCount != 2 {
+		t.Fatalf("failed session detail = %+v, %v", failureDetail, err)
 	}
 	unknownDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{RequestID: "unknown-request", Page: 1, PageSize: 25})
 	if err != nil || unknownDetail.RequestTotal != 1 || unknownDetail.Summary.Identified {
 		t.Fatalf("unknown detail = %+v, %v", unknownDetail, err)
+	}
+	emptyFailureDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{RequestID: "unknown-request", Status: "failure", Page: 1, PageSize: 25})
+	if err != nil || emptyFailureDetail.RequestTotal != 0 || len(emptyFailureDetail.Requests) != 0 || emptyFailureDetail.Summary.RequestCount != 1 {
+		t.Fatalf("empty failed detail = %+v, %v", emptyFailureDetail, err)
 	}
 }
 
@@ -1471,6 +1486,9 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if err != nil || len(page.Items) != 1 || page.Items[0].RequestBody != "" || page.Items[0].ResponseBody != "" || page.Items[0].Attempts[0].RequestBody != "" {
 		t.Fatalf("lightweight log page = %+v, %v", page, err)
 	}
+	if page.Summary.RequestCount != 1 || page.Summary.SuccessCount != 1 || page.Summary.AttemptCount != 2 || page.Summary.InputTokens != 110 || page.Summary.OutputTokens != 25 || page.Summary.UpstreamCost != 42 {
+		t.Fatalf("log page summary = %+v", page.Summary)
+	}
 	detail, err := management.LogDetail(context.Background(), requestLog.ID)
 	if err != nil || detail.RequestBody != string(payloadBody) || !strings.Contains(detail.ResponseBody, `"id":"chatcmpl_1"`) || !strings.Contains(detail.Attempts[0].ResponseBody, `"code":"temporary"`) {
 		t.Fatalf("log detail = %+v, %v", detail, err)
@@ -1602,16 +1620,18 @@ func TestSSEEventHasOutputToken(t *testing.T) {
 	}
 }
 
-func TestRequestSessionNameUsesFirstUserText(t *testing.T) {
+func TestRequestSessionNameUsesLatestUserText(t *testing.T) {
 	tests := []struct {
 		name string
 		body string
 		want string
 	}{
 		{name: "chat string", body: `{"messages":[{"role":"assistant","content":"ignored"},{"role":"user","content":"  first   question here  "}]}`, want: "first ques"},
+		{name: "chat accumulated context", body: `{"messages":[{"role":"user","content":"old context"},{"role":"assistant","content":"old answer"},{"role":"user","content":"current user request"}]}`, want: "current us"},
 		{name: "chat parts", body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"private"}},{"type":"text","text":"inspect this image"}]}]}`, want: "inspect th"},
 		{name: "responses string", body: `{"input":"生成一份设备运行日报表"}`, want: "生成一份设备运行日报"},
 		{name: "responses messages", body: `{"input":[{"role":"developer","content":"ignored"},{"role":"user","content":[{"type":"input_text","text":"line one"},{"type":"input_text","text":"line two"}]}]}`, want: "line one l"},
+		{name: "responses accumulated context", body: `{"input":[{"role":"user","content":"older prompt"},{"role":"assistant","content":"older answer"},{"role":"user","content":"latest prompt"}]}`, want: "latest pro"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1619,6 +1639,83 @@ func TestRequestSessionNameUsesFirstUserText(t *testing.T) {
 				t.Fatalf("requestSessionName() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestSessionPayloadCompactionRetainsOnlyIncrement(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	sharedContext := strings.Repeat("shared system context ", 80)
+	first, _ := json.Marshal(map[string]any{
+		"model": "model-a", "instructions": sharedContext,
+		"messages": []any{
+			map[string]any{"role": "system", "content": "rules"},
+			map[string]any{"role": "user", "content": "first prompt"},
+		},
+	})
+	second, _ := json.Marshal(map[string]any{
+		"model": "model-a", "instructions": sharedContext,
+		"messages": []any{
+			map[string]any{"role": "system", "content": "rules"},
+			map[string]any{"role": "user", "content": "first prompt"},
+			map[string]any{"role": "assistant", "content": "first answer"},
+			map[string]any{"role": "user", "content": "second prompt"},
+		},
+	})
+
+	firstResponse := []byte(`{"choices":[{"message":{"role":"assistant","content":"first answer"}}]}`)
+	if got := compactSessionPayload(store.db, 7, "session-a", "request-1", "first prom", first, firstResponse, now); string(got) != string(first) {
+		t.Fatalf("first payload = %s", got)
+	}
+	compacted := compactSessionPayload(store.db, 7, "session-a", "request-2", "second pro", second, nil, now.Add(time.Minute))
+	var envelope payloadDeltaEnvelope
+	if err := json.Unmarshal(compacted, &envelope); err != nil {
+		t.Fatalf("decode compacted payload: %v (%s)", err, compacted)
+	}
+	messages, ok := envelope.Payload["messages"].([]any)
+	if envelope.Metadata.Mode != "session" || envelope.Metadata.BaseRequestID != "request-1" || envelope.Metadata.OmittedItems["messages"] != 3 || !ok || len(messages) != 1 {
+		t.Fatalf("compacted payload = %+v", envelope)
+	}
+	if _, exists := envelope.Payload["instructions"]; exists {
+		t.Fatalf("unchanged instructions were retained: %+v", envelope.Payload)
+	}
+	var state RelaySessionState
+	if err := store.db.Where("token_id = ? AND session_id = ?", 7, "session-a").First(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.Title != "first prom" || state.LatestRequestID != "request-2" {
+		t.Fatalf("session state = %+v", state)
+	}
+}
+
+func TestRenameSessionPersistsCustomTitle(t *testing.T) {
+	store := newTestStore(t)
+	log := RelayRequestLog{
+		ID: "request-title", TokenID: 9, Endpoint: "responses", RequestedModel: "model-a",
+		CodexSessionID: "session-title", SessionName: "自动标题", StatusCode: http.StatusOK, CreatedAt: time.Now(),
+	}
+	if err := store.db.Create(&log).Error; err != nil {
+		t.Fatal(err)
+	}
+	management := NewManagementService(store)
+	if err := management.RenameSession(context.Background(), SessionTitleInput{
+		TokenID: 9, SessionID: "session-title", Title: "  我的 自定义标题  ",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	page, err := management.SessionLogs(context.Background(), SessionLogQuery{Session: "自定义标题", Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.Items[0].SessionName != "我的 自定义标题" {
+		t.Fatalf("renamed session page = %+v", page.Items)
+	}
+	var state RelaySessionState
+	if err := store.db.Where("token_id = ? AND session_id = ?", 9, "session-title").First(&state).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !state.TitleCustomized || state.Title != "我的 自定义标题" {
+		t.Fatalf("custom title state = %+v", state)
 	}
 }
 

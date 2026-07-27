@@ -748,20 +748,21 @@ func requestSessionName(body []byte) string {
 		return ""
 	}
 	if messages, ok := payload["messages"].([]any); ok {
-		if text := firstUserMessageText(messages); text != "" {
+		if text := latestUserMessageText(messages); text != "" {
 			return truncateRunes(normalizeSessionName(text), 10)
 		}
 	}
 	if input, exists := payload["input"]; exists {
-		if text := firstResponsesInputText(input); text != "" {
+		if text := latestResponsesInputText(input); text != "" {
 			return truncateRunes(normalizeSessionName(text), 10)
 		}
 	}
 	return ""
 }
 
-func firstUserMessageText(messages []any) string {
-	for _, item := range messages {
+func latestUserMessageText(messages []any) string {
+	for index := len(messages) - 1; index >= 0; index-- {
+		item := messages[index]
 		message, _ := item.(map[string]any)
 		role, _ := message["role"].(string)
 		if role != "user" {
@@ -774,12 +775,13 @@ func firstUserMessageText(messages []any) string {
 	return ""
 }
 
-func firstResponsesInputText(input any) string {
+func latestResponsesInputText(input any) string {
 	if text, ok := input.(string); ok {
 		return text
 	}
 	items, _ := input.([]any)
-	for _, item := range items {
+	for index := len(items) - 1; index >= 0; index-- {
+		item := items[index]
 		switch typed := item.(type) {
 		case string:
 			if strings.TrimSpace(typed) != "" {
@@ -1049,7 +1051,8 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		result.upstreamCost = 0
 		result.costSource = CostSourceFailedZero
 	}
-	requestBody, requestBodyTruncated := storedPayload(result.requestBody, false)
+	compactedRequestBody := compactAttemptPayload(result.requestBody, execution.rawBody, execution.requestID)
+	requestBody, requestBodyTruncated := storedPayload(compactedRequestBody, len(result.requestBody) > maxDetailedPayloadBytes)
 	responseBody, responseBodyTruncated := storedPayload(result.body, result.bodyTruncated)
 	log := RelayAttemptLog{
 		RequestID:             execution.requestID,
@@ -1115,8 +1118,8 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	if durationMS == 0 {
 		durationMS = elapsedMilliseconds(execution.startedAt, now)
 	}
-	requestBody, requestBodyTruncated := storedPayload(execution.rawBody, false)
 	responseBody, responseBodyTruncated := storedPayload(execution.responseBody, execution.responseBodyTruncated)
+	sessionName := requestSessionName(execution.rawBody)
 	log := RelayRequestLog{
 		ID:                    execution.requestID,
 		TokenID:               execution.token.ID,
@@ -1126,10 +1129,8 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		RequestedModel:        execution.payload.Model,
 		CodexSessionID:        truncateRunes(execution.payload.SessionKey, 512),
 		CodexSessionSource:    execution.payload.SessionSource,
-		SessionName:           requestSessionName(execution.rawBody),
+		SessionName:           sessionName,
 		RequestParametersJSON: execution.payload.RequestParametersJSON,
-		RequestBody:           requestBody,
-		RequestBodyTruncated:  requestBodyTruncated,
 		ResponseBody:          responseBody,
 		ResponseBodyTruncated: responseBodyTruncated,
 		StatusCode:            status,
@@ -1185,7 +1186,22 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
+	var responseForManifest []byte
+	if status >= 200 && status < 300 {
+		responseForManifest = execution.responseBody
+	}
 	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		compactedRequestBody := compactSessionPayload(
+			db,
+			execution.token.ID,
+			execution.payload.SessionKey,
+			execution.requestID,
+			sessionName,
+			execution.rawBody,
+			responseForManifest,
+			now,
+		)
+		log.RequestBody, log.RequestBodyTruncated = storedPayload(compactedRequestBody, len(execution.rawBody) > maxDetailedPayloadBytes)
 		if err := db.Create(&log).Error; err != nil {
 			return err
 		}

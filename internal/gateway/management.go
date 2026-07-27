@@ -192,6 +192,27 @@ type LogQuery struct {
 	PageSize   int
 }
 
+type LogAggregateSummary struct {
+	RequestCount          int64   `json:"requestCount"`
+	SuccessCount          int64   `json:"successCount"`
+	SuccessRate           float64 `json:"successRate"`
+	AttemptCount          int64   `json:"attemptCount"`
+	InputTokens           int64   `json:"inputTokens"`
+	NormalInputTokens     int64   `json:"normalInputTokens"`
+	OutputTokens          int64   `json:"outputTokens"`
+	CachedTokens          int64   `json:"cachedTokens"`
+	CacheWriteTokens      int64   `json:"cacheWriteTokens"`
+	SentTokens            int64   `json:"sentTokens"`
+	EstimatedCost         int64   `json:"estimatedCostMicros"`
+	UpstreamCost          int64   `json:"upstreamCostMicros"`
+	AverageFirstTokenMS   float64 `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64   `json:"firstTokenSampleCount"`
+	AverageLatencyMS      float64 `json:"averageLatencyMs"`
+	LatencySampleCount    int64   `json:"latencySampleCount"`
+	AverageDurationMS     float64 `json:"averageDurationMs"`
+	DurationSampleCount   int64   `json:"durationSampleCount"`
+}
+
 type RelayRequestView struct {
 	RelayRequestLog
 	RequestParameters map[string]any    `json:"requestParameters"`
@@ -199,10 +220,11 @@ type RelayRequestView struct {
 }
 
 type LogPage struct {
-	Items    []RelayRequestView `json:"items"`
-	Total    int64              `json:"total"`
-	Page     int                `json:"page"`
-	PageSize int                `json:"pageSize"`
+	Items    []RelayRequestView  `json:"items"`
+	Summary  LogAggregateSummary `json:"summary"`
+	Total    int64               `json:"total"`
+	Page     int                 `json:"page"`
+	PageSize int                 `json:"pageSize"`
 }
 
 type ManagementService struct {
@@ -1084,7 +1106,34 @@ func (s *ManagementService) Logs(ctx context.Context, query LogQuery) (*LogPage,
 		query.PageSize = 50
 	}
 	detailCutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
-	db := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", detailCutoff)
+	filteredLogs := func() *gorm.DB {
+		return applyLogFilters(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}), query, detailCutoff)
+	}
+	summary, err := aggregateLogSummary(filteredLogs())
+	if err != nil {
+		return nil, err
+	}
+	var total int64
+	if err := filteredLogs().Count(&total).Error; err != nil {
+		return nil, err
+	}
+	var logs []RelayRequestLog
+	if err := filteredLogs().Omit("request_body", "response_body").Order("created_at desc, id desc").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&logs).Error; err != nil {
+		return nil, err
+	}
+	items := make([]RelayRequestView, 0, len(logs))
+	for _, log := range logs {
+		view, err := s.relayRequestView(ctx, log, false)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, view)
+	}
+	return &LogPage{Items: items, Summary: summary, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
+}
+
+func applyLogFilters(db *gorm.DB, query LogQuery, detailCutoff time.Time) *gorm.DB {
+	db = db.Where("created_at >= ?", detailCutoff)
 	if strings.TrimSpace(query.Model) != "" {
 		db = db.Where("requested_model LIKE ?", "%"+strings.TrimSpace(query.Model)+"%")
 	}
@@ -1103,23 +1152,69 @@ func (s *ManagementService) Logs(ctx context.Context, query LogQuery) (*LogPage,
 	if !query.To.IsZero() {
 		db = db.Where("created_at <= ?", query.To)
 	}
-	var total int64
-	if err := db.Count(&total).Error; err != nil {
-		return nil, err
+	return db
+}
+
+func aggregateLogSummary(db *gorm.DB) (LogAggregateSummary, error) {
+	type aggregateRow struct {
+		RequestCount          int64
+		SuccessCount          int64
+		AttemptCount          int64
+		InputTokens           int64
+		NormalInputTokens     int64
+		OutputTokens          int64
+		CachedTokens          int64
+		CacheWriteTokens      int64
+		SentTokens            int64
+		EstimatedCost         int64
+		UpstreamCost          int64
+		TotalFirstTokenMS     int64
+		FirstTokenSampleCount int64
+		TotalLatencyMS        int64
+		LatencySampleCount    int64
+		TotalDurationMS       int64
 	}
-	var logs []RelayRequestLog
-	if err := db.Omit("request_body", "response_body").Order("created_at desc").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&logs).Error; err != nil {
-		return nil, err
+	var row aggregateRow
+	if err := db.Select(
+		"COUNT(*) AS request_count, " +
+			"COALESCE(SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END), 0) AS success_count, " +
+			"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
+			"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens, " +
+			"COALESCE(SUM(cached_tokens), 0) AS cached_tokens, COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, " +
+			"COALESCE(SUM(sent_tokens), 0) AS sent_tokens, COALESCE(SUM(estimated_cost), 0) AS estimated_cost, " +
+			"COALESCE(SUM(upstream_cost), 0) AS upstream_cost, COALESCE(SUM(first_token_ms), 0) AS total_first_token_ms, " +
+			"COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END), 0) AS first_token_sample_count, " +
+			"COALESCE(SUM(latency_ms), 0) AS total_latency_ms, COALESCE(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END), 0) AS latency_sample_count, " +
+			"COALESCE(SUM(duration_ms), 0) AS total_duration_ms").Scan(&row).Error; err != nil {
+		return LogAggregateSummary{}, err
 	}
-	items := make([]RelayRequestView, 0, len(logs))
-	for _, log := range logs {
-		view, err := s.relayRequestView(ctx, log, false)
-		if err != nil {
-			return nil, err
-		}
-		items = append(items, view)
+	summary := LogAggregateSummary{
+		RequestCount:          row.RequestCount,
+		SuccessCount:          row.SuccessCount,
+		AttemptCount:          row.AttemptCount,
+		InputTokens:           row.InputTokens,
+		NormalInputTokens:     row.NormalInputTokens,
+		OutputTokens:          row.OutputTokens,
+		CachedTokens:          row.CachedTokens,
+		CacheWriteTokens:      row.CacheWriteTokens,
+		SentTokens:            row.SentTokens,
+		EstimatedCost:         row.EstimatedCost,
+		UpstreamCost:          row.UpstreamCost,
+		FirstTokenSampleCount: row.FirstTokenSampleCount,
+		LatencySampleCount:    row.LatencySampleCount,
+		DurationSampleCount:   row.RequestCount,
 	}
-	return &LogPage{Items: items, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
+	if row.RequestCount > 0 {
+		summary.SuccessRate = float64(row.SuccessCount) / float64(row.RequestCount)
+		summary.AverageDurationMS = float64(row.TotalDurationMS) / float64(row.RequestCount)
+	}
+	if row.FirstTokenSampleCount > 0 {
+		summary.AverageFirstTokenMS = float64(row.TotalFirstTokenMS) / float64(row.FirstTokenSampleCount)
+	}
+	if row.LatencySampleCount > 0 {
+		summary.AverageLatencyMS = float64(row.TotalLatencyMS) / float64(row.LatencySampleCount)
+	}
+	return summary, nil
 }
 
 func (s *ManagementService) LogDetail(ctx context.Context, requestID string) (*RelayRequestView, error) {

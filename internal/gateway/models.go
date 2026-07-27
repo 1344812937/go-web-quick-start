@@ -145,6 +145,19 @@ type RelayRequestLog struct {
 	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
 }
 
+// RelaySessionState keeps the small amount of state needed to name a session
+// and remove context already retained by its preceding request logs.
+type RelaySessionState struct {
+	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false" json:"tokenId"`
+	SessionID           string    `gorm:"size:512;primaryKey" json:"sessionId"`
+	Title               string    `gorm:"size:80;index" json:"title"`
+	TitleCustomized     bool      `gorm:"not null;default:false" json:"titleCustomized"`
+	LatestRequestID     string    `gorm:"size:36" json:"latestRequestId"`
+	PayloadManifestJSON string    `gorm:"type:text" json:"-"`
+	CreatedAt           time.Time `json:"createdAt"`
+	UpdatedAt           time.Time `gorm:"index" json:"updatedAt"`
+}
+
 type RelayAttemptLog struct {
 	ID             uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
 	RequestID      string `gorm:"size:36;index;not null" json:"requestId"`

@@ -61,6 +61,7 @@ func (s *Store) migrate() error {
 		&ClientToken{},
 		&ClientTokenModel{},
 		&RelayRequestLog{},
+		&RelaySessionState{},
 		&RelayAttemptLog{},
 		&TokenDailyStat{},
 		&GatewayMigration{},
@@ -254,6 +255,7 @@ func (s *Store) cleanupExpired() {
 	cutoff := now.Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayAttemptLog{}).Error
 	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayRequestLog{}).Error
+	_ = s.db.Where("updated_at < ?", cutoff).Delete(&RelaySessionState{}).Error
 }
 
 func (s *Store) runCleanup() {
