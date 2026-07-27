@@ -145,6 +145,10 @@ function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(micros / 1_000_000)
 }
 
+function formatTiming(value: number, samples: number): string {
+  return samples > 0 ? `${Math.round(value)} ms` : '--'
+}
+
 onMounted(loadData)
 </script>
 
@@ -164,6 +168,7 @@ onMounted(loadData)
         <el-table-column label="RPM" width="88" align="right" prop="rpm" />
         <el-table-column label="并发" width="88" align="right" prop="maxConcurrency" />
         <el-table-column label="累计统计" min-width="220"><template #default="scope"><div class="primary-cell"><strong>{{ formatInteger(scope.row.statistics.requests) }} 次 · {{ formatUSD(scope.row.statistics.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.statistics.estimatedCostMicros) }} · {{ formatInteger(scope.row.statistics.inputTokens + scope.row.statistics.outputTokens) }} Tokens</small></div></template></el-table-column>
+        <el-table-column label="性能统计" min-width="250"><template #default="scope"><div class="primary-cell"><strong>首 Token {{ formatTiming(scope.row.statistics.averageFirstTokenMs, scope.row.statistics.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.statistics.averageLatencyMs, scope.row.statistics.latencySampleCount) }}</strong><small>请求耗时 {{ formatTiming(scope.row.statistics.averageDurationMs, scope.row.statistics.durationSampleCount) }}</small></div></template></el-table-column>
         <el-table-column label="最近使用" width="154"><template #default="scope">{{ formatDate(scope.row.lastUsedAt) }}</template></el-table-column>
         <el-table-column label="操作" width="126" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="编辑令牌策略" placement="top"><el-button class="table-action-button" text :icon="Edit" :disabled="rotatingTokenId === scope.row.id || revokingTokenId === scope.row.id" aria-label="编辑令牌策略" @click="openEditor(scope.row)" /></el-tooltip><el-tooltip content="轮换令牌" placement="top"><el-button class="table-action-button" text :icon="RefreshRight" :loading="rotatingTokenId === scope.row.id" :disabled="revokingTokenId === scope.row.id" aria-label="轮换令牌" @click="rotateToken(scope.row)" /></el-tooltip><el-tooltip v-if="scope.row.enabled" content="吊销令牌" placement="top"><el-button class="table-action-button" text type="danger" :icon="CircleClose" :loading="revokingTokenId === scope.row.id" :disabled="rotatingTokenId === scope.row.id" aria-label="吊销令牌" @click="revokeToken(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>

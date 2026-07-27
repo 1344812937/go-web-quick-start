@@ -35,6 +35,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 
 	admin.GET("/dashboard", a.dashboard)
 	admin.GET("/logs", a.logs)
+	admin.GET("/logs/:requestId", a.logDetail)
 	admin.GET("/sessions", a.sessions)
 	admin.GET("/sessions/detail", a.sessionDetail)
 
@@ -322,6 +323,15 @@ func (a *GatewayManagementApi) logs(c *gin.Context) {
 		query.To, _ = time.Parse(time.RFC3339, value)
 	}
 	item, err := a.management.Logs(c.Request.Context(), query)
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(item))
+}
+
+func (a *GatewayManagementApi) logDetail(c *gin.Context) {
+	item, err := a.management.LogDetail(c.Request.Context(), c.Param("requestId"))
 	if err != nil {
 		managementError(c, err)
 		return

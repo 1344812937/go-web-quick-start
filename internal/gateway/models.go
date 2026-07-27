@@ -3,27 +3,28 @@ package gateway
 import "time"
 
 const (
-	RoutingPriorityWeighted                      = "priority_weighted"
-	RoutingLowestCost                            = "lowest_cost"
-	RoutingLowestLatency                         = "lowest_latency"
-	SelectionReasonInitialRoute                  = "initial_route"
-	SelectionReasonResponseAffinity              = "response_affinity"
-	SelectionReasonSessionAffinity               = "session_affinity"
-	SelectionReasonChannelDisabled               = "channel_disabled"
-	SelectionReasonMappingDisabled               = "mapping_disabled"
-	SelectionReasonCircuitOpen                   = "circuit_open"
-	SelectionReasonAffinityTargetMissing         = "affinity_target_missing"
-	SelectionReasonRetryableStatus               = "retryable_status"
-	SelectionReasonTransportError                = "transport_error"
-	SelectionReasonResponseError                 = "response_error"
-	SelectionReasonGatewayPreparationError       = "gateway_preparation_error"
-	SelectionReasonCircuitOpened                 = "circuit_opened"
-	CostSourceUpstream                           = "upstream"
-	CostSourceFallback                           = "estimated_fallback"
-	CostSourceMixed                              = "mixed"
-	CostSourceFailedZero                         = "failed_zero"
-	DefaultPriceMultiplierBasisPoints      int64 = 10_000
-	MaxPriceMultiplierBasisPoints          int64 = 1_000_000
+	RoutingPriorityWeighted                       = "priority_weighted"
+	RoutingLowestCost                             = "lowest_cost"
+	RoutingLowestLatency                          = "lowest_latency"
+	SelectionReasonInitialRoute                   = "initial_route"
+	SelectionReasonResponseAffinity               = "response_affinity"
+	SelectionReasonSessionAffinity                = "session_affinity"
+	SelectionReasonChannelDisabled                = "channel_disabled"
+	SelectionReasonMappingDisabled                = "mapping_disabled"
+	SelectionReasonCircuitOpen                    = "circuit_open"
+	SelectionReasonAffinityTargetMissing          = "affinity_target_missing"
+	SelectionReasonRetryableStatus                = "retryable_status"
+	SelectionReasonTransportError                 = "transport_error"
+	SelectionReasonResponseError                  = "response_error"
+	SelectionReasonUpstreamApplicationError       = "upstream_application_error"
+	SelectionReasonGatewayPreparationError        = "gateway_preparation_error"
+	SelectionReasonCircuitOpened                  = "circuit_opened"
+	CostSourceUpstream                            = "upstream"
+	CostSourceFallback                            = "estimated_fallback"
+	CostSourceMixed                               = "mixed"
+	CostSourceFailedZero                          = "failed_zero"
+	DefaultPriceMultiplierBasisPoints       int64 = 10_000
+	MaxPriceMultiplierBasisPoints           int64 = 1_000_000
 )
 
 type AdminUser struct {
@@ -85,6 +86,9 @@ type ChannelModel struct {
 	Enabled                    bool      `gorm:"not null" json:"enabled"`
 	CreatedAt                  time.Time `json:"createdAt"`
 	UpdatedAt                  time.Time `json:"updatedAt"`
+	RecentSuccessRate          float64   `gorm:"-" json:"recentSuccessRate"`
+	RecentSuccessCount         int64     `gorm:"-" json:"recentSuccessCount"`
+	RecentAttemptCount         int64     `gorm:"-" json:"recentAttemptCount"`
 }
 
 type ClientToken struct {
@@ -115,7 +119,12 @@ type RelayRequestLog struct {
 	RequestedModel        string    `gorm:"size:200;index;not null" json:"requestedModel"`
 	CodexSessionID        string    `gorm:"size:512;index" json:"codexSessionId"`
 	CodexSessionSource    string    `gorm:"size:48;index" json:"codexSessionSource"`
+	SessionName           string    `gorm:"size:80;index" json:"sessionName"`
 	RequestParametersJSON string    `gorm:"type:text" json:"-"`
+	RequestBody           string    `gorm:"type:text" json:"requestBody"`
+	RequestBodyTruncated  bool      `gorm:"not null;default:false" json:"requestBodyTruncated"`
+	ResponseBody          string    `gorm:"type:text" json:"responseBody"`
+	ResponseBodyTruncated bool      `gorm:"not null;default:false" json:"responseBodyTruncated"`
 	StatusCode            int       `gorm:"index;not null" json:"statusCode"`
 	InputTokens           int64     `gorm:"not null;default:0" json:"inputTokens"`
 	NormalInputTokens     int64     `gorm:"not null;default:0" json:"normalInputTokens"`
@@ -128,6 +137,8 @@ type RelayRequestLog struct {
 	CostSource            string    `gorm:"size:32" json:"costSource"`
 	UsageSource           string    `gorm:"size:32" json:"usageSource"`
 	AttemptCount          int       `gorm:"not null;default:0" json:"attemptCount"`
+	FirstTokenMS          int64     `gorm:"not null;default:0" json:"firstTokenMs"`
+	LatencyMS             int64     `gorm:"not null;default:0" json:"latencyMs"`
 	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
 	Stream                bool      `gorm:"not null;default:false" json:"stream"`
 	ErrorCode             string    `gorm:"size:80" json:"errorCode"`
@@ -149,22 +160,28 @@ type RelayAttemptLog struct {
 	// SelectionReason is the stable reason code explaining why this attempt's channel was selected.
 	SelectionReason string `gorm:"size:48" json:"selectionReason"`
 	// SelectionDetail contains a sanitized, bounded diagnostic detail for SelectionReason.
-	SelectionDetail   string    `gorm:"size:512" json:"selectionDetail"`
-	StatusCode        int       `gorm:"not null" json:"statusCode"`
-	InputTokens       int64     `gorm:"not null;default:0" json:"inputTokens"`
-	NormalInputTokens int64     `gorm:"not null;default:0" json:"normalInputTokens"`
-	OutputTokens      int64     `gorm:"not null;default:0" json:"outputTokens"`
-	CachedTokens      int64     `gorm:"not null;default:0" json:"cachedTokens"`
-	CacheWriteTokens  int64     `gorm:"not null;default:0" json:"cacheWriteTokens"`
-	SentTokens        int64     `gorm:"not null;default:0" json:"sentTokens"`
-	EstimatedCost     int64     `gorm:"not null;default:0" json:"estimatedCostMicros"`
-	UpstreamCost      int64     `gorm:"not null;default:0" json:"upstreamCostMicros"`
-	CostSource        string    `gorm:"size:32" json:"costSource"`
-	UsageSource       string    `gorm:"size:32" json:"usageSource"`
-	LatencyMS         int64     `gorm:"not null;default:0" json:"latencyMs"`
-	Success           bool      `gorm:"not null;default:false" json:"success"`
-	ErrorMessage      string    `gorm:"type:text" json:"errorMessage"`
-	CreatedAt         time.Time `gorm:"index" json:"createdAt"`
+	SelectionDetail       string    `gorm:"size:512" json:"selectionDetail"`
+	RequestBody           string    `gorm:"type:text" json:"requestBody"`
+	RequestBodyTruncated  bool      `gorm:"not null;default:false" json:"requestBodyTruncated"`
+	ResponseBody          string    `gorm:"type:text" json:"responseBody"`
+	ResponseBodyTruncated bool      `gorm:"not null;default:false" json:"responseBodyTruncated"`
+	StatusCode            int       `gorm:"not null" json:"statusCode"`
+	InputTokens           int64     `gorm:"not null;default:0" json:"inputTokens"`
+	NormalInputTokens     int64     `gorm:"not null;default:0" json:"normalInputTokens"`
+	OutputTokens          int64     `gorm:"not null;default:0" json:"outputTokens"`
+	CachedTokens          int64     `gorm:"not null;default:0" json:"cachedTokens"`
+	CacheWriteTokens      int64     `gorm:"not null;default:0" json:"cacheWriteTokens"`
+	SentTokens            int64     `gorm:"not null;default:0" json:"sentTokens"`
+	EstimatedCost         int64     `gorm:"not null;default:0" json:"estimatedCostMicros"`
+	UpstreamCost          int64     `gorm:"not null;default:0" json:"upstreamCostMicros"`
+	CostSource            string    `gorm:"size:32" json:"costSource"`
+	UsageSource           string    `gorm:"size:32" json:"usageSource"`
+	FirstTokenMS          int64     `gorm:"not null;default:0" json:"firstTokenMs"`
+	LatencyMS             int64     `gorm:"not null;default:0" json:"latencyMs"`
+	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
+	Success               bool      `gorm:"not null;default:false" json:"success"`
+	ErrorMessage          string    `gorm:"type:text" json:"errorMessage"`
+	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
 }
 
 type TokenDailyStat struct {
@@ -180,6 +197,10 @@ type TokenDailyStat struct {
 	SentTokens        int64  `gorm:"not null;default:0"`
 	EstimatedCost     int64  `gorm:"not null;default:0"`
 	UpstreamCost      int64  `gorm:"not null;default:0"`
+	FirstTokenMS      int64  `gorm:"not null;default:0"`
+	FirstTokenSamples int64  `gorm:"not null;default:0"`
+	LatencyMS         int64  `gorm:"not null;default:0"`
+	LatencySamples    int64  `gorm:"not null;default:0"`
 	DurationMS        int64  `gorm:"not null;default:0"`
 	AttemptCount      int64  `gorm:"not null;default:0"`
 	CreatedAt         time.Time

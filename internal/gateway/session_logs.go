@@ -46,33 +46,39 @@ type SessionChannelView struct {
 }
 
 type SessionLogSummary struct {
-	GroupID           string              `gorm:"column:group_id" json:"-"`
-	SessionID         string              `json:"sessionId"`
-	SessionSource     string              `json:"sessionSource"`
-	Identified        bool                `json:"identified"`
-	FallbackRequestID string              `json:"fallbackRequestId"`
-	TokenID           uint64              `json:"tokenId"`
-	TokenName         string              `json:"tokenName"`
-	TokenKeyPrefix    string              `json:"tokenKeyPrefix"`
-	LatestModel       string              `json:"latestModel"`
-	LatestEndpoint    string              `json:"latestEndpoint"`
-	RequestCount      int64               `json:"requestCount"`
-	SuccessCount      int64               `json:"successCount"`
-	SuccessRate       float64             `json:"successRate"`
-	AttemptCount      int64               `json:"attemptCount"`
-	InputTokens       int64               `json:"inputTokens"`
-	NormalInputTokens int64               `json:"normalInputTokens"`
-	OutputTokens      int64               `json:"outputTokens"`
-	CachedTokens      int64               `json:"cachedTokens"`
-	CacheWriteTokens  int64               `json:"cacheWriteTokens"`
-	SentTokens        int64               `json:"sentTokens"`
-	CacheHitRate      float64             `json:"cacheHitRate"`
-	EstimatedCost     int64               `json:"estimatedCostMicros"`
-	UpstreamCost      int64               `json:"upstreamCostMicros"`
-	AverageDurationMS float64             `json:"averageDurationMs"`
-	FirstSeenAt       time.Time           `json:"firstSeenAt"`
-	LastSeenAt        time.Time           `json:"lastSeenAt"`
-	CurrentChannel    *SessionChannelView `gorm:"-" json:"currentChannel"`
+	GroupID               string              `gorm:"column:group_id" json:"-"`
+	SessionID             string              `json:"sessionId"`
+	SessionName           string              `json:"sessionName"`
+	SessionSource         string              `json:"sessionSource"`
+	Identified            bool                `json:"identified"`
+	FallbackRequestID     string              `json:"fallbackRequestId"`
+	TokenID               uint64              `json:"tokenId"`
+	TokenName             string              `json:"tokenName"`
+	TokenKeyPrefix        string              `json:"tokenKeyPrefix"`
+	LatestModel           string              `json:"latestModel"`
+	LatestEndpoint        string              `json:"latestEndpoint"`
+	RequestCount          int64               `json:"requestCount"`
+	SuccessCount          int64               `json:"successCount"`
+	SuccessRate           float64             `json:"successRate"`
+	AttemptCount          int64               `json:"attemptCount"`
+	InputTokens           int64               `json:"inputTokens"`
+	NormalInputTokens     int64               `json:"normalInputTokens"`
+	OutputTokens          int64               `json:"outputTokens"`
+	CachedTokens          int64               `json:"cachedTokens"`
+	CacheWriteTokens      int64               `json:"cacheWriteTokens"`
+	SentTokens            int64               `json:"sentTokens"`
+	CacheHitRate          float64             `json:"cacheHitRate"`
+	EstimatedCost         int64               `json:"estimatedCostMicros"`
+	UpstreamCost          int64               `json:"upstreamCostMicros"`
+	AverageFirstTokenMS   float64             `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64               `json:"firstTokenSampleCount"`
+	AverageLatencyMS      float64             `json:"averageLatencyMs"`
+	LatencySampleCount    int64               `json:"latencySampleCount"`
+	AverageDurationMS     float64             `json:"averageDurationMs"`
+	DurationSampleCount   int64               `json:"durationSampleCount"`
+	FirstSeenAt           time.Time           `json:"firstSeenAt"`
+	LastSeenAt            time.Time           `json:"lastSeenAt"`
+	CurrentChannel        *SessionChannelView `gorm:"-" json:"currentChannel"`
 }
 
 type SessionLogPage struct {
@@ -122,18 +128,23 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
 		"COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, " +
 		"COALESCE(SUM(sent_tokens), 0) AS sent_tokens, " +
-		"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
+		"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, " +
+		"COALESCE(SUM(first_token_ms), 0) AS total_first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_sample_count, " +
+		"COALESCE(SUM(latency_ms), 0) AS total_latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_sample_count, " +
+		"COALESCE(SUM(duration_ms), 0) AS total_duration_ms, COUNT(*) AS duration_sample_count, " +
 		"MIN(unixepoch(created_at)) AS first_seen_unix, MAX(unixepoch(created_at)) AS last_seen_unix"
 	type aggregateRow struct {
 		SessionLogSummary
-		TotalDurationMS int64
-		FirstSeenUnix   int64
-		LastSeenUnix    int64
+		TotalFirstTokenMS int64
+		TotalLatencyMS    int64
+		TotalDurationMS   int64
+		FirstSeenUnix     int64
+		LastSeenUnix      int64
 	}
 	var rows []aggregateRow
 	if err := applySessionLogFilters(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}), query, cutoff).
 		Select(selectSQL).Group("token_id, " + sessionGroupExpression).
-		Order("last_seen_unix DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
+		Order("first_seen_unix DESC, last_seen_unix DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
 		Scan(&rows).Error; err != nil {
 		return nil, err
 	}
@@ -141,7 +152,7 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		summary := row.SessionLogSummary
 		summary.FirstSeenAt = time.Unix(row.FirstSeenUnix, 0).UTC()
 		summary.LastSeenAt = time.Unix(row.LastSeenUnix, 0).UTC()
-		finishSessionSummary(&summary, row.TotalDurationMS)
+		finishSessionSummary(&summary, row.TotalFirstTokenMS, row.TotalLatencyMS, row.TotalDurationMS)
 		if err := s.populateSessionSummary(ctx, &summary, cutoff); err != nil {
 			return nil, err
 		}
@@ -154,7 +165,7 @@ func applySessionLogFilters(db *gorm.DB, query SessionLogQuery, cutoff time.Time
 	db = db.Where("created_at >= ?", cutoff)
 	if value := strings.TrimSpace(query.Session); value != "" {
 		pattern := "%" + value + "%"
-		db = db.Where("(codex_session_id LIKE ? OR id LIKE ?)", pattern, pattern)
+		db = db.Where("(session_name LIKE ? OR codex_session_id LIKE ? OR id LIKE ?)", pattern, pattern, pattern)
 	}
 	if value := strings.TrimSpace(query.Model); value != "" {
 		db = db.Where("requested_model = ?", value)
@@ -174,10 +185,17 @@ func applySessionLogFilters(db *gorm.DB, query SessionLogQuery, cutoff time.Time
 	return db
 }
 
-func finishSessionSummary(summary *SessionLogSummary, totalDurationMS int64) {
+func finishSessionSummary(summary *SessionLogSummary, totalFirstTokenMS int64, totalLatencyMS int64, totalDurationMS int64) {
+	if summary.FirstTokenSampleCount > 0 {
+		summary.AverageFirstTokenMS = float64(totalFirstTokenMS) / float64(summary.FirstTokenSampleCount)
+	}
+	if summary.LatencySampleCount > 0 {
+		summary.AverageLatencyMS = float64(totalLatencyMS) / float64(summary.LatencySampleCount)
+	}
 	if summary.RequestCount > 0 {
 		summary.SuccessRate = float64(summary.SuccessCount) / float64(summary.RequestCount)
 		summary.AverageDurationMS = float64(totalDurationMS) / float64(summary.RequestCount)
+		summary.DurationSampleCount = summary.RequestCount
 	}
 	summary.InputTokens = max(summary.InputTokens, 0)
 	summary.NormalInputTokens = max(summary.NormalInputTokens, 0)
@@ -219,6 +237,10 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		SentTokens        int64
 		EstimatedCost     int64
 		UpstreamCost      int64
+		TotalFirstTokenMS int64
+		FirstTokenSamples int64
+		TotalLatencyMS    int64
+		LatencySamples    int64
 		TotalDurationMS   int64
 		FirstSeenUnix     int64
 		LastSeenUnix      int64
@@ -231,43 +253,50 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 			"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
 			"COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens, " +
 			"COALESCE(SUM(sent_tokens), 0) AS sent_tokens, " +
-			"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
+			"COALESCE(SUM(estimated_cost), 0) AS estimated_cost, COALESCE(SUM(upstream_cost), 0) AS upstream_cost, " +
+			"COALESCE(SUM(first_token_ms), 0) AS total_first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_samples, " +
+			"COALESCE(SUM(latency_ms), 0) AS total_latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_samples, " +
+			"COALESCE(SUM(duration_ms), 0) AS total_duration_ms, " +
 			"MIN(unixepoch(created_at)) AS first_seen_unix, MAX(unixepoch(created_at)) AS last_seen_unix").Scan(&aggregate).Error; err != nil {
 		return nil, err
 	}
 	summary := SessionLogSummary{
-		SessionID:         query.SessionID,
-		Identified:        query.SessionID != "",
-		FallbackRequestID: query.RequestID,
-		TokenID:           query.TokenID,
-		RequestCount:      requestTotal,
-		SuccessCount:      aggregate.SuccessCount,
-		AttemptCount:      aggregate.AttemptCount,
-		InputTokens:       aggregate.InputTokens,
-		NormalInputTokens: aggregate.NormalInputTokens,
-		OutputTokens:      aggregate.OutputTokens,
-		CachedTokens:      aggregate.CachedTokens,
-		CacheWriteTokens:  aggregate.CacheWriteTokens,
-		SentTokens:        aggregate.SentTokens,
-		EstimatedCost:     aggregate.EstimatedCost,
-		UpstreamCost:      aggregate.UpstreamCost,
-		FirstSeenAt:       time.Unix(aggregate.FirstSeenUnix, 0).UTC(),
-		LastSeenAt:        time.Unix(aggregate.LastSeenUnix, 0).UTC(),
+		SessionID:             query.SessionID,
+		Identified:            query.SessionID != "",
+		FallbackRequestID:     query.RequestID,
+		TokenID:               query.TokenID,
+		RequestCount:          requestTotal,
+		SuccessCount:          aggregate.SuccessCount,
+		AttemptCount:          aggregate.AttemptCount,
+		InputTokens:           aggregate.InputTokens,
+		NormalInputTokens:     aggregate.NormalInputTokens,
+		OutputTokens:          aggregate.OutputTokens,
+		CachedTokens:          aggregate.CachedTokens,
+		CacheWriteTokens:      aggregate.CacheWriteTokens,
+		SentTokens:            aggregate.SentTokens,
+		EstimatedCost:         aggregate.EstimatedCost,
+		UpstreamCost:          aggregate.UpstreamCost,
+		FirstTokenSampleCount: aggregate.FirstTokenSamples,
+		LatencySampleCount:    aggregate.LatencySamples,
+		DurationSampleCount:   requestTotal,
+		FirstSeenAt:           time.Unix(aggregate.FirstSeenUnix, 0).UTC(),
+		LastSeenAt:            time.Unix(aggregate.LastSeenUnix, 0).UTC(),
 	}
-	finishSessionSummary(&summary, aggregate.TotalDurationMS)
+	finishSessionSummary(&summary, aggregate.TotalFirstTokenMS, aggregate.TotalLatencyMS, aggregate.TotalDurationMS)
 	if err := s.populateSessionSummary(ctx, &summary, cutoff); err != nil {
 		return nil, err
 	}
 
 	var logs []RelayRequestLog
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
+		Omit("request_body", "response_body").
 		Order("created_at ASC, id ASC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
 		Find(&logs).Error; err != nil {
 		return nil, err
 	}
 	requests := make([]RelayRequestView, 0, len(logs))
 	for _, log := range logs {
-		view, err := s.relayRequestView(ctx, log)
+		view, err := s.relayRequestView(ctx, log, false)
 		if err != nil {
 			return nil, err
 		}
@@ -285,11 +314,19 @@ func applySessionIdentity(db *gorm.DB, query SessionDetailQuery) *gorm.DB {
 
 func (s *ManagementService) populateSessionSummary(ctx context.Context, summary *SessionLogSummary, cutoff time.Time) error {
 	latestDB := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff)
+	firstDB := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff)
 	if summary.Identified {
 		latestDB = latestDB.Where("token_id = ? AND codex_session_id = ?", summary.TokenID, summary.SessionID)
+		firstDB = firstDB.Where("token_id = ? AND codex_session_id = ?", summary.TokenID, summary.SessionID)
 	} else {
 		latestDB = latestDB.Where("id = ? AND codex_session_id = ''", summary.FallbackRequestID)
+		firstDB = firstDB.Where("id = ? AND codex_session_id = ''", summary.FallbackRequestID)
 	}
+	var first RelayRequestLog
+	if err := firstDB.Order("created_at ASC, id ASC").First(&first).Error; err != nil {
+		return err
+	}
+	summary.SessionName = first.SessionName
 	var latest RelayRequestLog
 	if err := latestDB.Order("created_at DESC, id DESC").First(&latest).Error; err != nil {
 		return err
@@ -419,9 +456,13 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 	return current, nil
 }
 
-func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog) (RelayRequestView, error) {
+func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog, includePayloads bool) (RelayRequestView, error) {
 	attempts := make([]RelayAttemptLog, 0)
-	if err := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID).Order("created_at ASC, id ASC").Find(&attempts).Error; err != nil {
+	attemptDB := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID)
+	if !includePayloads {
+		attemptDB = attemptDB.Omit("request_body", "response_body")
+	}
+	if err := attemptDB.Order("created_at ASC, id ASC").Find(&attempts).Error; err != nil {
 		return RelayRequestView{}, err
 	}
 	channelCache := make(map[uint64]Channel)

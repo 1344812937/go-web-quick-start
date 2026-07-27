@@ -287,10 +287,12 @@ function formatTokens(value: number): string {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
 }
 
-function latencySampleLabel(channel: Channel): string {
-  const visible = channel.metrics.latencySeries.length
-  const total = channel.metrics.latencySampleCount
-  return total > visible ? `最近 ${visible} / 5 天共 ${total} 次` : `近 5 天 ${total} 次`
+function formatTiming(value: number, samples: number): string {
+  return samples > 0 ? `${Math.round(value)} ms` : '--'
+}
+
+function timingSampleLabel(channel: Channel): string {
+  return `样本 首 Token ${channel.metrics.firstTokenSampleCount} · 延迟 ${channel.metrics.latencySampleCount} · 耗时 ${channel.metrics.durationSampleCount}`
 }
 
 function channelState(channel: Channel): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
@@ -416,14 +418,24 @@ onMounted(loadData)
           <template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.baseUrl }}</small></div></template>
         </el-table-column>
         <el-table-column label="状态" width="116"><template #default="scope"><el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag></template></el-table-column>
+        <el-table-column label="近 30 分钟成功率" width="170" align="right">
+          <template #default="scope">
+            <div class="metric-copy success-metric">
+              <strong>{{ formatPercent(scope.row.metrics.recentSuccessRate) }}</strong>
+              <small v-if="scope.row.metrics.recentAttemptCount">{{ scope.row.metrics.recentSuccessCount }} / {{ scope.row.metrics.recentAttemptCount }} 次尝试</small>
+              <small v-else>暂无调用，按 100%</small>
+            </div>
+          </template>
+        </el-table-column>
         <el-table-column label="模型" min-width="160"><template #default="scope"><span v-if="scope.row.models.length">{{ scope.row.models.map((item: ChannelModel) => modelName(item.modelId)).join('、') }}</span><span v-else class="muted-text">未映射</span></template></el-table-column>
-        <el-table-column label="最近延迟" min-width="280">
+        <el-table-column label="近 5 天性能" min-width="390">
           <template #default="scope">
             <div v-if="scope.row.metrics.latencySeries.length" class="latency-metric-cell">
               <ChannelLatencySparkline :points="scope.row.metrics.latencySeries" :channel-name="scope.row.name" />
               <div class="metric-copy">
-                <strong>{{ scope.row.metrics.latestLatencyMs }} ms</strong>
-                <small>{{ latencySampleLabel(scope.row) }}</small>
+                <strong>首 Token {{ formatTiming(scope.row.metrics.averageFirstTokenMs, scope.row.metrics.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.metrics.averageLatencyMs, scope.row.metrics.latencySampleCount) }}</strong>
+                <small>请求耗时 {{ formatTiming(scope.row.metrics.averageDurationMs, scope.row.metrics.durationSampleCount) }}</small>
+                <small>{{ timingSampleLabel(scope.row) }}</small>
                 <small v-if="scope.row.latencyEwmaMs > 0">EWMA {{ Math.round(scope.row.latencyEwmaMs) }} ms</small>
               </div>
             </div>
@@ -587,6 +599,7 @@ onMounted(loadData)
 .metric-copy { display: grid; min-width: 0; gap: 2px; font-variant-numeric: tabular-nums; }
 .metric-copy strong { color: var(--rose-text); font-size: 13px; font-weight: 650; }
 .metric-copy small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; white-space: nowrap; }
+.success-metric { justify-items: end; }
 .cache-metric { width: 132px; }
 .cache-meter { width: 100%; height: 4px; overflow: hidden; border-radius: 2px; background: var(--rose-border); }
 .cache-meter span { display: block; height: 100%; background: var(--rose-amber); }

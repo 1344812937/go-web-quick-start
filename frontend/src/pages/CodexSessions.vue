@@ -33,6 +33,10 @@ function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(micros / 1_000_000)
 }
 
+function formatTiming(value: number, samples: number): string {
+  return samples > 0 ? `${Math.round(value)} ms` : '--'
+}
+
 function sessionSourceLabel(value: string): string {
   if (value === 'prompt_cache_key') return '缓存键'
   if (value.includes('session_id')) return '客户端会话 ID'
@@ -112,12 +116,12 @@ onMounted(async () => {
 <template>
   <div class="page-stack">
     <header class="page-heading">
-      <div><h1>会话日志</h1><p>按 Codex 客户端会话汇总最近 5 天的渠道、模型、令牌与用量</p></div>
+      <div><h1>会话日志</h1><p>按首次调用时间查看最近 5 天的会话、渠道、模型、令牌与用量</p></div>
       <div class="page-actions"><el-tooltip content="刷新会话日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新会话日志" @click="loadSessions" /></el-tooltip></div>
     </header>
 
     <section class="filter-bar" aria-label="会话日志筛选">
-      <el-input v-model="filters.session" clearable placeholder="会话 ID 或请求 ID" @keyup.enter="searchSessions" />
+      <el-input v-model="filters.session" clearable placeholder="会话名称、会话 ID 或请求 ID" @keyup.enter="searchSessions" />
       <el-select v-model="filters.model" clearable placeholder="全部模型"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.name" /></el-select>
       <el-select v-model="filters.channelId" clearable placeholder="全部渠道"><el-option v-for="channel in channels" :key="channel.id" :label="channel.name" :value="String(channel.id)" /></el-select>
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
@@ -128,10 +132,10 @@ onMounted(async () => {
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="sessions" :row-key="sessionRowKey" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
-        <el-table-column label="Codex 会话" min-width="240">
+        <el-table-column label="会话" min-width="240">
           <template #default="scope">
             <div class="session-identity">
-              <div><el-tag :type="scope.row.identified ? 'success' : 'info'" effect="plain">{{ sessionSourceLabel(scope.row.sessionSource) }}</el-tag><strong>{{ scope.row.identified ? scope.row.sessionId : '未识别会话' }}</strong></div>
+              <div><el-tag :type="scope.row.identified ? 'success' : 'info'" effect="plain">{{ sessionSourceLabel(scope.row.sessionSource) }}</el-tag><strong>{{ scope.row.sessionName || '未命名会话' }}</strong></div>
               <small><code>{{ scope.row.identified ? scope.row.sessionId : scope.row.fallbackRequestId }}</code></small>
             </div>
           </template>
@@ -155,8 +159,9 @@ onMounted(async () => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="费用 / 平均耗时" width="170" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }} · {{ Math.round(scope.row.averageDurationMs) }} ms</small></div></template></el-table-column>
-        <el-table-column label="最近调用" width="168"><template #default="scope">{{ formatDate(scope.row.lastSeenAt) }}</template></el-table-column>
+        <el-table-column label="费用" width="150" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
+        <el-table-column label="平均性能" min-width="250"><template #default="scope"><div class="numeric-cell"><strong>首 Token {{ formatTiming(scope.row.averageFirstTokenMs, scope.row.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.averageLatencyMs, scope.row.latencySampleCount) }}</strong><small>请求耗时 {{ formatTiming(scope.row.averageDurationMs, scope.row.durationSampleCount) }}</small></div></template></el-table-column>
+        <el-table-column label="首次 / 最近调用" width="180"><template #default="scope"><div class="numeric-cell"><strong>{{ formatDate(scope.row.firstSeenAt) }}</strong><small>最近 {{ formatDate(scope.row.lastSeenAt) }}</small></div></template></el-table-column>
         <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="查看会话详情" placement="top"><el-button class="table-action-button" text :icon="View" aria-label="查看会话详情" @click.stop="openSession(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>

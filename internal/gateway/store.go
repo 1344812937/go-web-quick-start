@@ -98,6 +98,8 @@ func (s *Store) backfillTokenDailyStats() error {
 				"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, " +
 				"COALESCE(SUM(sent_tokens),0) AS sent_tokens, " +
 				"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(estimated_cost),0) AS upstream_cost, " +
+				"COALESCE(SUM(first_token_ms),0) AS first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_samples, " +
+				"COALESCE(SUM(latency_ms),0) AS latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_samples, " +
 				"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
 		).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
 			return err
@@ -173,6 +175,8 @@ func (s *Store) backfillCostFields() error {
 					"COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, "+
 					"COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, COALESCE(SUM(sent_tokens),0) AS sent_tokens, "+
 					"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
+					"COALESCE(SUM(first_token_ms),0) AS first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_samples, "+
+					"COALESCE(SUM(latency_ms),0) AS latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_samples, "+
 					"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
 			).Where("date(created_at) IN ?", dates).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
 				return err

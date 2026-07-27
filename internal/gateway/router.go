@@ -5,6 +5,7 @@ import (
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -20,9 +21,12 @@ var (
 )
 
 type RouteCandidate struct {
-	Channel Channel
-	Mapping ChannelModel
-	Cost    int64
+	Channel            Channel
+	Mapping            ChannelModel
+	Cost               int64
+	RecentSuccessRate  float64
+	RecentSuccessCount int64
+	RecentAttemptCount int64
 }
 
 type RoutePlan struct {
@@ -212,17 +216,50 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 		return nil, err
 	}
 	now := time.Now()
+	channelIDs := make([]uint64, 0, len(mappings))
+	channelModelIDs := make([]uint64, 0, len(mappings))
+	seenChannels := make(map[uint64]struct{}, len(mappings))
+	for _, mapping := range mappings {
+		channelModelIDs = append(channelModelIDs, mapping.ID)
+		if _, exists := seenChannels[mapping.ChannelID]; exists {
+			continue
+		}
+		seenChannels[mapping.ChannelID] = struct{}{}
+		channelIDs = append(channelIDs, mapping.ChannelID)
+	}
+	var channels []Channel
+	if len(channelIDs) > 0 {
+		if err := r.store.db.WithContext(ctx).Where("id IN ?", channelIDs).Find(&channels).Error; err != nil {
+			return nil, err
+		}
+	}
+	channelsByID := make(map[uint64]Channel, len(channels))
+	for _, channel := range channels {
+		channelsByID[channel.ID] = channel
+	}
+	recentSuccess, err := loadRecentSuccessMetrics(ctx, r.store.db, channelIDs, channelModelIDs, now)
+	if err != nil {
+		return nil, err
+	}
 	candidates := make([]RouteCandidate, 0, len(mappings))
 	for _, mapping := range mappings {
-		var channel Channel
-		if err := r.store.db.WithContext(ctx).First(&channel, mapping.ChannelID).Error; err != nil {
+		channel, exists := channelsByID[mapping.ChannelID]
+		if !exists {
 			continue
 		}
 		if !channel.Enabled || (channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(now)) {
 			continue
 		}
 		usage := Usage{InputTokens: inputTokens, OutputTokens: outputTokens}
-		candidates = append(candidates, RouteCandidate{Channel: channel, Mapping: mapping, Cost: CalculateCostMicros(mapping, usage)})
+		metric := recentSuccess.ByChannelModel[mapping.ID]
+		candidates = append(candidates, RouteCandidate{
+			Channel:            channel,
+			Mapping:            mapping,
+			Cost:               CalculateCostMicros(mapping, usage),
+			RecentSuccessRate:  metric.rate(),
+			RecentSuccessCount: metric.Successes,
+			RecentAttemptCount: metric.Attempts,
+		})
 	}
 	return candidates, nil
 }
@@ -263,40 +300,37 @@ func (r *Router) recentOutputMedian(ctx context.Context, modelName string) int64
 func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) {
 	switch strategy {
 	case RoutingLowestCost:
-		sort.SliceStable(candidates, func(i, j int) bool {
-			if candidates[i].Cost == candidates[j].Cost {
-				return candidates[i].Channel.LatencyEWMA < candidates[j].Channel.LatencyEWMA
-			}
-			return candidates[i].Cost < candidates[j].Cost
-		})
+		sortCandidatesByCost(candidates)
+		r.weightedProbabilityOrder(candidates, costProbabilityWeights(candidates))
 	case RoutingLowestLatency:
-		sort.SliceStable(candidates, func(i, j int) bool {
-			iUnknown := candidates[i].Channel.LatencyEWMA <= 0
-			jUnknown := candidates[j].Channel.LatencyEWMA <= 0
-			if iUnknown != jUnknown {
-				return iUnknown
-			}
-			return candidates[i].Channel.LatencyEWMA < candidates[j].Channel.LatencyEWMA
-		})
+		sortCandidatesByLatency(candidates)
+		r.weightedProbabilityOrder(candidates, latencyProbabilityWeights(candidates))
 	default:
 		r.weightedPriorityOrder(candidates)
 	}
 }
 
 func (r *Router) orderCandidatesWithoutWeightedAdvance(strategy string, candidates []RouteCandidate) {
-	if strategy != RoutingPriorityWeighted {
-		r.orderCandidates(strategy, candidates)
-		return
+	switch strategy {
+	case RoutingLowestCost:
+		sortCandidatesByCost(candidates)
+		sortCandidatesByProbabilityWeight(candidates, costProbabilityWeights(candidates))
+	case RoutingLowestLatency:
+		sortCandidatesByLatency(candidates)
+		sortCandidatesByProbabilityWeight(candidates, latencyProbabilityWeights(candidates))
+	default:
+		sort.SliceStable(candidates, func(i, j int) bool {
+			if candidates[i].Mapping.Priority != candidates[j].Mapping.Priority {
+				return candidates[i].Mapping.Priority > candidates[j].Mapping.Priority
+			}
+			iWeight := effectivePriorityWeight(candidates[i])
+			jWeight := effectivePriorityWeight(candidates[j])
+			if iWeight != jWeight {
+				return iWeight > jWeight
+			}
+			return routeCandidateKey(candidates[i]) < routeCandidateKey(candidates[j])
+		})
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Mapping.Priority != candidates[j].Mapping.Priority {
-			return candidates[i].Mapping.Priority > candidates[j].Mapping.Priority
-		}
-		if candidates[i].Mapping.Weight != candidates[j].Mapping.Weight {
-			return candidates[i].Mapping.Weight > candidates[j].Mapping.Weight
-		}
-		return routeCandidateKey(candidates[i]) < routeCandidateKey(candidates[j])
-	})
 }
 
 func (r *Router) weightedPriorityOrder(candidates []RouteCandidate) {
@@ -329,7 +363,7 @@ func (r *Router) smoothWeightedGroup(group []RouteCandidate) []RouteCandidate {
 			Current: make(map[uint64]int64, len(group)),
 		}
 		for _, candidate := range group {
-			state.Weights[routeCandidateKey(candidate)] = int64(max(candidate.Mapping.Weight, 1))
+			state.Weights[routeCandidateKey(candidate)] = effectivePriorityWeight(candidate)
 		}
 		r.weightedStates[key] = state
 	}
@@ -381,11 +415,139 @@ func weightedStateMatches(state *weightedPriorityState, group []RouteCandidate) 
 	}
 	for _, candidate := range group {
 		weight, ok := state.Weights[routeCandidateKey(candidate)]
-		if !ok || weight != int64(max(candidate.Mapping.Weight, 1)) {
+		if !ok || weight != effectivePriorityWeight(candidate) {
 			return false
 		}
 	}
 	return true
+}
+
+const routeProbabilityScale int64 = 10_000
+
+func candidateSuccessBasisPoints(candidate RouteCandidate) int64 {
+	rate := candidate.RecentSuccessRate
+	if candidate.RecentAttemptCount == 0 {
+		rate = 1
+	}
+	if math.IsNaN(rate) || math.IsInf(rate, 0) {
+		rate = 1
+	}
+	rate = min(max(rate, 0), 1)
+	return max(int64(math.Round(rate*float64(routeProbabilityScale))), 1)
+}
+
+func effectivePriorityWeight(candidate RouteCandidate) int64 {
+	return int64(max(candidate.Mapping.Weight, 1)) * candidateSuccessBasisPoints(candidate)
+}
+
+func sortCandidatesByCost(candidates []RouteCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Cost == candidates[j].Cost {
+			return candidates[i].Channel.LatencyEWMA < candidates[j].Channel.LatencyEWMA
+		}
+		return candidates[i].Cost < candidates[j].Cost
+	})
+}
+
+func sortCandidatesByLatency(candidates []RouteCandidate) {
+	sort.SliceStable(candidates, func(i, j int) bool {
+		iUnknown := candidates[i].Channel.LatencyEWMA <= 0
+		jUnknown := candidates[j].Channel.LatencyEWMA <= 0
+		if iUnknown != jUnknown {
+			return iUnknown
+		}
+		return candidates[i].Channel.LatencyEWMA < candidates[j].Channel.LatencyEWMA
+	})
+}
+
+func costProbabilityWeights(candidates []RouteCandidate) []int64 {
+	weights := make([]int64, len(candidates))
+	if len(candidates) == 0 {
+		return weights
+	}
+	minimumCost := max(candidates[0].Cost, 0)
+	for index, candidate := range candidates {
+		cost := max(candidate.Cost, 0)
+		quality := (float64(minimumCost) + 1) / (float64(cost) + 1)
+		weights[index] = qualityAdjustedWeight(candidate, quality)
+	}
+	return weights
+}
+
+func latencyProbabilityWeights(candidates []RouteCandidate) []int64 {
+	weights := make([]int64, len(candidates))
+	bestKnownLatency := float64(0)
+	for _, candidate := range candidates {
+		latency := candidate.Channel.LatencyEWMA
+		if latency > 0 && (bestKnownLatency == 0 || latency < bestKnownLatency) {
+			bestKnownLatency = latency
+		}
+	}
+	if bestKnownLatency == 0 {
+		bestKnownLatency = 1
+	}
+	for index, candidate := range candidates {
+		latency := candidate.Channel.LatencyEWMA
+		if latency <= 0 {
+			latency = bestKnownLatency
+		}
+		weights[index] = qualityAdjustedWeight(candidate, min(bestKnownLatency/latency, 1))
+	}
+	return weights
+}
+
+func qualityAdjustedWeight(candidate RouteCandidate, quality float64) int64 {
+	quality = min(max(quality, 0), 1)
+	return max(int64(math.Round(quality*float64(candidateSuccessBasisPoints(candidate)))), 1)
+}
+
+func (r *Router) weightedProbabilityOrder(candidates []RouteCandidate, weights []int64) {
+	if len(candidates) <= 1 || len(weights) != len(candidates) {
+		return
+	}
+	totalWeight := int64(0)
+	for _, weight := range weights {
+		totalWeight += max(weight, 1)
+	}
+	if totalWeight <= 1 {
+		return
+	}
+	point := 0
+	if r.random != nil {
+		point = r.random(int(totalWeight))
+	}
+	if point < 0 {
+		point = -point
+	}
+	point %= int(totalWeight)
+	cumulative := int64(0)
+	selectedIndex := 0
+	for index, weight := range weights {
+		cumulative += max(weight, 1)
+		if int64(point) < cumulative {
+			selectedIndex = index
+			break
+		}
+	}
+	if selectedIndex == 0 {
+		return
+	}
+	selected := candidates[selectedIndex]
+	copy(candidates[1:selectedIndex+1], candidates[:selectedIndex])
+	candidates[0] = selected
+}
+
+func sortCandidatesByProbabilityWeight(candidates []RouteCandidate, weights []int64) {
+	if len(weights) != len(candidates) {
+		return
+	}
+	weightsByCandidate := make(map[uint64]int64, len(candidates))
+	for index, candidate := range candidates {
+		weightsByCandidate[routeCandidateKey(candidate)] = weights[index]
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return weightsByCandidate[routeCandidateKey(candidates[i])] > weightsByCandidate[routeCandidateKey(candidates[j])]
+	})
 }
 
 func routeCandidateKey(candidate RouteCandidate) uint64 {

@@ -65,12 +65,20 @@ type ChannelLatencyPoint struct {
 }
 
 type ChannelMetrics struct {
-	LatencySeries      []ChannelLatencyPoint `json:"latencySeries"`
-	LatestLatencyMS    int64                 `json:"latestLatencyMs"`
-	LatencySampleCount int64                 `json:"latencySampleCount"`
-	InputTokens        int64                 `json:"inputTokens"`
-	CachedTokens       int64                 `json:"cachedTokens"`
-	CacheHitRate       float64               `json:"cacheHitRate"`
+	LatencySeries         []ChannelLatencyPoint `json:"latencySeries"`
+	LatestLatencyMS       int64                 `json:"latestLatencyMs"`
+	AverageFirstTokenMS   float64               `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64                 `json:"firstTokenSampleCount"`
+	AverageLatencyMS      float64               `json:"averageLatencyMs"`
+	LatencySampleCount    int64                 `json:"latencySampleCount"`
+	AverageDurationMS     float64               `json:"averageDurationMs"`
+	DurationSampleCount   int64                 `json:"durationSampleCount"`
+	InputTokens           int64                 `json:"inputTokens"`
+	CachedTokens          int64                 `json:"cachedTokens"`
+	CacheHitRate          float64               `json:"cacheHitRate"`
+	RecentSuccessRate     float64               `json:"recentSuccessRate"`
+	RecentSuccessCount    int64                 `json:"recentSuccessCount"`
+	RecentAttemptCount    int64                 `json:"recentAttemptCount"`
 }
 
 type GatewayModelInput struct {
@@ -108,18 +116,23 @@ type ClientTokenView struct {
 }
 
 type TokenStatistics struct {
-	Requests          int64   `json:"requests"`
-	Successes         int64   `json:"successes"`
-	InputTokens       int64   `json:"inputTokens"`
-	NormalInputTokens int64   `json:"normalInputTokens"`
-	OutputTokens      int64   `json:"outputTokens"`
-	CachedTokens      int64   `json:"cachedTokens"`
-	CacheWriteTokens  int64   `json:"cacheWriteTokens"`
-	SentTokens        int64   `json:"sentTokens"`
-	EstimatedCost     int64   `json:"estimatedCostMicros"`
-	UpstreamCost      int64   `json:"upstreamCostMicros"`
-	AverageLatency    float64 `json:"averageLatencyMs"`
-	Attempts          int64   `json:"attempts"`
+	Requests              int64   `json:"requests"`
+	Successes             int64   `json:"successes"`
+	InputTokens           int64   `json:"inputTokens"`
+	NormalInputTokens     int64   `json:"normalInputTokens"`
+	OutputTokens          int64   `json:"outputTokens"`
+	CachedTokens          int64   `json:"cachedTokens"`
+	CacheWriteTokens      int64   `json:"cacheWriteTokens"`
+	SentTokens            int64   `json:"sentTokens"`
+	EstimatedCost         int64   `json:"estimatedCostMicros"`
+	UpstreamCost          int64   `json:"upstreamCostMicros"`
+	AverageFirstTokenMS   float64 `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64   `json:"firstTokenSampleCount"`
+	AverageLatency        float64 `json:"averageLatencyMs"`
+	LatencySampleCount    int64   `json:"latencySampleCount"`
+	AverageDurationMS     float64 `json:"averageDurationMs"`
+	DurationSampleCount   int64   `json:"durationSampleCount"`
+	Attempts              int64   `json:"attempts"`
 }
 
 type IssuedClientToken struct {
@@ -128,26 +141,37 @@ type IssuedClientToken struct {
 }
 
 type DashboardSummary struct {
-	Requests       int64                `json:"requests"`
-	SuccessRate    float64              `json:"successRate"`
-	InputTokens    int64                `json:"inputTokens"`
-	OutputTokens   int64                `json:"outputTokens"`
-	EstimatedCost  int64                `json:"estimatedCostMicros"`
-	UpstreamCost   int64                `json:"upstreamCostMicros"`
-	AverageLatency float64              `json:"averageLatencyMs"`
-	Daily          []DashboardDaily     `json:"daily"`
-	Channels       []DashboardBreakdown `json:"channels"`
-	Models         []DashboardBreakdown `json:"models"`
+	Requests              int64                `json:"requests"`
+	SuccessRate           float64              `json:"successRate"`
+	InputTokens           int64                `json:"inputTokens"`
+	OutputTokens          int64                `json:"outputTokens"`
+	EstimatedCost         int64                `json:"estimatedCostMicros"`
+	UpstreamCost          int64                `json:"upstreamCostMicros"`
+	AverageFirstTokenMS   float64              `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64                `json:"firstTokenSampleCount"`
+	AverageLatency        float64              `json:"averageLatencyMs"`
+	LatencySampleCount    int64                `json:"latencySampleCount"`
+	AverageDurationMS     float64              `json:"averageDurationMs"`
+	DurationSampleCount   int64                `json:"durationSampleCount"`
+	Daily                 []DashboardDaily     `json:"daily"`
+	Channels              []DashboardBreakdown `json:"channels"`
+	Models                []DashboardBreakdown `json:"models"`
 }
 
 type DashboardDaily struct {
-	Date          string `json:"date"`
-	Requests      int64  `json:"requests"`
-	Successes     int64  `json:"successes"`
-	InputTokens   int64  `json:"inputTokens"`
-	OutputTokens  int64  `json:"outputTokens"`
-	EstimatedCost int64  `json:"estimatedCostMicros"`
-	UpstreamCost  int64  `json:"upstreamCostMicros"`
+	Date                  string  `json:"date"`
+	Requests              int64   `json:"requests"`
+	Successes             int64   `json:"successes"`
+	InputTokens           int64   `json:"inputTokens"`
+	OutputTokens          int64   `json:"outputTokens"`
+	EstimatedCost         int64   `json:"estimatedCostMicros"`
+	UpstreamCost          int64   `json:"upstreamCostMicros"`
+	AverageFirstTokenMS   float64 `json:"averageFirstTokenMs"`
+	FirstTokenSampleCount int64   `json:"firstTokenSampleCount"`
+	AverageLatencyMS      float64 `json:"averageLatencyMs"`
+	LatencySampleCount    int64   `json:"latencySampleCount"`
+	AverageDurationMS     float64 `json:"averageDurationMs"`
+	DurationSampleCount   int64   `json:"durationSampleCount"`
 }
 
 type DashboardBreakdown struct {
@@ -232,21 +256,44 @@ func (s *ManagementService) ListChannels(ctx context.Context) ([]ChannelView, er
 	for _, channel := range channels {
 		channelIDs = append(channelIDs, channel.ID)
 	}
+	var models []ChannelModel
+	if len(channelIDs) > 0 {
+		if err := s.store.db.WithContext(ctx).Where("channel_id IN ?", channelIDs).Order("priority desc, id asc").Find(&models).Error; err != nil {
+			return nil, err
+		}
+	}
+	channelModelIDs := make([]uint64, 0, len(models))
+	modelsByChannel := make(map[uint64][]ChannelModel, len(channels))
+	for _, model := range models {
+		channelModelIDs = append(channelModelIDs, model.ID)
+	}
+	recentSuccess, err := loadRecentSuccessMetrics(ctx, s.store.db, channelIDs, channelModelIDs, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	for index := range models {
+		metric := recentSuccess.ByChannelModel[models[index].ID]
+		models[index].RecentSuccessRate = metric.rate()
+		models[index].RecentSuccessCount = metric.Successes
+		models[index].RecentAttemptCount = metric.Attempts
+		modelsByChannel[models[index].ChannelID] = append(modelsByChannel[models[index].ChannelID], models[index])
+	}
 	metricsByChannel, err := s.channelMetrics(ctx, channelIDs)
 	if err != nil {
 		return nil, err
 	}
 	views := make([]ChannelView, 0, len(channels))
 	for _, channel := range channels {
-		var models []ChannelModel
-		if err := s.store.db.WithContext(ctx).Where("channel_id = ?", channel.ID).Order("priority desc, id asc").Find(&models).Error; err != nil {
-			return nil, err
-		}
+		metrics := metricsByChannel[channel.ID]
+		recentMetric := recentSuccess.ByChannel[channel.ID]
+		metrics.RecentSuccessRate = recentMetric.rate()
+		metrics.RecentSuccessCount = recentMetric.Successes
+		metrics.RecentAttemptCount = recentMetric.Attempts
 		views = append(views, ChannelView{
 			Channel:          channel,
 			APIKeyConfigured: channel.APIKeyCipher != "",
-			Models:           models,
-			Metrics:          metricsByChannel[channel.ID],
+			Models:           modelsByChannel[channel.ID],
+			Metrics:          metrics,
 		})
 	}
 	return views, nil
@@ -263,14 +310,24 @@ func (s *ManagementService) channelMetrics(ctx context.Context, channelIDs []uin
 
 	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	type channelAggregate struct {
-		ChannelID          uint64
-		LatencySampleCount int64
-		InputTokens        int64
-		CachedTokens       int64
+		ChannelID             uint64
+		AverageFirstTokenMS   float64
+		FirstTokenSampleCount int64
+		AverageLatencyMS      float64
+		LatencySampleCount    int64
+		AverageDurationMS     float64
+		DurationSampleCount   int64
+		InputTokens           int64
+		CachedTokens          int64
 	}
 	var aggregates []channelAggregate
 	if err := s.store.db.WithContext(ctx).Model(&RelayAttemptLog{}).
-		Select("channel_id, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_sample_count, "+
+		Select("channel_id, COALESCE(AVG(CASE WHEN first_token_ms > 0 THEN first_token_ms END), 0) AS average_first_token_ms, "+
+			"SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_sample_count, "+
+			"COALESCE(AVG(CASE WHEN latency_ms > 0 THEN latency_ms END), 0) AS average_latency_ms, "+
+			"SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_sample_count, "+
+			"COALESCE(AVG(CASE WHEN duration_ms > 0 THEN duration_ms END), 0) AS average_duration_ms, "+
+			"SUM(CASE WHEN duration_ms > 0 THEN 1 ELSE 0 END) AS duration_sample_count, "+
 			"COALESCE(SUM(CASE WHEN usage_source = 'upstream' THEN input_tokens ELSE 0 END), 0) AS input_tokens, "+
 			"COALESCE(SUM(CASE WHEN usage_source = 'upstream' THEN cached_tokens ELSE 0 END), 0) AS cached_tokens").
 		Where("channel_id IN ? AND created_at >= ? AND success = ?", channelIDs, cutoff, true).
@@ -279,7 +336,12 @@ func (s *ManagementService) channelMetrics(ctx context.Context, channelIDs []uin
 	}
 	for _, aggregate := range aggregates {
 		metrics := metricsByChannel[aggregate.ChannelID]
+		metrics.AverageFirstTokenMS = aggregate.AverageFirstTokenMS
+		metrics.FirstTokenSampleCount = aggregate.FirstTokenSampleCount
+		metrics.AverageLatencyMS = aggregate.AverageLatencyMS
 		metrics.LatencySampleCount = aggregate.LatencySampleCount
+		metrics.AverageDurationMS = aggregate.AverageDurationMS
+		metrics.DurationSampleCount = aggregate.DurationSampleCount
 		metrics.InputTokens = max(aggregate.InputTokens, 0)
 		metrics.CachedTokens = min(max(aggregate.CachedTokens, 0), metrics.InputTokens)
 		if metrics.InputTokens > 0 {
@@ -347,7 +409,7 @@ func (s *ManagementService) CreateChannel(ctx context.Context, input ChannelInpu
 		Channel:          channel,
 		APIKeyConfigured: true,
 		Models:           []ChannelModel{},
-		Metrics:          ChannelMetrics{LatencySeries: []ChannelLatencyPoint{}},
+		Metrics:          ChannelMetrics{LatencySeries: []ChannelLatencyPoint{}, RecentSuccessRate: 1},
 	}, nil
 }
 
@@ -378,15 +440,34 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 	}
 	var models []ChannelModel
 	_ = s.store.db.WithContext(ctx).Where("channel_id = ?", channel.ID).Find(&models).Error
+	channelModelIDs := make([]uint64, 0, len(models))
+	for _, model := range models {
+		channelModelIDs = append(channelModelIDs, model.ID)
+	}
+	recentSuccess, err := loadRecentSuccessMetrics(ctx, s.store.db, []uint64{channel.ID}, channelModelIDs, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	for index := range models {
+		metric := recentSuccess.ByChannelModel[models[index].ID]
+		models[index].RecentSuccessRate = metric.rate()
+		models[index].RecentSuccessCount = metric.Successes
+		models[index].RecentAttemptCount = metric.Attempts
+	}
 	metricsByChannel, err := s.channelMetrics(ctx, []uint64{channel.ID})
 	if err != nil {
 		return nil, err
 	}
+	metrics := metricsByChannel[channel.ID]
+	recentMetric := recentSuccess.ByChannel[channel.ID]
+	metrics.RecentSuccessRate = recentMetric.rate()
+	metrics.RecentSuccessCount = recentMetric.Successes
+	metrics.RecentAttemptCount = recentMetric.Attempts
 	return &ChannelView{
 		Channel:          channel,
 		APIKeyConfigured: channel.APIKeyCipher != "",
 		Models:           models,
-		Metrics:          metricsByChannel[channel.ID],
+		Metrics:          metrics,
 	}, nil
 }
 
@@ -463,6 +544,9 @@ func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID 
 		}
 		return db.Create(&models).Error
 	})
+	for index := range models {
+		models[index].RecentSuccessRate = 1
+	}
 	return models, err
 }
 
@@ -555,7 +639,9 @@ func (s *ManagementService) ListTokens(ctx context.Context) ([]ClientTokenView, 
 func (s *ManagementService) tokenStatistics(ctx context.Context, tokenID uint64) (TokenStatistics, error) {
 	type totals struct {
 		TokenStatistics
-		DurationMS int64
+		FirstTokenMS int64
+		LatencyMS    int64
+		DurationMS   int64
 	}
 	var total totals
 	err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).Select(
@@ -566,13 +652,22 @@ func (s *ManagementService) tokenStatistics(ctx context.Context, tokenID uint64)
 			"COALESCE(SUM(sent_tokens),0) AS sent_tokens, "+
 			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, "+
 			"COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
+			"COALESCE(SUM(first_token_ms),0) AS first_token_ms, COALESCE(SUM(first_token_samples),0) AS first_token_sample_count, "+
+			"COALESCE(SUM(latency_ms),0) AS latency_ms, COALESCE(SUM(latency_samples),0) AS latency_sample_count, "+
 			"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempts",
 	).Where("token_id = ?", tokenID).Scan(&total).Error
 	if err != nil {
 		return TokenStatistics{}, err
 	}
+	if total.FirstTokenSampleCount > 0 {
+		total.AverageFirstTokenMS = float64(total.FirstTokenMS) / float64(total.FirstTokenSampleCount)
+	}
+	if total.LatencySampleCount > 0 {
+		total.AverageLatency = float64(total.LatencyMS) / float64(total.LatencySampleCount)
+	}
 	if total.Requests > 0 {
-		total.AverageLatency = float64(total.DurationMS) / float64(total.Requests)
+		total.AverageDurationMS = float64(total.DurationMS) / float64(total.Requests)
+		total.DurationSampleCount = total.Requests
 	}
 	return total.TokenStatistics, nil
 }
@@ -911,19 +1006,25 @@ func (s *ManagementService) updateDiscoveryHealth(channelID uint64, discovery *C
 func (s *ManagementService) Dashboard(ctx context.Context) (*DashboardSummary, error) {
 	summary := &DashboardSummary{Daily: []DashboardDaily{}, Channels: []DashboardBreakdown{}, Models: []DashboardBreakdown{}}
 	type totals struct {
-		Requests      int64
-		Successes     int64
-		InputTokens   int64
-		OutputTokens  int64
-		EstimatedCost int64
-		UpstreamCost  int64
-		DurationMS    int64
+		Requests              int64
+		Successes             int64
+		InputTokens           int64
+		OutputTokens          int64
+		EstimatedCost         int64
+		UpstreamCost          int64
+		FirstTokenMS          int64
+		FirstTokenSampleCount int64
+		LatencyMS             int64
+		LatencySampleCount    int64
+		DurationMS            int64
 	}
 	var total totals
 	err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).Select(
 		"COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, " +
 			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, " +
-			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, COALESCE(SUM(duration_ms),0) AS duration_ms",
+			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, " +
+			"COALESCE(SUM(first_token_ms),0) AS first_token_ms, COALESCE(SUM(first_token_samples),0) AS first_token_sample_count, " +
+			"COALESCE(SUM(latency_ms),0) AS latency_ms, COALESCE(SUM(latency_samples),0) AS latency_sample_count, COALESCE(SUM(duration_ms),0) AS duration_ms",
 	).Scan(&total).Error
 	if err != nil {
 		return nil, err
@@ -933,13 +1034,30 @@ func (s *ManagementService) Dashboard(ctx context.Context) (*DashboardSummary, e
 	summary.OutputTokens = total.OutputTokens
 	summary.EstimatedCost = total.EstimatedCost
 	summary.UpstreamCost = total.UpstreamCost
+	summary.FirstTokenSampleCount = total.FirstTokenSampleCount
+	summary.LatencySampleCount = total.LatencySampleCount
+	summary.DurationSampleCount = total.Requests
+	if total.FirstTokenSampleCount > 0 {
+		summary.AverageFirstTokenMS = float64(total.FirstTokenMS) / float64(total.FirstTokenSampleCount)
+	}
+	if total.LatencySampleCount > 0 {
+		summary.AverageLatency = float64(total.LatencyMS) / float64(total.LatencySampleCount)
+	}
 	if total.Requests > 0 {
 		summary.SuccessRate = float64(total.Successes) / float64(total.Requests)
-		summary.AverageLatency = float64(total.DurationMS) / float64(total.Requests)
+		summary.AverageDurationMS = float64(total.DurationMS) / float64(total.Requests)
 	}
 	dailyCutoff := time.Now().UTC().AddDate(0, 0, -13).Format(time.DateOnly)
 	if err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).
-		Select("date, COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
+		Select("date, COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, "+
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, "+
+			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
+			"COALESCE(1.0 * SUM(first_token_ms) / NULLIF(SUM(first_token_samples),0),0) AS average_first_token_ms, "+
+			"COALESCE(SUM(first_token_samples),0) AS first_token_sample_count, "+
+			"COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(latency_samples),0),0) AS average_latency_ms, "+
+			"COALESCE(SUM(latency_samples),0) AS latency_sample_count, "+
+			"COALESCE(1.0 * SUM(duration_ms) / NULLIF(SUM(request_count),0),0) AS average_duration_ms, "+
+			"COALESCE(SUM(request_count),0) AS duration_sample_count").
 		Where("date >= ?", dailyCutoff).Group("date").Order("date asc").Scan(&summary.Daily).Error; err != nil {
 		return nil, err
 	}
@@ -990,16 +1108,33 @@ func (s *ManagementService) Logs(ctx context.Context, query LogQuery) (*LogPage,
 		return nil, err
 	}
 	var logs []RelayRequestLog
-	if err := db.Order("created_at desc").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&logs).Error; err != nil {
+	if err := db.Omit("request_body", "response_body").Order("created_at desc").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).Find(&logs).Error; err != nil {
 		return nil, err
 	}
 	items := make([]RelayRequestView, 0, len(logs))
 	for _, log := range logs {
-		view, err := s.relayRequestView(ctx, log)
+		view, err := s.relayRequestView(ctx, log, false)
 		if err != nil {
 			return nil, err
 		}
 		items = append(items, view)
 	}
 	return &LogPage{Items: items, Total: total, Page: query.Page, PageSize: query.PageSize}, nil
+}
+
+func (s *ManagementService) LogDetail(ctx context.Context, requestID string) (*RelayRequestView, error) {
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return nil, errors.New("request id is required")
+	}
+	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	var log RelayRequestLog
+	if err := s.store.db.WithContext(ctx).Where("id = ? AND created_at >= ?", requestID, cutoff).First(&log).Error; err != nil {
+		return nil, err
+	}
+	view, err := s.relayRequestView(ctx, log, true)
+	if err != nil {
+		return nil, err
+	}
+	return &view, nil
 }

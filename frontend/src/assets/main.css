@@ -81,7 +81,7 @@ code { font-family: var(--rose-font-mono); font-size: 0.94em; font-variant-numer
 .el-message { border-radius: var(--rose-radius-control); }
 .el-input-number { width: 100%; }
 
-@media (max-width: 1120px) {
+@media (max-width: 1360px) {
   .metric-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .metric-cell:nth-child(3) { border-right: 0; }
   .metric-cell:nth-child(-n + 3) { border-bottom: 1px solid var(--rose-border); }

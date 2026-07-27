@@ -26,9 +26,9 @@ const deletingModelId = ref<number | null>(null)
 const form = reactive<{ name: string; routingStrategy: RoutingStrategy; enabled: boolean }>({ name: '', routingStrategy: 'priority_weighted', enabled: true })
 const dialogTitle = computed(() => editingId.value ? '编辑公开模型' : '新增公开模型')
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
-  { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按权重分配' },
-  { value: 'lowest_cost', label: '最低成本', note: '按本次输入和预计输出 Token 选择' },
-  { value: 'lowest_latency', label: '最低延迟', note: '按成功请求延迟 EWMA 选择并探测新渠道' },
+  { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按配置权重和近 30 分钟成功率分配' },
+  { value: 'lowest_cost', label: '最低成本', note: '按本次预计成本优势和近 30 分钟成功率动态分配' },
+  { value: 'lowest_latency', label: '最低延迟', note: '按延迟优势和近 30 分钟成功率动态分配，并探测新渠道' },
 ]
 
 function strategyLabel(value: RoutingStrategy): string {
@@ -76,6 +76,10 @@ function formatPrice(micros: number | null): string {
 
 function formatMultiplier(basisPoints: number): string {
   return `${(Number.isFinite(basisPoints) ? basisPoints / 10_000 : 1).toFixed(2)}x`
+}
+
+function formatPercent(value: number): string {
+  return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
 }
 
 function openEditor(model?: GatewayModel) {
@@ -158,6 +162,15 @@ onMounted(loadData)
                 <el-table-column label="映射状态" width="104"><template #default="candidate"><el-tag :type="candidate.row.mapping.enabled ? 'success' : 'info'" effect="plain" size="small">{{ candidate.row.mapping.enabled ? '已启用' : '已停用' }}</el-tag></template></el-table-column>
                 <el-table-column label="渠道状态" width="104"><template #default="candidate"><el-tag :type="channelState(candidate.row.channel).type" effect="plain" size="small">{{ channelState(candidate.row.channel).label }}</el-tag></template></el-table-column>
                 <el-table-column label="上游模型" min-width="160"><template #default="candidate"><code>{{ candidate.row.mapping.upstreamModel }}</code></template></el-table-column>
+                <el-table-column label="近 30 分钟成功率" width="160" align="right">
+                  <template #default="candidate">
+                    <div class="success-rate-cell">
+                      <strong>{{ formatPercent(candidate.row.mapping.recentSuccessRate) }}</strong>
+                      <small v-if="candidate.row.mapping.recentAttemptCount">{{ candidate.row.mapping.recentSuccessCount }} / {{ candidate.row.mapping.recentAttemptCount }} 次尝试</small>
+                      <small v-else>暂无调用，按 100%</small>
+                    </div>
+                  </template>
+                </el-table-column>
                 <el-table-column label="优先级 / 权重" width="132" align="right"><template #default="candidate">{{ candidate.row.mapping.priority }} / {{ candidate.row.mapping.weight }}</template></el-table-column>
                 <el-table-column label="价格倍率" width="96" align="right"><template #default="candidate"><code>{{ formatMultiplier(candidate.row.mapping.priceMultiplierBasisPoints) }}</code></template></el-table-column>
                 <el-table-column label="输入" width="104" align="right"><template #default="candidate">{{ formatPrice(candidate.row.mapping.inputPriceMicros) }}</template></el-table-column>
@@ -194,6 +207,9 @@ onMounted(loadData)
 .candidate-matrix { padding: 12px 24px 20px 54px; background: var(--rose-surface-muted); }
 .matrix-heading { display: flex; justify-content: space-between; align-items: center; padding: 0 0 10px; color: var(--rose-text-muted); font-size: 12px; }
 .matrix-heading strong { color: var(--rose-text); }
+.success-rate-cell { display: grid; justify-items: end; gap: 2px; font-variant-numeric: tabular-nums; }
+.success-rate-cell strong { color: var(--rose-text); font-size: 13px; }
+.success-rate-cell small { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
 .select-option { display: grid; line-height: 1.3; }
 .select-option small { color: var(--rose-text-muted); font-size: 11px; }
 @media (max-width: 640px) { .candidate-matrix { padding: 10px; } }

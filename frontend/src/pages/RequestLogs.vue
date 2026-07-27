@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
+import { Refresh, RefreshLeft, Search, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import type { Channel, ClientToken, GatewayModel, LogPage, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 
@@ -13,6 +15,9 @@ const channels = ref<Channel[]>([])
 const tokens = ref<ClientToken[]>([])
 const filters = reactive({ model: '', channelId: '', tokenId: '', status: '', range: [] as Date[] })
 const pagination = reactive({ page: 1, pageSize: 50 })
+const payloadDialogOpen = ref(false)
+const selectedRequest = ref<RelayRequestLog | null>(null)
+const payloadLoadingId = ref('')
 
 function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(micros / 1_000_000)
@@ -24,6 +29,10 @@ function formatTokens(value: number): string {
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
+}
+
+function formatTiming(value: number): string {
+  return value > 0 ? `${value} ms` : '--'
 }
 
 function channelName(id: number): string {
@@ -59,6 +68,23 @@ function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
   if (status === 408 || status === 429) return 'warning'
   if (status >= 500 || status === 0) return 'danger'
   return 'info'
+}
+
+function attemptStatus(log: RelayRequestLog['attempts'][number]): string {
+  if (!log.success && log.statusCode >= 200 && log.statusCode < 300) return `业务中断 · HTTP ${log.statusCode}`
+  return log.statusCode ? String(log.statusCode) : '网络错误'
+}
+
+async function showPayloads(log: RelayRequestLog) {
+  payloadLoadingId.value = log.id
+  try {
+    selectedRequest.value = await request<RelayRequestLog>(`/admin/gateway/logs/${encodeURIComponent(log.id)}`)
+    payloadDialogOpen.value = true
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '调用详情加载失败')
+  } finally {
+    payloadLoadingId.value = ''
+  }
 }
 
 async function loadOptions() {
@@ -140,8 +166,12 @@ onMounted(async () => {
               <div v-for="(attempt, index) in scope.row.attempts" :key="attempt.id" class="attempt-row">
                 <span class="attempt-index">{{ index + 1 }}</span>
                 <div><strong>{{ attempt.channelName || channelName(attempt.channelId) }}</strong><small><code>{{ attempt.upstreamModel }}</code></small></div>
-                <el-tag :type="statusType(attempt.statusCode)" effect="plain">{{ attempt.statusCode || '网络错误' }}</el-tag>
-                <span>{{ attempt.latencyMs }} ms</span>
+                <el-tag :type="attempt.success ? statusType(attempt.statusCode) : 'danger'" effect="plain">{{ attemptStatus(attempt) }}</el-tag>
+                <div class="attempt-timing">
+                  <span><small>首 Token</small><strong>{{ formatTiming(attempt.firstTokenMs) }}</strong></span>
+                  <span><small>延迟</small><strong>{{ formatTiming(attempt.latencyMs) }}</strong></span>
+                  <span><small>耗时</small><strong>{{ formatTiming(attempt.durationMs) }}</strong></span>
+                </div>
                 <div class="token-breakdown attempt-tokens">
                   <span><small>普通输入</small><strong>{{ formatTokens(attempt.normalInputTokens) }}</strong></span>
                   <span><small>输出</small><strong>{{ formatTokens(attempt.outputTokens) }}</strong></span>
@@ -157,7 +187,7 @@ onMounted(async () => {
           </template>
         </el-table-column>
         <el-table-column label="时间 / 请求 ID" min-width="220"><template #default="scope"><div class="primary-cell"><strong>{{ formatDate(scope.row.createdAt) }}</strong><small><code>{{ scope.row.id }}</code></small></div></template></el-table-column>
-        <el-table-column label="会话 / 调用令牌" min-width="210"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.codexSessionId || '未识别会话' }}</strong><small>{{ tokenName(scope.row) }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
+        <el-table-column label="会话 / 调用令牌" min-width="210"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.sessionName || scope.row.codexSessionId || '未命名会话' }}</strong><small>{{ tokenName(scope.row) }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
         <el-table-column label="端点 / 模型" min-width="180"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</strong><small><code>{{ scope.row.requestedModel }}</code></small></div></template></el-table-column>
         <el-table-column label="状态" width="92"><template #default="scope"><el-tag :type="statusType(scope.row.statusCode)" effect="plain">{{ scope.row.statusCode }}</el-tag></template></el-table-column>
         <el-table-column label="Token 明细" min-width="300">
@@ -173,11 +203,15 @@ onMounted(async () => {
         </el-table-column>
         <el-table-column label="费用" width="158" align="right"><template #default="scope"><div class="cost-breakdown"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>自行估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
         <el-table-column label="来源" width="142"><template #default="scope"><div class="source-breakdown"><el-tag :type="costSourceType(scope.row.costSource)" effect="plain" size="small">{{ costSource(scope.row.costSource) }}</el-tag><small>{{ usageSource(scope.row.usageSource) }}</small></div></template></el-table-column>
-        <el-table-column label="耗时" width="96" align="right"><template #default="scope">{{ scope.row.durationMs }} ms</template></el-table-column>
+        <el-table-column label="首 Token" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.firstTokenMs) }}</template></el-table-column>
+        <el-table-column label="请求延迟" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.latencyMs) }}</template></el-table-column>
+        <el-table-column label="请求耗时" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.durationMs) }}</template></el-table-column>
         <el-table-column label="尝试" width="72" align="right" prop="attemptCount" />
+        <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><el-tooltip content="查看完整请求与响应" placement="top"><el-button class="table-action-button" text :icon="View" :loading="payloadLoadingId === scope.row.id" aria-label="查看完整请求与响应" @click="showPayloads(scope.row)" /></el-tooltip></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadLogs" /></footer>
     </section>
+    <RequestPayloadDialog v-model="payloadDialogOpen" :request="selectedRequest" />
   </div>
 </template>
 
@@ -185,8 +219,12 @@ onMounted(async () => {
 .attempt-list { display: grid; gap: 8px; padding: 14px 24px 18px 54px; background: var(--rose-surface-muted); }
 .attempt-list > header { display: flex; justify-content: space-between; color: var(--rose-text-muted); font-size: 12px; }
 .attempt-list > header strong { color: var(--rose-text); }
-.attempt-row { display: grid; grid-template-columns: 28px minmax(140px, 1.2fr) 94px 90px minmax(300px, 1.4fr) 142px 132px; align-items: center; gap: 12px; min-width: 1060px; padding: 9px 0; border-top: 1px solid var(--rose-border); font-size: 12px; }
+.attempt-row { display: grid; grid-template-columns: 28px minmax(140px, 1.2fr) 94px 200px minmax(300px, 1.4fr) 142px 132px; align-items: center; gap: 12px; min-width: 1170px; padding: 9px 0; border-top: 1px solid var(--rose-border); font-size: 12px; }
 .attempt-row > div { display: grid; }
+.attempt-timing { grid-template-columns: repeat(3, minmax(58px, 1fr)); gap: 8px; font-variant-numeric: tabular-nums; }
+.attempt-timing span { display: grid; gap: 1px; }
+.attempt-timing small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
+.attempt-timing strong { color: var(--rose-text); font-size: 12px; white-space: nowrap; }
 .token-breakdown { display: grid; grid-template-columns: repeat(4, minmax(58px, 1fr)); gap: 5px 10px; font-variant-numeric: tabular-nums; }
 .token-breakdown > span { display: grid; gap: 1px; min-width: 0; }
 .token-breakdown small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }

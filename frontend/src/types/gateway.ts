@@ -33,6 +33,13 @@ export interface ChannelModel {
   priceMultiplierBasisPoints: number
   /** Whether this mapping can receive new requests. */
   enabled: boolean
+
+  /** Successes divided by attempts for this channel-model mapping during the last 30 minutes; 1 without samples. */
+  recentSuccessRate: number
+  /** Successful upstream attempts for this mapping during the last 30 minutes. */
+  recentSuccessCount: number
+  /** All upstream attempts for this mapping during the last 30 minutes. */
+  recentAttemptCount: number
   /** Mapping creation timestamp in RFC 3339 format. */
   createdAt: string
   /** Mapping update timestamp in RFC 3339 format. */
@@ -51,14 +58,30 @@ export interface ChannelMetrics {
   latencySeries: ChannelLatencyPoint[]
   /** Most recent successful upstream latency in milliseconds, or zero without a sample. */
   latestLatencyMs: number
+  /** Mean time to the first generated output token across sampled successful streaming attempts. */
+  averageFirstTokenMs: number
+  /** Successful streaming attempts with a recorded first output token within five days. */
+  firstTokenSampleCount: number
+  /** Mean time to upstream response headers across sampled successful attempts. */
+  averageLatencyMs: number
   /** Total successful attempts with a positive latency sample within five days. */
   latencySampleCount: number
+  /** Mean time to consume the full upstream response across sampled successful attempts. */
+  averageDurationMs: number
+  /** Successful attempts with a recorded full-response duration within five days. */
+  durationSampleCount: number
   /** Upstream-reported input tokens from successful attempts within five days. */
   inputTokens: number
   /** Upstream-reported cached input tokens included in inputTokens within five days. */
   cachedTokens: number
   /** cachedTokens divided by inputTokens, or zero when no input usage is known. */
   cacheHitRate: number
+  /** Successes divided by all channel attempts during the last 30 minutes; 1 without samples. */
+  recentSuccessRate: number
+  /** Successful attempts across every channel model during the last 30 minutes. */
+  recentSuccessCount: number
+  /** All attempts across every channel model during the last 30 minutes. */
+  recentAttemptCount: number
 }
 
 export interface Channel {
@@ -88,7 +111,7 @@ export interface Channel {
   apiKeyConfigured: boolean
   /** Public-to-upstream model mappings configured for the channel. */
   models: ChannelModel[]
-  /** Recent performance and cache metrics derived from five-day detailed attempt logs. */
+  /** Performance, cache, and rolling 30-minute success metrics derived from detailed attempt logs. */
   metrics: ChannelMetrics
   /** Channel creation timestamp in RFC 3339 format. */
   createdAt: string
@@ -217,8 +240,18 @@ export interface TokenStatistics {
   estimatedCostMicros: number
   /** Total upstream-reported cost in micro-USD, with estimate fallback when the upstream omits cost. */
   upstreamCostMicros: number
-  /** Average end-to-end request latency in milliseconds. */
+  /** Mean time to the first generated output token in milliseconds. */
+  averageFirstTokenMs: number
+  /** Requests with an observed first output token. */
+  firstTokenSampleCount: number
+  /** Mean time from gateway ingress to final upstream response headers in milliseconds. */
   averageLatencyMs: number
+  /** Requests with an observed final upstream response header. */
+  latencySampleCount: number
+  /** Mean end-to-end request duration in milliseconds. */
+  averageDurationMs: number
+  /** Requests included in the duration average. */
+  durationSampleCount: number
   /** Total upstream attempts across requests. */
   attempts: number
 }
@@ -245,6 +278,18 @@ export interface DashboardDaily {
   estimatedCostMicros: number
   /** Upstream cost in micro-USD, with estimate fallback when the upstream omits cost. */
   upstreamCostMicros: number
+  /** Mean time to the first generated output token for sampled requests on the date. */
+  averageFirstTokenMs: number
+  /** Requests with an observed first output token on the date. */
+  firstTokenSampleCount: number
+  /** Mean time to final upstream response headers for sampled requests on the date. */
+  averageLatencyMs: number
+  /** Requests with an observed final upstream response header on the date. */
+  latencySampleCount: number
+  /** Mean end-to-end request duration on the date. */
+  averageDurationMs: number
+  /** Requests included in the duration average on the date. */
+  durationSampleCount: number
 }
 
 export interface DashboardBreakdown {
@@ -271,8 +316,18 @@ export interface DashboardSummary {
   estimatedCostMicros: number
   /** Primary total cost in micro-USD, reported by upstream or estimated when absent. */
   upstreamCostMicros: number
-  /** Mean end-to-end request latency in milliseconds. */
+  /** Mean time to the first generated output token in milliseconds. */
+  averageFirstTokenMs: number
+  /** Requests with an observed first output token. */
+  firstTokenSampleCount: number
+  /** Mean time from gateway ingress to final upstream response headers in milliseconds. */
   averageLatencyMs: number
+  /** Requests with an observed final upstream response header. */
+  latencySampleCount: number
+  /** Mean end-to-end request duration in milliseconds. */
+  averageDurationMs: number
+  /** Requests included in the duration average. */
+  durationSampleCount: number
   /** Daily metrics for the most recent 14 days. */
   daily: DashboardDaily[]
   /** Highest-usage channel breakdown from five-day detailed logs. */
@@ -292,6 +347,7 @@ export type AttemptSelectionReason =
   | 'retryable_status'
   | 'transport_error'
   | 'response_error'
+  | 'upstream_application_error'
   | 'gateway_preparation_error'
   | 'circuit_opened'
   | ''
@@ -319,6 +375,14 @@ export interface RelayAttemptLog {
   selectionReason: AttemptSelectionReason
   /** Sanitized, bounded diagnostic detail for the selection reason. */
   selectionDetail: string
+  /** Transformed request body sent to this upstream attempt. */
+  requestBody: string
+  /** Whether requestBody was truncated at the four MiB retention limit. */
+  requestBodyTruncated: boolean
+  /** Full upstream response body retained for this attempt, including SSE events. */
+  responseBody: string
+  /** Whether responseBody was truncated at the four MiB retention limit. */
+  responseBodyTruncated: boolean
   /** Upstream HTTP status, or zero for a transport error. */
   statusCode: number
   /** Input tokens charged or estimated for this attempt. */
@@ -341,8 +405,12 @@ export interface RelayAttemptLog {
   costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
+  /** Time from sending the upstream request to the first generated output token, or zero without a sample. */
+  firstTokenMs: number
   /** Time to upstream response headers in milliseconds. */
   latencyMs: number
+  /** Time from sending the upstream request until its response body ended. */
+  durationMs: number
   /** Whether the attempt completed successfully. */
   success: boolean
   /** Sanitized transport or status failure detail. */
@@ -368,8 +436,18 @@ export interface RelayRequestLog {
   codexSessionId: string
   /** Payload field used to identify the Codex session, or unavailable. */
   codexSessionSource: string
+  /** First user text from this request, normalized and limited to ten Unicode characters. */
+  sessionName: string
   /** Allowlisted non-content API parameters retained for five-day diagnostics. */
   requestParameters: Record<string, unknown>
+  /** Original request body, including the client-sent context. */
+  requestBody: string
+  /** Whether requestBody was truncated at the four MiB retention limit. */
+  requestBodyTruncated: boolean
+  /** Final response body retained for the request, including SSE events. */
+  responseBody: string
+  /** Whether responseBody was truncated at the four MiB retention limit. */
+  responseBodyTruncated: boolean
   /** Final HTTP status returned to the client. */
   statusCode: number
   /** Total input tokens across known attempts. */
@@ -394,6 +472,10 @@ export interface RelayRequestLog {
   usageSource: string
   /** Number of upstream attempts made. */
   attemptCount: number
+  /** Time from gateway ingress to the first generated output token, or zero without a sample. */
+  firstTokenMs: number
+  /** Time from gateway ingress to the final upstream response headers, or zero without a sample. */
+  latencyMs: number
   /** End-to-end request duration in milliseconds. */
   durationMs: number
   /** Whether the client requested an SSE response. */
@@ -443,6 +525,8 @@ export interface SessionChannel {
 export interface CodexSessionSummary {
   /** Extracted Codex session identifier, blank for an unidentified request. */
   sessionId: string
+  /** Name derived from the first retained request's first user text. */
+  sessionName: string
   /** Payload field used to identify the session, or unavailable. */
   sessionSource: string
   /** Whether multiple requests can be reliably grouped into this session. */
@@ -485,8 +569,18 @@ export interface CodexSessionSummary {
   estimatedCostMicros: number
   /** Total upstream cost in micro-USD, with estimate fallback when absent. */
   upstreamCostMicros: number
-  /** Mean end-to-end request latency in milliseconds. */
+  /** Mean time to the first generated output token in milliseconds. */
+  averageFirstTokenMs: number
+  /** Retained requests with an observed first output token. */
+  firstTokenSampleCount: number
+  /** Mean time to final upstream response headers in milliseconds. */
+  averageLatencyMs: number
+  /** Retained requests with an observed final upstream response header. */
+  latencySampleCount: number
+  /** Mean end-to-end request duration in milliseconds. */
   averageDurationMs: number
+  /** Retained requests included in the duration average. */
+  durationSampleCount: number
   /** Earliest retained request timestamp in RFC 3339 format. */
   firstSeenAt: string
   /** Latest retained request timestamp in RFC 3339 format. */

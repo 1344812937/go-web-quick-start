@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Coin, Connection, CopyDocument, DataLine, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
+import { Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import type { Channel, ClientToken, DashboardSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -148,10 +148,22 @@ onMounted(loadDashboard)
           <small>自行估算 {{ formatUSD(dashboard?.estimatedCostMicros ?? 0) }}</small>
         </article>
         <article class="metric-cell">
-          <span><Timer />平均延迟</span>
-          <strong v-if="!loading">{{ Math.round(dashboard?.averageLatencyMs ?? 0) }} ms</strong>
+          <span><Timer />平均首 Token</span>
+          <strong v-if="!loading">{{ dashboard?.firstTokenSampleCount ? `${Math.round(dashboard.averageFirstTokenMs)} ms` : '--' }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>端到端请求耗时</small>
+          <small>{{ dashboard?.firstTokenSampleCount ?? 0 }} 个流式样本</small>
+        </article>
+        <article class="metric-cell">
+          <span><Odometer />平均请求延迟</span>
+          <strong v-if="!loading">{{ dashboard?.latencySampleCount ? `${Math.round(dashboard.averageLatencyMs)} ms` : '--' }}</strong>
+          <el-skeleton v-else :rows="1" animated />
+          <small>{{ dashboard?.latencySampleCount ?? 0 }} 个响应头样本</small>
+        </article>
+        <article class="metric-cell">
+          <span><Clock />平均请求耗时</span>
+          <strong v-if="!loading">{{ Math.round(dashboard?.averageDurationMs ?? 0) }} ms</strong>
+          <el-skeleton v-else :rows="1" animated />
+          <small>{{ dashboard?.durationSampleCount ?? 0 }} 个完整请求</small>
         </article>
         <article class="metric-cell">
           <span><Connection />可用渠道</span>

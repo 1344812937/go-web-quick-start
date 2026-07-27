@@ -14,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/1344812937/go-web-quick-start/internal/config"
 
@@ -391,8 +392,8 @@ func TestBackfillTokenStatsAndLogFieldsRunOnce(t *testing.T) {
 	store := newTestStore(t)
 	createdAt := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
 	logs := []RelayRequestLog{
-		{ID: "request-1", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, InputTokens: 10, OutputTokens: 4, CachedTokens: 3, CacheWriteTokens: 2, EstimatedCost: 12, AttemptCount: 1, DurationMS: 100, CreatedAt: createdAt},
-		{ID: "request-2", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusBadGateway, InputTokens: 6, OutputTokens: 0, EstimatedCost: 5, AttemptCount: 2, DurationMS: 300, CreatedAt: createdAt.Add(time.Hour)},
+		{ID: "request-1", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, InputTokens: 10, OutputTokens: 4, CachedTokens: 3, CacheWriteTokens: 2, EstimatedCost: 12, AttemptCount: 1, FirstTokenMS: 50, LatencyMS: 30, DurationMS: 100, CreatedAt: createdAt},
+		{ID: "request-2", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusBadGateway, InputTokens: 6, OutputTokens: 0, EstimatedCost: 5, AttemptCount: 2, LatencyMS: 60, DurationMS: 300, CreatedAt: createdAt.Add(time.Hour)},
 	}
 	if err := store.db.Create(&logs).Error; err != nil {
 		t.Fatal(err)
@@ -417,7 +418,7 @@ func TestBackfillTokenStatsAndLogFieldsRunOnce(t *testing.T) {
 	if err := store.db.First(&stat, "date = ? AND token_id = ?", "2026-07-20", 7).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stat.RequestCount != 2 || stat.SuccessCount != 1 || stat.InputTokens != 16 || stat.NormalInputTokens != 11 || stat.OutputTokens != 4 || stat.CachedTokens != 3 || stat.CacheWriteTokens != 2 || stat.SentTokens != 16 || stat.EstimatedCost != 17 || stat.UpstreamCost != 17 || stat.DurationMS != 400 || stat.AttemptCount != 3 {
+	if stat.RequestCount != 2 || stat.SuccessCount != 1 || stat.InputTokens != 16 || stat.NormalInputTokens != 11 || stat.OutputTokens != 4 || stat.CachedTokens != 3 || stat.CacheWriteTokens != 2 || stat.SentTokens != 16 || stat.EstimatedCost != 17 || stat.UpstreamCost != 17 || stat.FirstTokenMS != 50 || stat.FirstTokenSamples != 1 || stat.LatencyMS != 90 || stat.LatencySamples != 2 || stat.DurationMS != 400 || stat.AttemptCount != 3 {
 		t.Fatalf("backfilled stat = %+v", stat)
 	}
 	var backfilledRequest RelayRequestLog
@@ -432,7 +433,7 @@ func TestBackfillTokenStatsAndLogFieldsRunOnce(t *testing.T) {
 		t.Fatalf("backfilled token details = request %+v attempt %+v", backfilledRequest, backfilledAttempt)
 	}
 	statistics, err := NewManagementService(store).tokenStatistics(context.Background(), 7)
-	if err != nil || statistics.NormalInputTokens != 11 || statistics.CacheWriteTokens != 2 || statistics.SentTokens != 16 || statistics.UpstreamCost != 17 {
+	if err != nil || statistics.NormalInputTokens != 11 || statistics.CacheWriteTokens != 2 || statistics.SentTokens != 16 || statistics.UpstreamCost != 17 || statistics.AverageFirstTokenMS != 50 || statistics.AverageLatency != 45 || statistics.AverageDurationMS != 200 {
 		t.Fatalf("token statistics = %+v, error = %v", statistics, err)
 	}
 }
@@ -541,7 +542,8 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
 	stat := TokenDailyStat{
 		Date: "2026-07-20", TokenID: 1, RequestCount: 8, SuccessCount: 6,
-		InputTokens: 100, OutputTokens: 40, EstimatedCost: 900, UpstreamCost: 700, DurationMS: 1600,
+		InputTokens: 100, OutputTokens: 40, EstimatedCost: 900, UpstreamCost: 700,
+		FirstTokenMS: 300, FirstTokenSamples: 3, LatencyMS: 400, LatencySamples: 4, DurationMS: 1600,
 	}
 	if err := store.db.Create(&stat).Error; err != nil {
 		t.Fatal(err)
@@ -564,7 +566,7 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Requests != 8 || summary.InputTokens != 100 || summary.OutputTokens != 40 || summary.EstimatedCost != 900 || summary.UpstreamCost != 700 || summary.AverageLatency != 200 {
+	if summary.Requests != 8 || summary.InputTokens != 100 || summary.OutputTokens != 40 || summary.EstimatedCost != 900 || summary.UpstreamCost != 700 || summary.AverageFirstTokenMS != 100 || summary.AverageLatency != 100 || summary.AverageDurationMS != 200 {
 		t.Fatalf("dashboard totals = %+v", summary)
 	}
 	if len(summary.Channels) != 1 || summary.Channels[0].Requests != 1 || summary.Channels[0].UpstreamCost != 30 || len(summary.Models) != 1 || summary.Models[0].Requests != 1 || summary.Models[0].UpstreamCost != 30 {
@@ -598,7 +600,9 @@ func TestListChannelsIncludesRecentLatencyAndCacheMetrics(t *testing.T) {
 			InputTokens:    10,
 			CachedTokens:   5,
 			UsageSource:    "upstream",
+			FirstTokenMS:   int64(200 + index),
 			LatencyMS:      int64(100 + index),
+			DurationMS:     int64(300 + index),
 			Success:        true,
 			CreatedAt:      now.Add(-4*time.Hour + time.Duration(index)*time.Minute),
 		})
@@ -608,7 +612,7 @@ func TestListChannelsIncludesRecentLatencyAndCacheMetrics(t *testing.T) {
 	}
 	extraAttempts := []RelayAttemptLog{
 		{RequestID: "usage-without-latency", ChannelID: channels[0].ID, ChannelModelID: 1, UpstreamModel: "upstream-model", StatusCode: http.StatusOK, InputTokens: 100, CachedTokens: 25, UsageSource: "upstream", Success: true, CreatedAt: now.Add(-30 * time.Minute)},
-		{RequestID: "estimated-usage", ChannelID: channels[0].ID, ChannelModelID: 1, UpstreamModel: "upstream-model", StatusCode: http.StatusOK, InputTokens: 400, UsageSource: "estimated_tiktoken", LatencyMS: 75, Success: true, CreatedAt: now.Add(-25 * time.Minute)},
+		{RequestID: "estimated-usage", ChannelID: channels[0].ID, ChannelModelID: 1, UpstreamModel: "upstream-model", StatusCode: http.StatusOK, InputTokens: 400, UsageSource: "estimated_tiktoken", FirstTokenMS: 175, LatencyMS: 75, DurationMS: 275, Success: true, CreatedAt: now.Add(-25 * time.Minute)},
 		{RequestID: "failed", ChannelID: channels[0].ID, ChannelModelID: 1, UpstreamModel: "upstream-model", StatusCode: http.StatusBadGateway, InputTokens: 1000, CachedTokens: 1000, UsageSource: "upstream", LatencyMS: 888, Success: false, CreatedAt: now.Add(-20 * time.Minute)},
 		{RequestID: "expired", ChannelID: channels[0].ID, ChannelModelID: 1, UpstreamModel: "upstream-model", StatusCode: http.StatusOK, InputTokens: 1000, CachedTokens: 1000, UsageSource: "upstream", LatencyMS: 999, Success: true, CreatedAt: now.Add(-(DetailedLogRetentionDays*24*time.Hour + time.Hour))},
 	}
@@ -638,6 +642,9 @@ func TestListChannelsIncludesRecentLatencyAndCacheMetrics(t *testing.T) {
 	if measured.Metrics.LatencySeries[0].LatencyMS != 103 || measured.Metrics.LatencySeries[channelLatencyPointLimit-2].LatencyMS != 149 || measured.Metrics.LatencySeries[channelLatencyPointLimit-1].LatencyMS != 75 || measured.Metrics.LatestLatencyMS != 75 {
 		t.Fatalf("latency series is not the latest chronological window: %+v", measured.Metrics.LatencySeries)
 	}
+	if measured.Metrics.FirstTokenSampleCount != 51 || measured.Metrics.LatencySampleCount != 51 || measured.Metrics.DurationSampleCount != 51 || math.Abs(measured.Metrics.AverageFirstTokenMS-223.5294117647) > 0.000001 || math.Abs(measured.Metrics.AverageLatencyMS-123.5294117647) > 0.000001 || math.Abs(measured.Metrics.AverageDurationMS-323.5294117647) > 0.000001 {
+		t.Fatalf("timing metrics = %+v", measured.Metrics)
+	}
 	for index := 1; index < len(measured.Metrics.LatencySeries); index++ {
 		if measured.Metrics.LatencySeries[index-1].RecordedAt.After(measured.Metrics.LatencySeries[index].RecordedAt) {
 			t.Fatalf("latency series is not chronological: %+v", measured.Metrics.LatencySeries)
@@ -646,8 +653,89 @@ func TestListChannelsIncludesRecentLatencyAndCacheMetrics(t *testing.T) {
 	if measured.Metrics.InputTokens != 600 || measured.Metrics.CachedTokens != 275 || math.Abs(measured.Metrics.CacheHitRate-275.0/600.0) > 0.000001 {
 		t.Fatalf("cache metrics = %+v", measured.Metrics)
 	}
-	if empty.Metrics.LatencySeries == nil || len(empty.Metrics.LatencySeries) != 0 || empty.Metrics.InputTokens != 0 || empty.Metrics.CacheHitRate != 0 {
+	if measured.Metrics.RecentSuccessCount != 1 || measured.Metrics.RecentAttemptCount != 2 || measured.Metrics.RecentSuccessRate != 0.5 {
+		t.Fatalf("recent channel success metrics = %+v", measured.Metrics)
+	}
+	if empty.Metrics.LatencySeries == nil || len(empty.Metrics.LatencySeries) != 0 || empty.Metrics.InputTokens != 0 || empty.Metrics.CacheHitRate != 0 || empty.Metrics.RecentSuccessRate != 1 || empty.Metrics.RecentAttemptCount != 0 {
 		t.Fatalf("empty channel metrics = %+v", empty.Metrics)
+	}
+}
+
+func TestRecentSuccessMetricsUseThirtyMinuteWindowAndAggregateChannelModels(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	attempts := []RelayAttemptLog{
+		{RequestID: "model-a-success-1", ChannelID: 10, ChannelModelID: 101, UpstreamModel: "model-a", Success: true, CreatedAt: now.Add(-29 * time.Minute)},
+		{RequestID: "model-a-success-2", ChannelID: 10, ChannelModelID: 101, UpstreamModel: "model-a", Success: true, CreatedAt: now.Add(-20 * time.Minute)},
+		{RequestID: "model-a-failure", ChannelID: 10, ChannelModelID: 101, UpstreamModel: "model-a", Success: false, CreatedAt: now.Add(-10 * time.Minute)},
+		{RequestID: "model-b-success", ChannelID: 10, ChannelModelID: 102, UpstreamModel: "model-b", Success: true, CreatedAt: now.Add(-5 * time.Minute)},
+		{RequestID: "model-b-failure", ChannelID: 10, ChannelModelID: 102, UpstreamModel: "model-b", Success: false, CreatedAt: now.Add(-time.Minute)},
+		{RequestID: "other-channel-failure", ChannelID: 20, ChannelModelID: 201, UpstreamModel: "model-c", Success: false, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "expired-failure", ChannelID: 10, ChannelModelID: 101, UpstreamModel: "model-a", Success: false, CreatedAt: now.Add(-31 * time.Minute)},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	metrics, err := loadRecentSuccessMetrics(context.Background(), store.db, []uint64{10, 20, 30}, []uint64{101, 102, 201, 301}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metric := metrics.ByChannelModel[101]; metric.Successes != 2 || metric.Attempts != 3 || math.Abs(metric.rate()-2.0/3.0) > 0.000001 {
+		t.Fatalf("model A metric = %+v, rate %v", metric, metric.rate())
+	}
+	if metric := metrics.ByChannel[10]; metric.Successes != 3 || metric.Attempts != 5 || metric.rate() != 0.6 {
+		t.Fatalf("channel metric = %+v, rate %v", metric, metric.rate())
+	}
+	if metric := metrics.ByChannel[20]; metric.Successes != 0 || metric.Attempts != 1 || metric.rate() != 0 {
+		t.Fatalf("failed channel metric = %+v, rate %v", metric, metric.rate())
+	}
+	if metric := metrics.ByChannel[30]; metric.Attempts != 0 || metric.rate() != 1 {
+		t.Fatalf("empty channel metric = %+v, rate %v", metric, metric.rate())
+	}
+	if metric := metrics.ByChannelModel[301]; metric.Attempts != 0 || metric.rate() != 1 {
+		t.Fatalf("empty model metric = %+v, rate %v", metric, metric.rate())
+	}
+}
+
+func TestListChannelsIncludesRecentModelSuccessMetrics(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	now := time.Now()
+	attempts := []RelayAttemptLog{
+		{RequestID: "recent-model-success", ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, Success: true, CreatedAt: now.Add(-10 * time.Minute)},
+		{RequestID: "recent-model-failure", ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, Success: false, CreatedAt: now.Add(-5 * time.Minute)},
+		{RequestID: "expired-other-model-failure", ChannelID: channels[1].ID, ChannelModelID: mappings[1].ID, UpstreamModel: mappings[1].UpstreamModel, Success: false, CreatedAt: now.Add(-31 * time.Minute)},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := NewManagementService(store).ListChannels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelsByID := make(map[uint64]ChannelModel, len(mappings))
+	metricsByChannelID := make(map[uint64]ChannelMetrics, len(channels))
+	for _, view := range views {
+		metricsByChannelID[view.ID] = view.Metrics
+		for _, mapping := range view.Models {
+			modelsByID[mapping.ID] = mapping
+		}
+	}
+	measured := modelsByID[mappings[0].ID]
+	if measured.RecentSuccessRate != 0.5 || measured.RecentSuccessCount != 1 || measured.RecentAttemptCount != 2 {
+		t.Fatalf("measured mapping = %+v", measured)
+	}
+	empty := modelsByID[mappings[1].ID]
+	if empty.RecentSuccessRate != 1 || empty.RecentSuccessCount != 0 || empty.RecentAttemptCount != 0 {
+		t.Fatalf("empty mapping = %+v", empty)
+	}
+	if metrics := metricsByChannelID[channels[0].ID]; metrics.RecentSuccessRate != 0.5 || metrics.RecentSuccessCount != 1 || metrics.RecentAttemptCount != 2 {
+		t.Fatalf("measured channel = %+v", metrics)
+	}
+	if metrics := metricsByChannelID[channels[1].ID]; metrics.RecentSuccessRate != 1 || metrics.RecentAttemptCount != 0 {
+		t.Fatalf("empty channel = %+v", metrics)
 	}
 }
 
@@ -843,6 +931,87 @@ func TestRouterSmoothWeightedPriorityBalancesAllocations(t *testing.T) {
 	}
 }
 
+func TestRouterRecentSuccessRateInfluencesEveryStrategy(t *testing.T) {
+	base := []RouteCandidate{
+		{
+			Channel:            Channel{ID: 1, LatencyEWMA: 50},
+			Mapping:            ChannelModel{ID: 1, ModelID: 1, Priority: 10, Weight: 1},
+			Cost:               100,
+			RecentSuccessRate:  1,
+			RecentAttemptCount: 10,
+		},
+		{
+			Channel:            Channel{ID: 2, LatencyEWMA: 50},
+			Mapping:            ChannelModel{ID: 2, ModelID: 1, Priority: 10, Weight: 1},
+			Cost:               100,
+			RecentSuccessRate:  0.5,
+			RecentAttemptCount: 10,
+		},
+	}
+
+	priorityRouter := &Router{random: func(int) int { return 0 }}
+	priorityCounts := [2]int{}
+	for range 30 {
+		candidates := append([]RouteCandidate(nil), base...)
+		priorityRouter.orderCandidates(RoutingPriorityWeighted, candidates)
+		priorityCounts[candidates[0].Channel.ID-1]++
+	}
+	if priorityCounts != [2]int{20, 10} {
+		t.Fatalf("priority allocation counts = %v, want [20 10]", priorityCounts)
+	}
+
+	for _, strategy := range []string{RoutingLowestCost, RoutingLowestLatency} {
+		t.Run(strategy, func(t *testing.T) {
+			call := 0
+			router := &Router{random: func(limit int) int {
+				point := call * limit / 300
+				call++
+				return point
+			}}
+			counts := [2]int{}
+			for range 300 {
+				candidates := append([]RouteCandidate(nil), base...)
+				router.orderCandidates(strategy, candidates)
+				counts[candidates[0].Channel.ID-1]++
+			}
+			if counts != [2]int{200, 100} {
+				t.Fatalf("allocation counts = %v, want [200 100]", counts)
+			}
+		})
+	}
+}
+
+func TestRouterPlanLoadsRecentModelSuccessRates(t *testing.T) {
+	store := newTestStore(t)
+	token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	now := time.Now()
+	attempts := []RelayAttemptLog{
+		{RequestID: "recent-success", ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, Success: true, CreatedAt: now.Add(-20 * time.Minute)},
+		{RequestID: "recent-failure", ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, Success: false, CreatedAt: now.Add(-10 * time.Minute)},
+		{RequestID: "expired-failure", ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, Success: false, CreatedAt: now.Add(-31 * time.Minute)},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+	router := NewRouter(store, NewClientAccessService(store))
+	plan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	byMapping := make(map[uint64]RouteCandidate, len(plan.Candidates))
+	for _, candidate := range plan.Candidates {
+		byMapping[candidate.Mapping.ID] = candidate
+	}
+	measured := byMapping[mappings[0].ID]
+	if measured.RecentSuccessRate != 0.5 || measured.RecentSuccessCount != 1 || measured.RecentAttemptCount != 2 {
+		t.Fatalf("measured route candidate = %+v", measured)
+	}
+	empty := byMapping[mappings[1].ID]
+	if empty.RecentSuccessRate != 1 || empty.RecentSuccessCount != 0 || empty.RecentAttemptCount != 0 {
+		t.Fatalf("empty route candidate = %+v", empty)
+	}
+}
+
 func TestRouterSmoothWeightedPriorityBalancesConcurrentAllocations(t *testing.T) {
 	router := &Router{random: func(int) int { return 0 }}
 	base := []RouteCandidate{
@@ -955,9 +1124,9 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
 	now := time.Now()
 	logs := []RelayRequestLog{
-		{ID: "session-request-1", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "codex-session", CodexSessionSource: "prompt_cache_key", RequestParametersJSON: `{"temperature":0.2}`, StatusCode: http.StatusOK, InputTokens: 100, NormalInputTokens: 60, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 10, SentTokens: 100, EstimatedCost: 70, UpstreamCost: 60, AttemptCount: 1, DurationMS: 100, CreatedAt: now.Add(-2 * time.Hour)},
-		{ID: "session-request-2", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "codex-session", CodexSessionSource: "prompt_cache_key", RequestParametersJSON: `{"reasoning":{"effort":"high"}}`, StatusCode: http.StatusBadGateway, InputTokens: 10, NormalInputTokens: 10, SentTokens: 20, EstimatedCost: 0, UpstreamCost: 0, AttemptCount: 2, DurationMS: 300, CreatedAt: now.Add(-time.Hour)},
-		{ID: "unknown-request", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "chat", RequestedModel: model.Name, CodexSessionSource: "unavailable", RequestParametersJSON: `{}`, StatusCode: http.StatusOK, InputTokens: 50, OutputTokens: 10, CachedTokens: 5, EstimatedCost: 20, UpstreamCost: 15, AttemptCount: 0, DurationMS: 80, CreatedAt: now.Add(-30 * time.Minute)},
+		{ID: "session-request-1", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "codex-session", CodexSessionSource: "prompt_cache_key", RequestParametersJSON: `{"temperature":0.2}`, StatusCode: http.StatusOK, InputTokens: 100, NormalInputTokens: 60, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 10, SentTokens: 100, EstimatedCost: 70, UpstreamCost: 60, AttemptCount: 1, FirstTokenMS: 50, LatencyMS: 20, DurationMS: 100, CreatedAt: now.Add(-2 * time.Hour)},
+		{ID: "session-request-2", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "codex-session", CodexSessionSource: "prompt_cache_key", RequestParametersJSON: `{"reasoning":{"effort":"high"}}`, StatusCode: http.StatusBadGateway, InputTokens: 10, NormalInputTokens: 10, SentTokens: 20, EstimatedCost: 0, UpstreamCost: 0, AttemptCount: 2, LatencyMS: 40, DurationMS: 300, CreatedAt: now.Add(-time.Hour)},
+		{ID: "unknown-request", TokenID: token.ID, TokenName: token.Name, TokenKeyPrefix: token.KeyPrefix, Endpoint: "chat", RequestedModel: model.Name, CodexSessionSource: "unavailable", RequestParametersJSON: `{}`, StatusCode: http.StatusOK, InputTokens: 50, OutputTokens: 10, CachedTokens: 5, EstimatedCost: 20, UpstreamCost: 15, AttemptCount: 0, FirstTokenMS: 30, LatencyMS: 10, DurationMS: 80, CreatedAt: now.Add(-30 * time.Minute)},
 		{ID: "expired-request", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "codex-session", StatusCode: http.StatusOK, InputTokens: 1000, CreatedAt: now.Add(-(DetailedLogRetentionDays*24*time.Hour + time.Hour))},
 	}
 	if err := store.db.Create(&logs).Error; err != nil {
@@ -992,7 +1161,7 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if identified == nil || unknown == nil {
 		t.Fatalf("session summaries = %+v", page.Items)
 	}
-	if identified.RequestCount != 2 || identified.SuccessCount != 1 || identified.AttemptCount != 3 || identified.InputTokens != 110 || identified.NormalInputTokens != 70 || identified.OutputTokens != 20 || identified.CachedTokens != 30 || identified.CacheWriteTokens != 10 || identified.SentTokens != 120 || identified.EstimatedCost != 70 || identified.UpstreamCost != 60 {
+	if identified.RequestCount != 2 || identified.SuccessCount != 1 || identified.AttemptCount != 3 || identified.InputTokens != 110 || identified.NormalInputTokens != 70 || identified.OutputTokens != 20 || identified.CachedTokens != 30 || identified.CacheWriteTokens != 10 || identified.SentTokens != 120 || identified.EstimatedCost != 70 || identified.UpstreamCost != 60 || identified.AverageFirstTokenMS != 50 || identified.FirstTokenSampleCount != 1 || identified.AverageLatencyMS != 30 || identified.LatencySampleCount != 2 || identified.AverageDurationMS != 200 || identified.DurationSampleCount != 2 {
 		t.Fatalf("identified summary = %+v", identified)
 	}
 	if identified.CurrentChannel == nil || identified.CurrentChannel.ChannelID != channels[1].ID || identified.CurrentChannel.AssignmentSource != "session_affinity" {
@@ -1013,7 +1182,7 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if detail.RequestTotal != 2 || len(detail.Requests) != 2 || detail.Requests[0].ID != "session-request-1" || len(detail.Requests[1].Attempts) != 2 {
 		t.Fatalf("session detail = %+v", detail)
 	}
-	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Requests[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].SentTokens != 100 {
+	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Summary.AverageFirstTokenMS != 50 || detail.Summary.AverageLatencyMS != 30 || detail.Summary.AverageDurationMS != 200 || detail.Requests[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].SentTokens != 100 {
 		t.Fatalf("session cache-write detail = %+v", detail)
 	}
 	if detail.Requests[0].Attempts[0].SelectionReason != SelectionReasonInitialRoute || detail.Requests[1].Attempts[0].SelectionReason != "" || detail.Requests[1].Attempts[1].SelectionReason != SelectionReasonRetryableStatus || detail.Requests[1].Attempts[1].PreviousChannelID != channels[0].ID {
@@ -1030,6 +1199,32 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	unknownDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{RequestID: "unknown-request", Page: 1, PageSize: 25})
 	if err != nil || unknownDetail.RequestTotal != 1 || unknownDetail.Summary.Identified {
 		t.Fatalf("unknown detail = %+v, %v", unknownDetail, err)
+	}
+}
+
+func TestSessionLogsSortByFirstCallAndUseFirstRequestName(t *testing.T) {
+	store := newTestStore(t)
+	token, model, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	now := time.Now()
+	logs := []RelayRequestLog{
+		{ID: "older-first", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "older-session", SessionName: "最早的问题名称", StatusCode: http.StatusOK, CreatedAt: now.Add(-4 * time.Hour)},
+		{ID: "older-latest", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "older-session", SessionName: "不应覆盖名称", StatusCode: http.StatusOK, CreatedAt: now.Add(-10 * time.Minute)},
+		{ID: "newer-first", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "newer-session", SessionName: "较新的会话名", StatusCode: http.StatusOK, CreatedAt: now.Add(-2 * time.Hour)},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	management := NewManagementService(store)
+	page, err := management.SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 || page.Items[0].SessionID != "newer-session" || page.Items[1].SessionID != "older-session" || page.Items[1].SessionName != "最早的问题名称" {
+		t.Fatalf("sessions = %+v", page.Items)
+	}
+	filtered, err := management.SessionLogs(context.Background(), SessionLogQuery{Session: "最早的问题", Page: 1, PageSize: 25})
+	if err != nil || len(filtered.Items) != 1 || filtered.Items[0].SessionID != "older-session" {
+		t.Fatalf("name-filtered sessions = %+v, %v", filtered, err)
 	}
 }
 
@@ -1252,6 +1447,9 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if requestLog.CodexSessionID != "codex-session-log" || requestLog.CodexSessionSource != "prompt_cache_key" || requestLog.TokenName != token.Name || requestLog.TokenKeyPrefix != token.KeyPrefix {
 		t.Fatalf("request log identity snapshot = %+v", requestLog)
 	}
+	if requestLog.SessionName != "hello" || requestLog.RequestBody != string(payloadBody) || requestLog.RequestBodyTruncated || requestLog.ResponseBodyTruncated || !strings.Contains(requestLog.ResponseBody, `"id":"chatcmpl_1"`) {
+		t.Fatalf("request payload snapshot = %+v", requestLog)
+	}
 	if !strings.Contains(requestLog.RequestParametersJSON, `"temperature":0.4`) || strings.Contains(requestLog.RequestParametersJSON, "hello") || strings.Contains(requestLog.RequestParametersJSON, "unknown_field") {
 		t.Fatalf("request parameter snapshot = %s", requestLog.RequestParametersJSON)
 	}
@@ -1264,6 +1462,18 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	}
 	if attemptLogs[0].SelectionReason != SelectionReasonInitialRoute || attemptLogs[1].SelectionReason != SelectionReasonRetryableStatus || attemptLogs[1].SelectionDetail != "HTTP 500" || attemptLogs[1].PreviousChannelID != attemptLogs[0].ChannelID || attemptLogs[1].PreviousChannelName != attemptLogs[0].ChannelName {
 		t.Fatalf("attempt selection metadata = %+v", attemptLogs)
+	}
+	if !strings.Contains(attemptLogs[0].RequestBody, `"model":"upstream-1"`) || !strings.Contains(attemptLogs[0].ResponseBody, `"code":"temporary"`) || !strings.Contains(attemptLogs[1].RequestBody, `"model":"upstream-2"`) || !strings.Contains(attemptLogs[1].ResponseBody, `"id":"chatcmpl_1"`) {
+		t.Fatalf("attempt payload snapshots = %+v", attemptLogs)
+	}
+	management := NewManagementService(store)
+	page, err := management.Logs(context.Background(), LogQuery{Page: 1, PageSize: 50})
+	if err != nil || len(page.Items) != 1 || page.Items[0].RequestBody != "" || page.Items[0].ResponseBody != "" || page.Items[0].Attempts[0].RequestBody != "" {
+		t.Fatalf("lightweight log page = %+v, %v", page, err)
+	}
+	detail, err := management.LogDetail(context.Background(), requestLog.ID)
+	if err != nil || detail.RequestBody != string(payloadBody) || !strings.Contains(detail.ResponseBody, `"id":"chatcmpl_1"`) || !strings.Contains(detail.Attempts[0].ResponseBody, `"code":"temporary"`) {
+		t.Fatalf("log detail = %+v, %v", detail, err)
 	}
 	var stat TokenDailyStat
 	if err := store.db.First(&stat).Error; err != nil {
@@ -1360,6 +1570,113 @@ func TestRelayStreamUsesLastValidCostSnapshot(t *testing.T) {
 	}
 	if requestLog.InputTokens != 10 || requestLog.OutputTokens != 2 || requestLog.EstimatedCost != 12 || requestLog.UpstreamCost != 250 || requestLog.CostSource != CostSourceUpstream {
 		t.Fatalf("stream request = %+v", requestLog)
+	}
+	var attemptLog RelayAttemptLog
+	if err := store.db.First(&attemptLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(requestLog.ResponseBody, "data: [DONE]") || !strings.Contains(attemptLog.ResponseBody, `"total_cost":"0.000250"`) {
+		t.Fatalf("stream payload snapshots request=%q attempt=%q", requestLog.ResponseBody, attemptLog.ResponseBody)
+	}
+}
+
+func TestSSEEventHasOutputToken(t *testing.T) {
+	tests := []struct {
+		name  string
+		event string
+		want  bool
+	}{
+		{name: "responses metadata", event: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n", want: false},
+		{name: "responses text delta", event: "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n", want: true},
+		{name: "chat role delta", event: "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n", want: false},
+		{name: "chat content delta", event: "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n", want: true},
+		{name: "chat tool delta", event: "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\"}}]}}]}\n\n", want: true},
+		{name: "done", event: "data: [DONE]\n\n", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := sseEventHasOutputToken([]byte(test.event)); got != test.want {
+				t.Fatalf("sseEventHasOutputToken() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRequestSessionNameUsesFirstUserText(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "chat string", body: `{"messages":[{"role":"assistant","content":"ignored"},{"role":"user","content":"  first   question here  "}]}`, want: "first ques"},
+		{name: "chat parts", body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"private"}},{"type":"text","text":"inspect this image"}]}]}`, want: "inspect th"},
+		{name: "responses string", body: `{"input":"生成一份设备运行日报表"}`, want: "生成一份设备运行日报"},
+		{name: "responses messages", body: `{"input":[{"role":"developer","content":"ignored"},{"role":"user","content":[{"type":"input_text","text":"line one"},{"type":"input_text","text":"line two"}]}]}`, want: "line one l"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := requestSessionName([]byte(test.body)); got != test.want {
+				t.Fatalf("requestSessionName() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestStoredPayloadIsBoundedAndValidUTF8(t *testing.T) {
+	payload := append(bytes.Repeat([]byte("a"), maxDetailedPayloadBytes-1), []byte("你b")...)
+	stored, truncated := storedPayload(payload, false)
+	if !truncated || !utf8.ValidString(stored) || len(stored) > maxDetailedPayloadBytes {
+		t.Fatalf("stored payload length=%d truncated=%v valid=%v", len(stored), truncated, utf8.ValidString(stored))
+	}
+}
+
+func TestRelayRecordsDistinctStreamingTimings(t *testing.T) {
+	store := newTestStore(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		writer.WriteHeader(http.StatusOK)
+		flusher := writer.(http.Flusher)
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_timing\"}}\n\n"))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		flusher.Flush()
+		time.Sleep(20 * time.Millisecond)
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicErr := newTestRelay(store).Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+
+	var requestLog RelayRequestLog
+	if err := store.db.First(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	var attemptLog RelayAttemptLog
+	if err := store.db.First(&attemptLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestLog.LatencyMS <= 0 || requestLog.FirstTokenMS <= requestLog.LatencyMS || requestLog.DurationMS <= requestLog.FirstTokenMS {
+		t.Fatalf("request timings = latency %d, first token %d, duration %d", requestLog.LatencyMS, requestLog.FirstTokenMS, requestLog.DurationMS)
+	}
+	if attemptLog.LatencyMS <= 0 || attemptLog.FirstTokenMS <= attemptLog.LatencyMS || attemptLog.DurationMS <= attemptLog.FirstTokenMS {
+		t.Fatalf("attempt timings = latency %d, first token %d, duration %d", attemptLog.LatencyMS, attemptLog.FirstTokenMS, attemptLog.DurationMS)
+	}
+	var stat TokenDailyStat
+	if err := store.db.First(&stat).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stat.FirstTokenSamples != 1 || stat.LatencySamples != 1 || stat.FirstTokenMS != requestLog.FirstTokenMS || stat.LatencyMS != requestLog.LatencyMS || stat.DurationMS != requestLog.DurationMS {
+		t.Fatalf("daily timing stats = %+v", stat)
 	}
 }
 
@@ -1773,6 +2090,134 @@ func TestRelayRetriesBeforeFirstSSEEvent(t *testing.T) {
 	var attempts int64
 	if err := store.db.Model(&RelayAttemptLog{}).Count(&attempts).Error; err != nil || attempts != 2 {
 		t.Fatalf("attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestRelayRetriesHTTP200ApplicationError(t *testing.T) {
+	store := newTestStore(t)
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"error":{"code":"model_at_capacity","message":"Selected model is at capacity. Please try a different model."}}`))
+	}))
+	defer first.Close()
+	second := successfulResponseServer()
+	defer second.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	body := []byte(`{"model":"public-model","input":"capacity retry"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "at capacity") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	attempts := relayAttempts(t, store)
+	if len(attempts) != 2 || attempts[0].Success || attempts[0].StatusCode != http.StatusOK || attempts[1].SelectionReason != SelectionReasonUpstreamApplicationError || !attempts[1].Success {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	var requestLog RelayRequestLog
+	if err := store.db.First(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestLog.StatusCode != http.StatusOK || requestLog.AttemptCount != 2 || !strings.Contains(requestLog.ResponseBody, `"status":"completed"`) {
+		t.Fatalf("request log = %+v", requestLog)
+	}
+}
+
+func TestRelayRetriesPretokenSSEApplicationErrorWithoutLeakingEvents(t *testing.T) {
+	store := newTestStore(t)
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"type\":\"error\",\"error\":{\"code\":\"model_at_capacity\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n"))
+	}))
+	defer first.Close()
+	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"switched\"}\n\n"))
+		_, _ = writer.Write([]byte("data: [DONE]\n\n"))
+	}))
+	defer second.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"capacity retry"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if output := recorder.Body.String(); !strings.Contains(output, "switched") || strings.Contains(output, "resp_failed") || strings.Contains(output, "at capacity") {
+		t.Fatalf("downstream stream = %s", output)
+	}
+	attempts := relayAttempts(t, store)
+	if len(attempts) != 2 || attempts[0].Success || !strings.Contains(attempts[0].ResponseBody, "at capacity") || attempts[1].SelectionReason != SelectionReasonUpstreamApplicationError || !attempts[1].Success {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+}
+
+func TestRelayDoesNotRetryApplicationErrorAfterFirstToken(t *testing.T) {
+	store := newTestStore(t)
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"code\":\"model_at_capacity\",\"message\":\"Selected model is at capacity.\"}}}\n\n"))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL, upstream.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"do not duplicate"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if calls.Load() != 1 || !strings.Contains(recorder.Body.String(), "partial") {
+		t.Fatalf("calls=%d body=%s", calls.Load(), recorder.Body.String())
+	}
+	var requestLog RelayRequestLog
+	if err := store.db.First(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestLog.StatusCode != http.StatusBadGateway || requestLog.ErrorCode != "upstream_application_error" || requestLog.AttemptCount != 1 {
+		t.Fatalf("request log = %+v", requestLog)
+	}
+	attempts := relayAttempts(t, store)
+	if len(attempts) != 1 || attempts[0].Success || attempts[0].FirstTokenMS == 0 {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+}
+
+func TestRelayApplicationErrorAttemptsAreHardCappedAtThree(t *testing.T) {
+	store := newTestStore(t)
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"error":{"message":"Selected model is at capacity. Please try a different model."}}`))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL, upstream.URL, upstream.URL, upstream.URL)
+	body := []byte(`{"model":"public-model","input":"bounded retry"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicErr := newTestRelay(store).Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body)
+	if publicErr == nil || publicErr.Status != http.StatusBadGateway || calls.Load() != 3 {
+		t.Fatalf("error=%+v calls=%d", publicErr, calls.Load())
+	}
+	if attempts := relayAttempts(t, store); len(attempts) != 3 {
+		t.Fatalf("attempts = %+v", attempts)
 	}
 }
 

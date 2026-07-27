@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Right, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import type { CodexSessionDetail, CodexSessionSummary, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 
@@ -22,10 +24,11 @@ const loading = ref(false)
 const errorMessage = ref('')
 const detail = ref<CodexSessionDetail | null>(null)
 const pagination = ref({ page: 1, pageSize: 25 })
-const parameterDialogOpen = ref(false)
+const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
+const payloadLoadingId = ref('')
 
-const drawerTitle = computed(() => summary?.identified ? `会话 ${summary.sessionId}` : `未识别请求 ${summary?.fallbackRequestId ?? ''}`)
+const drawerTitle = computed(() => summary?.sessionName || (summary?.identified ? `会话 ${summary.sessionId}` : `未识别请求 ${summary?.fallbackRequestId ?? ''}`))
 const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requestItem, requestIndex, requests) => ({
   request: requestItem,
   attempts: requestItem.attempts.map((attempt, attemptIndex) => ({
@@ -50,6 +53,10 @@ function formatPercent(value: number): string {
   return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
 }
 
+function formatTiming(value: number): string {
+  return value > 0 ? `${Math.round(value)} ms` : '--'
+}
+
 function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
   if (status >= 200 && status < 300) return 'success'
   if (status === 408 || status === 429) return 'warning'
@@ -58,6 +65,7 @@ function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
 }
 
 function statusLabel(status: number, errorMessage = ''): string {
+  if (status >= 200 && status < 300 && errorMessage) return `业务中断 · HTTP ${status}`
   if (status > 0) return String(status)
   if (errorMessage.startsWith('gateway preparation failed:')) return '准备失败'
   return '网络错误'
@@ -81,6 +89,7 @@ function selectionReasonLabel(attempt: RelayAttemptLog): string {
     case 'retryable_status': return '上次调用返回可重试状态'
     case 'transport_error': return '上次调用发生网络或传输错误'
     case 'response_error': return '读取上游响应失败'
+    case 'upstream_application_error': return '上游返回业务中断，自动切换渠道'
     case 'gateway_preparation_error': return '网关准备上游请求失败'
     case 'circuit_opened': return '连续失败触发渠道熔断'
     case 'response_affinity': return '沿用响应固定渠道'
@@ -174,13 +183,16 @@ function currentChannelState(): { label: string; type: 'success' | 'warning' | '
   return { label: '可用', type: 'success' }
 }
 
-function parameterJSON(value: Record<string, unknown>): string {
-  return JSON.stringify(value, null, 2)
-}
-
-function showParameters(requestItem: RelayRequestLog) {
-  selectedRequest.value = requestItem
-  parameterDialogOpen.value = true
+async function showParameters(requestItem: RelayRequestLog) {
+  payloadLoadingId.value = requestItem.id
+  try {
+    selectedRequest.value = await request<RelayRequestLog>(`/admin/gateway/logs/${encodeURIComponent(requestItem.id)}`)
+    payloadDialogOpen.value = true
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '调用详情加载失败')
+  } finally {
+    payloadLoadingId.value = ''
+  }
 }
 
 async function loadDetail() {
@@ -231,6 +243,9 @@ watch(
       <section class="session-summary-strip" aria-label="会话统计">
         <div><span>请求</span><strong>{{ detail.summary.requestCount }}</strong></div>
         <div><span>成功率</span><strong>{{ formatPercent(detail.summary.successRate) }}</strong></div>
+        <div><span>平均首 Token</span><strong>{{ detail.summary.firstTokenSampleCount ? formatTiming(detail.summary.averageFirstTokenMs) : '--' }}</strong></div>
+        <div><span>平均请求延迟</span><strong>{{ detail.summary.latencySampleCount ? formatTiming(detail.summary.averageLatencyMs) : '--' }}</strong></div>
+        <div><span>平均请求耗时</span><strong>{{ formatTiming(detail.summary.averageDurationMs) }}</strong></div>
         <div><span>普通输入 Token</span><strong>{{ formatTokens(detail.summary.normalInputTokens) }}</strong></div>
         <div><span>输出 Token</span><strong>{{ formatTokens(detail.summary.outputTokens) }}</strong></div>
         <div><span>缓存读 Token</span><strong>{{ formatTokens(detail.summary.cachedTokens) }}</strong></div>
@@ -271,12 +286,17 @@ watch(
                 <div class="request-actions">
                   <el-tag :type="statusType(entry.request.statusCode)" effect="plain">{{ statusLabel(entry.request.statusCode) }}</el-tag>
                   <span>{{ entry.request.attemptCount }} 次尝试</span>
-                  <el-tooltip content="查看接口调用参数" placement="top">
-                    <el-button class="icon-action" text :icon="View" aria-label="查看接口调用参数" @click="showParameters(entry.request)" />
+                  <el-tooltip content="查看完整请求与响应" placement="top">
+                    <el-button class="icon-action" text :icon="View" :loading="payloadLoadingId === entry.request.id" aria-label="查看完整请求与响应" @click="showParameters(entry.request)" />
                   </el-tooltip>
                 </div>
               </header>
               <div class="request-id"><code>{{ entry.request.id }}</code></div>
+              <dl class="request-timings">
+                <div><dt>首 Token</dt><dd>{{ formatTiming(entry.request.firstTokenMs) }}</dd></div>
+                <div><dt>请求延迟</dt><dd>{{ formatTiming(entry.request.latencyMs) }}</dd></div>
+                <div><dt>请求耗时</dt><dd>{{ formatTiming(entry.request.durationMs) }}</dd></div>
+              </dl>
 
               <div v-if="entry.attempts.length === 0" class="route-stage-failure">
                 <strong>请求未进入上游渠道</strong>
@@ -303,9 +323,11 @@ watch(
                     <small><code>{{ attemptEntry.attempt.upstreamModel }}</code></small>
                     <small v-if="attemptEntry.attempt.channelBaseUrl"><code>{{ attemptEntry.attempt.channelBaseUrl }}</code></small>
                   </div>
-                  <el-tag :type="statusType(attemptEntry.attempt.statusCode)" effect="plain">{{ statusLabel(attemptEntry.attempt.statusCode, attemptEntry.attempt.errorMessage) }}</el-tag>
+                  <el-tag :type="attemptEntry.attempt.success ? statusType(attemptEntry.attempt.statusCode) : 'danger'" effect="plain">{{ statusLabel(attemptEntry.attempt.statusCode, attemptEntry.attempt.errorMessage) }}</el-tag>
                   <dl class="attempt-metrics">
-                    <div><dt>延迟</dt><dd>{{ attemptEntry.attempt.latencyMs }} ms</dd></div>
+                    <div><dt>首 Token</dt><dd>{{ formatTiming(attemptEntry.attempt.firstTokenMs) }}</dd></div>
+                    <div><dt>请求延迟</dt><dd>{{ formatTiming(attemptEntry.attempt.latencyMs) }}</dd></div>
+                    <div><dt>请求耗时</dt><dd>{{ formatTiming(attemptEntry.attempt.durationMs) }}</dd></div>
                     <div><dt>普通输入</dt><dd>{{ formatTokens(attemptEntry.attempt.normalInputTokens) }}</dd></div>
                     <div><dt>输出</dt><dd>{{ formatTokens(attemptEntry.attempt.outputTokens) }}</dd></div>
                     <div><dt>缓存读</dt><dd>{{ formatTokens(attemptEntry.attempt.cachedTokens) }}</dd></div>
@@ -327,19 +349,12 @@ watch(
     </div>
   </el-drawer>
 
-  <el-dialog v-model="parameterDialogOpen" title="接口调用参数" width="min(720px, 92vw)" append-to-body>
-    <div v-if="selectedRequest" class="parameter-dialog-content">
-      <div class="parameter-meta"><span><strong>请求 ID</strong><code>{{ selectedRequest.id }}</code></span><span><strong>端点</strong>{{ selectedRequest.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</span><span><strong>模型</strong><code>{{ selectedRequest.requestedModel }}</code></span></div>
-      <pre v-if="Object.keys(selectedRequest.requestParameters).length">{{ parameterJSON(selectedRequest.requestParameters) }}</pre>
-      <div v-else class="mapping-empty">当前请求没有可展示的参数</div>
-    </div>
-    <template #footer><div class="dialog-actions"><el-button @click="parameterDialogOpen = false">关闭</el-button></div></template>
-  </el-dialog>
+  <RequestPayloadDialog v-model="payloadDialogOpen" :request="selectedRequest" />
 </template>
 
 <style scoped>
 .session-detail { display: grid; gap: 22px; }
-.session-summary-strip { display: grid; grid-template-columns: repeat(9, minmax(110px, 1fr)); border-block: 1px solid var(--rose-border); }
+.session-summary-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); border-block: 1px solid var(--rose-border); }
 .session-summary-strip > div { display: grid; gap: 5px; padding: 13px 14px; border-right: 1px solid var(--rose-border); }
 .session-summary-strip > div:last-child { border-right: 0; }
 .session-summary-strip span, .current-channel-grid span { color: var(--rose-text-muted); font-size: 11px; }
@@ -358,6 +373,10 @@ watch(
 .timeline-heading > span { color: var(--rose-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .timeline-empty { padding: 32px 16px; color: var(--rose-text-muted); text-align: center; }
 .request-timeline { display: grid; margin: 0; padding: 0; list-style: none; }
+.request-timings { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
+.request-timings > div { display: flex; align-items: baseline; gap: 6px; }
+.request-timings dt { color: var(--rose-text-muted); font-size: 10px; }
+.request-timings dd { margin: 0; color: var(--rose-text); font-size: 12px; font-weight: 650; }
 .request-event { position: relative; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 18px 0; }
 .request-event:not(:last-child)::before { position: absolute; top: 46px; bottom: -12px; left: 16px; width: 1px; background: var(--rose-border-strong); content: ''; }
 .request-marker { z-index: 1; display: grid; width: 33px; height: 33px; place-items: center; border: 1px solid var(--rose-primary); border-radius: 50%; color: var(--rose-primary-hover); background: var(--rose-surface); font: 600 11px/1 var(--rose-font-mono); }
@@ -389,12 +408,6 @@ watch(
 .attempt-metrics dd { margin: 0; color: var(--rose-text); font-size: 12px; }
 .attempt-source { justify-self: end; }
 .attempt-error { grid-column: 2 / -1; margin: -2px 0 0; color: var(--rose-danger); font-size: 11px; overflow-wrap: anywhere; }
-.parameter-dialog-content { display: grid; gap: 14px; }
-.parameter-meta { display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--rose-text-muted); font-size: 12px; }
-.parameter-meta span { display: flex; align-items: center; gap: 7px; }
-.parameter-meta strong { color: var(--rose-text); }
-.parameter-dialog-content pre { max-height: 56vh; margin: 0; padding: 14px; overflow: auto; border: 1px solid var(--rose-border); border-radius: var(--rose-radius-control); color: var(--rose-text); background: var(--rose-surface-muted); font: 12px/1.6 var(--rose-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-.parameter-dialog-content .mapping-empty { padding: 24px; border: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); text-align: center; }
 @media (max-width: 1040px) { .attempt-event { grid-template-columns: 58px minmax(160px, 1fr) 92px; } .attempt-metrics { grid-column: 1 / -1; grid-row: 2; } .attempt-source { grid-column: 3; } .attempt-error { grid-column: 1 / -1; } }
 @media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
 @media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .attempt-event { grid-template-columns: minmax(0, 1fr) auto; padding: 10px; } .attempt-index { grid-column: 1; } .attempt-channel { grid-column: 1 / -1; } .attempt-event > .el-tag { grid-column: 2; grid-row: 1; } .attempt-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-column: 1 / -1; grid-row: auto; } .attempt-source { grid-column: 1 / -1; justify-self: start; } .attempt-error { grid-column: 1 / -1; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
