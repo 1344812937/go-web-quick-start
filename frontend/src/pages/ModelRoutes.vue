@@ -143,7 +143,7 @@ onMounted(loadData)
   <div class="page-stack">
     <header class="page-heading">
       <div><h1>模型路由</h1><p>管理公开模型名称、候选渠道矩阵和动态调度策略</p></div>
-      <div class="page-actions"><el-button :icon="Refresh" :loading="loading" @click="loadData">刷新</el-button><el-button type="primary" :icon="Plus" @click="openEditor()">新增模型</el-button></div>
+      <div class="page-actions"><el-tooltip content="刷新模型列表" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新模型列表" @click="loadData" /></el-tooltip><el-button type="primary" :icon="Plus" @click="openEditor()">新增模型</el-button></div>
     </header>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>模型路由加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
@@ -172,7 +172,7 @@ onMounted(loadData)
         <el-table-column label="公开模型" min-width="210"><template #default="scope"><div class="primary-cell"><strong><code>{{ scope.row.name }}</code></strong><small>{{ candidateSummary(scope.row.id) }}</small></div></template></el-table-column>
         <el-table-column label="调度策略" min-width="150"><template #default="scope">{{ strategyLabel(scope.row.routingStrategy) }}</template></el-table-column>
         <el-table-column label="状态" width="106"><template #default="scope"><el-tag :type="scope.row.enabled ? 'success' : 'info'" effect="plain">{{ scope.row.enabled ? '已公开' : '已停用' }}</el-tag></template></el-table-column>
-        <el-table-column label="操作" width="164" fixed="right"><template #default="scope"><el-button text :icon="Edit" :disabled="deletingModelId === scope.row.id" @click="openEditor(scope.row)">编辑</el-button><el-button text type="danger" :icon="Delete" :loading="deletingModelId === scope.row.id" @click="deleteModel(scope.row)">删除</el-button></template></el-table-column>
+        <el-table-column label="操作" width="92" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="编辑公开模型" placement="top"><el-button class="table-action-button" text :icon="Edit" :disabled="deletingModelId === scope.row.id" aria-label="编辑公开模型" @click="openEditor(scope.row)" /></el-tooltip><el-tooltip content="删除公开模型" placement="top"><el-button class="table-action-button" text type="danger" :icon="Delete" :loading="deletingModelId === scope.row.id" aria-label="删除公开模型" @click="deleteModel(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <div v-if="!loading && models.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="openEditor()">添加第一个公开模型</el-button></div>
     </section>
@@ -185,7 +185,7 @@ onMounted(loadData)
         </el-form-item>
         <el-checkbox v-model="form.enabled">公开并允许调用</el-checkbox>
       </el-form>
-      <template #footer><el-button @click="dialogOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveModel">保存模型</el-button></template>
+      <template #footer><div class="dialog-actions"><el-button @click="dialogOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveModel">保存模型</el-button></div></template>
     </el-dialog>
   </div>
 </template>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Refresh, Search, View } from '@element-plus/icons-vue'
+import { Refresh, RefreshLeft, Search, View } from '@element-plus/icons-vue'
 import SessionLogDrawer from '@/components/SessionLogDrawer.vue'
 import type { Channel, ClientToken, CodexSessionPage, CodexSessionSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -84,6 +84,12 @@ function searchSessions() {
   void loadSessions()
 }
 
+function resetSessions() {
+  Object.assign(filters, { session: '', model: '', channelId: '', tokenId: '', range: [] })
+  pagination.page = 1
+  void loadSessions()
+}
+
 function openSession(session: CodexSessionSummary) {
   selectedSession.value = session
   drawerOpen.value = true
@@ -107,7 +113,7 @@ onMounted(async () => {
   <div class="page-stack">
     <header class="page-heading">
       <div><h1>会话日志</h1><p>按 Codex 客户端会话汇总最近 5 天的渠道、模型、令牌与用量</p></div>
-      <el-button :icon="Refresh" :loading="loading" @click="loadSessions">刷新</el-button>
+      <div class="page-actions"><el-tooltip content="刷新会话日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新会话日志" @click="loadSessions" /></el-tooltip></div>
     </header>
 
     <section class="filter-bar" aria-label="会话日志筛选">
@@ -116,7 +122,7 @@ onMounted(async () => {
       <el-select v-model="filters.channelId" clearable placeholder="全部渠道"><el-option v-for="channel in channels" :key="channel.id" :label="channel.name" :value="String(channel.id)" /></el-select>
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
-      <el-button class="filter-action" type="primary" :icon="Search" :loading="loading" @click="searchSessions">查询</el-button>
+      <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetSessions">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchSessions">查询</el-button></div>
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
@@ -151,7 +157,7 @@ onMounted(async () => {
         </el-table-column>
         <el-table-column label="费用 / 平均耗时" width="170" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }} · {{ Math.round(scope.row.averageDurationMs) }} ms</small></div></template></el-table-column>
         <el-table-column label="最近调用" width="168"><template #default="scope">{{ formatDate(scope.row.lastSeenAt) }}</template></el-table-column>
-        <el-table-column label="详情" width="70" fixed="right"><template #default="scope"><el-button text :icon="View" title="查看会话详情" @click.stop="openSession(scope.row)" /></template></el-table-column>
+        <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="查看会话详情" placement="top"><el-button class="table-action-button" text :icon="View" aria-label="查看会话详情" @click.stop="openSession(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
     </section>

@@ -261,7 +261,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 
 	var logs []RelayRequestLog
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
-		Order("created_at DESC, id DESC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
+		Order("created_at ASC, id ASC").Offset((query.Page - 1) * query.PageSize).Limit(query.PageSize).
 		Find(&logs).Error; err != nil {
 		return nil, err
 	}
@@ -421,7 +421,7 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 
 func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog) (RelayRequestView, error) {
 	attempts := make([]RelayAttemptLog, 0)
-	if err := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID).Order("id ASC").Find(&attempts).Error; err != nil {
+	if err := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID).Order("created_at ASC, id ASC").Find(&attempts).Error; err != nil {
 		return RelayRequestView{}, err
 	}
 	channelCache := make(map[uint64]Channel)

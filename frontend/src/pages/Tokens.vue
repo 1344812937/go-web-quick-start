@@ -152,7 +152,7 @@ onMounted(loadData)
   <div class="page-stack">
     <header class="page-heading">
       <div><h1>访问令牌</h1><p>签发客户端 sk- Token，并限制模型、RPM 与并发数</p></div>
-      <div class="page-actions"><el-button :icon="Refresh" :loading="loading" @click="loadData">刷新</el-button><el-button type="primary" :icon="Plus" @click="openEditor()">签发令牌</el-button></div>
+      <div class="page-actions"><el-tooltip content="刷新令牌列表" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新令牌列表" @click="loadData" /></el-tooltip><el-button type="primary" :icon="Plus" @click="openEditor()">签发令牌</el-button></div>
     </header>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>访问令牌加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
@@ -165,7 +165,7 @@ onMounted(loadData)
         <el-table-column label="并发" width="88" align="right" prop="maxConcurrency" />
         <el-table-column label="累计统计" min-width="220"><template #default="scope"><div class="primary-cell"><strong>{{ formatInteger(scope.row.statistics.requests) }} 次 · {{ formatUSD(scope.row.statistics.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.statistics.estimatedCostMicros) }} · {{ formatInteger(scope.row.statistics.inputTokens + scope.row.statistics.outputTokens) }} Tokens</small></div></template></el-table-column>
         <el-table-column label="最近使用" width="154"><template #default="scope">{{ formatDate(scope.row.lastUsedAt) }}</template></el-table-column>
-        <el-table-column label="操作" width="252" fixed="right"><template #default="scope"><el-button text :icon="Edit" :disabled="rotatingTokenId === scope.row.id || revokingTokenId === scope.row.id" @click="openEditor(scope.row)">编辑</el-button><el-button text :icon="RefreshRight" :loading="rotatingTokenId === scope.row.id" :disabled="revokingTokenId === scope.row.id" @click="rotateToken(scope.row)">轮换</el-button><el-button v-if="scope.row.enabled" text type="danger" :icon="CircleClose" :loading="revokingTokenId === scope.row.id" :disabled="rotatingTokenId === scope.row.id" @click="revokeToken(scope.row)">吊销</el-button></template></el-table-column>
+        <el-table-column label="操作" width="126" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="编辑令牌策略" placement="top"><el-button class="table-action-button" text :icon="Edit" :disabled="rotatingTokenId === scope.row.id || revokingTokenId === scope.row.id" aria-label="编辑令牌策略" @click="openEditor(scope.row)" /></el-tooltip><el-tooltip content="轮换令牌" placement="top"><el-button class="table-action-button" text :icon="RefreshRight" :loading="rotatingTokenId === scope.row.id" :disabled="revokingTokenId === scope.row.id" aria-label="轮换令牌" @click="rotateToken(scope.row)" /></el-tooltip><el-tooltip v-if="scope.row.enabled" content="吊销令牌" placement="top"><el-button class="table-action-button" text type="danger" :icon="CircleClose" :loading="revokingTokenId === scope.row.id" :disabled="rotatingTokenId === scope.row.id" aria-label="吊销令牌" @click="revokeToken(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <div v-if="!loading && tokens.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="openEditor()">签发第一个令牌</el-button></div>
     </section>
@@ -180,12 +180,12 @@ onMounted(loadData)
         <el-checkbox-group v-if="!form.allowAllModels" v-model="form.modelIds" class="model-checks"><el-checkbox v-for="model in models" :key="model.id" :value="model.id">{{ model.name }}</el-checkbox></el-checkbox-group>
         <el-checkbox v-model="form.enabled">令牌立即生效</el-checkbox>
       </el-form>
-      <template #footer><el-button @click="dialogOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveToken">{{ editingId ? '保存策略' : '签发令牌' }}</el-button></template>
+      <template #footer><div class="dialog-actions"><el-button @click="dialogOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveToken">{{ editingId ? '保存策略' : '签发令牌' }}</el-button></div></template>
     </el-dialog>
 
     <el-dialog v-model="secretDialogOpen" title="令牌已签发" width="min(600px, calc(100vw - 32px))" :close-on-click-modal="false">
       <div class="secret-once"><strong>完整令牌仅显示一次</strong><p>关闭后只能轮换，无法再次查看。</p><code>{{ issuedSecret }}</code><el-button type="primary" :icon="CopyDocument" :loading="copyingSecret" @click="copySecret">复制令牌</el-button></div>
-      <template #footer><el-button type="primary" @click="secretDialogOpen = false">我已保存</el-button></template>
+      <template #footer><div class="dialog-actions"><el-button type="primary" @click="secretDialogOpen = false">我已保存</el-button></div></template>
     </el-dialog>
   </div>
 </template>

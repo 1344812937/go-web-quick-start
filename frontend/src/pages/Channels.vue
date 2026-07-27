@@ -402,7 +402,9 @@ onMounted(loadData)
     <header class="page-heading">
       <div><h1>渠道管理</h1><p>维护上游连接、模型映射与每百万 Token 价格</p></div>
       <div class="page-actions">
-        <el-button :icon="Refresh" :loading="loading" @click="loadData">刷新</el-button>
+        <el-tooltip content="刷新渠道列表" placement="bottom">
+          <el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新渠道列表" @click="loadData" />
+        </el-tooltip>
         <el-button type="primary" :icon="Plus" @click="resetForm()">新增渠道</el-button>
       </div>
     </header>
@@ -440,11 +442,13 @@ onMounted(loadData)
             <span v-else class="muted-text">暂无 usage 数据</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="236" fixed="right">
+        <el-table-column label="操作" width="126" fixed="right" align="right">
           <template #default="scope">
-            <el-button text :icon="Connection" :loading="testingChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id" @click="testChannel(scope.row)">测试</el-button>
-            <el-button text :icon="Edit" @click="resetForm(scope.row)">编辑</el-button>
-            <el-button text type="danger" :icon="Delete" :loading="deletingChannelId === scope.row.id" :disabled="testingChannelId === scope.row.id" @click="deleteChannel(scope.row)">删除</el-button>
+            <div class="table-actions">
+              <el-tooltip content="测试渠道连接" placement="top"><el-button class="table-action-button" text :icon="Connection" :loading="testingChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id" aria-label="测试渠道连接" @click="testChannel(scope.row)" /></el-tooltip>
+              <el-tooltip content="编辑渠道" placement="top"><el-button class="table-action-button" text :icon="Edit" aria-label="编辑渠道" @click="resetForm(scope.row)" /></el-tooltip>
+              <el-tooltip content="删除渠道" placement="top"><el-button class="table-action-button" text type="danger" :icon="Delete" :loading="deletingChannelId === scope.row.id" :disabled="testingChannelId === scope.row.id" aria-label="删除渠道" @click="deleteChannel(scope.row)" /></el-tooltip>
+            </div>
           </template>
         </el-table-column>
       </el-table>
@@ -563,7 +567,7 @@ onMounted(loadData)
           </section>
         </article>
       </el-form>
-      <template #footer><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></template>
+      <template #footer><div class="drawer-actions"><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></div></template>
     </el-drawer>
   </div>
 </template>

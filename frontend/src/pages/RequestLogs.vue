@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Refresh, Search } from '@element-plus/icons-vue'
+import { Refresh, RefreshLeft, Search } from '@element-plus/icons-vue'
 import type { Channel, ClientToken, GatewayModel, LogPage, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 
@@ -97,6 +97,12 @@ function searchLogs() {
   void loadLogs()
 }
 
+function resetLogs() {
+  Object.assign(filters, { model: '', channelId: '', tokenId: '', status: '', range: [] })
+  pagination.page = 1
+  void loadLogs()
+}
+
 onMounted(async () => {
   try {
     await loadOptions()
@@ -111,7 +117,7 @@ onMounted(async () => {
   <div class="page-stack">
     <header class="page-heading">
       <div><h1>调用日志</h1><p>查看最近 5 天的请求状态、重试尝试、usage 来源与双费用口径</p></div>
-      <el-button :icon="Refresh" :loading="loading" @click="loadLogs">刷新</el-button>
+      <div class="page-actions"><el-tooltip content="刷新调用日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新调用日志" @click="loadLogs" /></el-tooltip></div>
     </header>
 
     <section class="filter-bar" aria-label="日志筛选">
@@ -120,7 +126,7 @@ onMounted(async () => {
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
       <el-select v-model="filters.status" clearable placeholder="全部状态"><el-option label="成功 2xx" value="200" /><el-option label="限流 429" value="429" /><el-option label="服务不可用 503" value="503" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
-      <el-button class="filter-action" type="primary" :icon="Search" :loading="loading" @click="searchLogs">查询</el-button>
+      <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetLogs">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchLogs">查询</el-button></div>
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>

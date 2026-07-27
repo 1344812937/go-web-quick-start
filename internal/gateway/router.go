@@ -27,9 +27,17 @@ type RouteCandidate struct {
 type RoutePlan struct {
 	Model                    GatewayModel
 	Candidates               []RouteCandidate
+	InitialSelection         RouteSelection
 	Affinity                 bool
 	SessionAffinity          bool
 	SessionAffinityMappingID uint64
+}
+
+type RouteSelection struct {
+	PreviousChannelID   uint64
+	PreviousChannelName string
+	Reason              string
+	Detail              string
 }
 
 type Router struct {
@@ -74,7 +82,12 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		if err != nil {
 			return nil, err
 		}
-		return &RoutePlan{Model: model, Candidates: []RouteCandidate{*candidate}, Affinity: true}, nil
+		return &RoutePlan{
+			Model:            model,
+			Candidates:       []RouteCandidate{*candidate},
+			InitialSelection: RouteSelection{Reason: SelectionReasonResponseAffinity},
+			Affinity:         true,
+		}, nil
 	}
 
 	candidates, err := r.availableCandidates(ctx, model.ID, inputTokens, outputTokens)
@@ -85,22 +98,62 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		return nil, ErrNoAvailableChannel
 	}
 	r.orderCandidates(model.RoutingStrategy, candidates)
+	initialSelection := RouteSelection{Reason: SelectionReasonInitialRoute}
 	if sessionKey != "" {
 		affinity, affinityErr := r.sessionAffinity(ctx, token.ID, model.ID, sessionKey)
 		if affinityErr != nil {
 			return nil, affinityErr
 		}
 		if affinity != nil {
-			pinCandidate(candidates, affinity.ChannelModelID)
+			if pinCandidate(candidates, affinity.ChannelModelID) {
+				initialSelection = RouteSelection{Reason: SelectionReasonSessionAffinity}
+			} else {
+				initialSelection = r.unavailableSessionSelection(ctx, token.ID, model, sessionKey, affinity.ChannelModelID)
+			}
 			return &RoutePlan{
 				Model:                    model,
 				Candidates:               candidates,
+				InitialSelection:         initialSelection,
 				SessionAffinity:          true,
 				SessionAffinityMappingID: affinity.ChannelModelID,
 			}, nil
 		}
 	}
-	return &RoutePlan{Model: model, Candidates: candidates}, nil
+	return &RoutePlan{Model: model, Candidates: candidates, InitialSelection: initialSelection}, nil
+}
+
+func (r *Router) unavailableSessionSelection(ctx context.Context, tokenID uint64, model GatewayModel, sessionKey string, channelModelID uint64) RouteSelection {
+	selection := RouteSelection{Reason: SelectionReasonAffinityTargetMissing}
+	var mapping ChannelModel
+	if err := r.store.db.WithContext(ctx).First(&mapping, channelModelID).Error; err == nil && mapping.ModelID == model.ID {
+		selection.PreviousChannelID = mapping.ChannelID
+		var channel Channel
+		if err := r.store.db.WithContext(ctx).First(&channel, mapping.ChannelID).Error; err == nil {
+			selection.PreviousChannelName = channel.Name
+			switch {
+			case !channel.Enabled:
+				selection.Reason = SelectionReasonChannelDisabled
+			case !mapping.Enabled:
+				selection.Reason = SelectionReasonMappingDisabled
+			case channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(time.Now()):
+				selection.Reason = SelectionReasonCircuitOpen
+				selection.Detail = channel.CircuitOpenUntil.UTC().Format(time.RFC3339)
+			}
+		}
+	}
+	if selection.PreviousChannelName == "" {
+		var attempt RelayAttemptLog
+		err := r.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
+			Select("a.*").
+			Joins("JOIN relay_request_logs AS request ON request.id = a.request_id").
+			Where("request.token_id = ? AND request.requested_model = ? AND request.codex_session_id = ? AND a.channel_model_id = ?", tokenID, model.Name, sessionKey, channelModelID).
+			Order("a.created_at DESC, a.id DESC").First(&attempt).Error
+		if err == nil {
+			selection.PreviousChannelID = attempt.ChannelID
+			selection.PreviousChannelName = attempt.ChannelName
+		}
+	}
+	return selection
 }
 
 func (r *Router) sessionAffinity(ctx context.Context, tokenID uint64, modelID uint64, sessionKey string) (*SessionAffinity, error) {

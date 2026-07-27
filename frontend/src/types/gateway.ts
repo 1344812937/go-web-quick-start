@@ -281,6 +281,21 @@ export interface DashboardSummary {
   models: DashboardBreakdown[]
 }
 
+export type AttemptSelectionReason =
+  | 'initial_route'
+  | 'response_affinity'
+  | 'session_affinity'
+  | 'channel_disabled'
+  | 'mapping_disabled'
+  | 'circuit_open'
+  | 'affinity_target_missing'
+  | 'retryable_status'
+  | 'transport_error'
+  | 'response_error'
+  | 'gateway_preparation_error'
+  | 'circuit_opened'
+  | ''
+
 export interface RelayAttemptLog {
   /** Persistent attempt identifier. */
   id: number
@@ -296,6 +311,14 @@ export interface RelayAttemptLog {
   channelModelId: number
   /** Model identifier sent upstream. */
   upstreamModel: string
+  /** Channel identifier used immediately before this selection, or zero for an initial route. */
+  previousChannelId: number
+  /** Historical name of the channel used immediately before this selection. */
+  previousChannelName: string
+  /** Stable reason code describing why this channel was selected; blank on legacy rows. */
+  selectionReason: AttemptSelectionReason
+  /** Sanitized, bounded diagnostic detail for the selection reason. */
+  selectionDetail: string
   /** Upstream HTTP status, or zero for a transport error. */
   statusCode: number
   /** Input tokens charged or estimated for this attempt. */

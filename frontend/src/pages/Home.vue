@@ -97,7 +97,11 @@ onMounted(loadDashboard)
         <h1>运行总览</h1>
         <p>累计令牌统计，以及最近 5 天的渠道和模型明细</p>
       </div>
-      <el-button :icon="Refresh" :loading="loading" @click="loadDashboard">刷新</el-button>
+      <div class="page-actions">
+        <el-tooltip content="刷新运行总览" placement="bottom">
+          <el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新运行总览" @click="loadDashboard" />
+        </el-tooltip>
+      </div>
     </header>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert">

@@ -3,15 +3,27 @@ package gateway
 import "time"
 
 const (
-	RoutingPriorityWeighted                 = "priority_weighted"
-	RoutingLowestCost                       = "lowest_cost"
-	RoutingLowestLatency                    = "lowest_latency"
-	CostSourceUpstream                      = "upstream"
-	CostSourceFallback                      = "estimated_fallback"
-	CostSourceMixed                         = "mixed"
-	CostSourceFailedZero                    = "failed_zero"
-	DefaultPriceMultiplierBasisPoints int64 = 10_000
-	MaxPriceMultiplierBasisPoints     int64 = 1_000_000
+	RoutingPriorityWeighted                      = "priority_weighted"
+	RoutingLowestCost                            = "lowest_cost"
+	RoutingLowestLatency                         = "lowest_latency"
+	SelectionReasonInitialRoute                  = "initial_route"
+	SelectionReasonResponseAffinity              = "response_affinity"
+	SelectionReasonSessionAffinity               = "session_affinity"
+	SelectionReasonChannelDisabled               = "channel_disabled"
+	SelectionReasonMappingDisabled               = "mapping_disabled"
+	SelectionReasonCircuitOpen                   = "circuit_open"
+	SelectionReasonAffinityTargetMissing         = "affinity_target_missing"
+	SelectionReasonRetryableStatus               = "retryable_status"
+	SelectionReasonTransportError                = "transport_error"
+	SelectionReasonResponseError                 = "response_error"
+	SelectionReasonGatewayPreparationError       = "gateway_preparation_error"
+	SelectionReasonCircuitOpened                 = "circuit_opened"
+	CostSourceUpstream                           = "upstream"
+	CostSourceFallback                           = "estimated_fallback"
+	CostSourceMixed                              = "mixed"
+	CostSourceFailedZero                         = "failed_zero"
+	DefaultPriceMultiplierBasisPoints      int64 = 10_000
+	MaxPriceMultiplierBasisPoints          int64 = 1_000_000
 )
 
 type AdminUser struct {
@@ -123,13 +135,21 @@ type RelayRequestLog struct {
 }
 
 type RelayAttemptLog struct {
-	ID                uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
-	RequestID         string    `gorm:"size:36;index;not null" json:"requestId"`
-	ChannelID         uint64    `gorm:"index;not null" json:"channelId"`
-	ChannelName       string    `gorm:"size:120" json:"channelName"`
-	ChannelBaseURL    string    `gorm:"size:1024" json:"channelBaseUrl"`
-	ChannelModelID    uint64    `gorm:"not null" json:"channelModelId"`
-	UpstreamModel     string    `gorm:"size:200;not null" json:"upstreamModel"`
+	ID             uint64 `gorm:"primaryKey;autoIncrement" json:"id"`
+	RequestID      string `gorm:"size:36;index;not null" json:"requestId"`
+	ChannelID      uint64 `gorm:"index;not null" json:"channelId"`
+	ChannelName    string `gorm:"size:120" json:"channelName"`
+	ChannelBaseURL string `gorm:"size:1024" json:"channelBaseUrl"`
+	ChannelModelID uint64 `gorm:"not null" json:"channelModelId"`
+	UpstreamModel  string `gorm:"size:200;not null" json:"upstreamModel"`
+	// PreviousChannelID identifies the channel used immediately before this selection, or zero for an initial route.
+	PreviousChannelID uint64 `gorm:"not null;default:0" json:"previousChannelId"`
+	// PreviousChannelName preserves the prior channel name even if that channel is later removed.
+	PreviousChannelName string `gorm:"size:120" json:"previousChannelName"`
+	// SelectionReason is the stable reason code explaining why this attempt's channel was selected.
+	SelectionReason string `gorm:"size:48" json:"selectionReason"`
+	// SelectionDetail contains a sanitized, bounded diagnostic detail for SelectionReason.
+	SelectionDetail   string    `gorm:"size:512" json:"selectionDetail"`
 	StatusCode        int       `gorm:"not null" json:"statusCode"`
 	InputTokens       int64     `gorm:"not null;default:0" json:"inputTokens"`
 	NormalInputTokens int64     `gorm:"not null;default:0" json:"normalInputTokens"`

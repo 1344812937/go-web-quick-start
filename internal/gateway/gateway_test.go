@@ -29,8 +29,18 @@ type disconnectedStreamWriter struct {
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
+type errorReadCloser struct{}
+
 func (fn roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return fn(request)
+}
+
+func (errorReadCloser) Read([]byte) (int, error) {
+	return 0, errors.New("response body unavailable")
+}
+
+func (errorReadCloser) Close() error {
+	return nil
 }
 
 func (w *disconnectedStreamWriter) Header() http.Header {
@@ -856,9 +866,9 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 		t.Fatal(err)
 	}
 	attempts := []RelayAttemptLog{
-		{RequestID: logs[0].ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name, ChannelBaseURL: channels[0].BaseURL, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusOK, InputTokens: 100, NormalInputTokens: 60, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 10, SentTokens: 100, Success: true, CreatedAt: logs[0].CreatedAt},
+		{RequestID: logs[0].ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name, ChannelBaseURL: channels[0].BaseURL, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, SelectionReason: SelectionReasonInitialRoute, StatusCode: http.StatusOK, InputTokens: 100, NormalInputTokens: 60, OutputTokens: 20, CachedTokens: 30, CacheWriteTokens: 10, SentTokens: 100, Success: true, CreatedAt: logs[0].CreatedAt},
 		{RequestID: logs[1].ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name, ChannelBaseURL: channels[0].BaseURL, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusInternalServerError, SentTokens: 10, Success: false, CreatedAt: logs[1].CreatedAt},
-		{RequestID: logs[1].ID, ChannelID: channels[1].ID, ChannelName: channels[1].Name, ChannelBaseURL: channels[1].BaseURL, ChannelModelID: mappings[1].ID, UpstreamModel: mappings[1].UpstreamModel, StatusCode: http.StatusBadGateway, SentTokens: 10, Success: false, CreatedAt: logs[1].CreatedAt.Add(time.Second)},
+		{RequestID: logs[1].ID, ChannelID: channels[1].ID, ChannelName: channels[1].Name, ChannelBaseURL: channels[1].BaseURL, ChannelModelID: mappings[1].ID, UpstreamModel: mappings[1].UpstreamModel, PreviousChannelID: channels[0].ID, PreviousChannelName: channels[0].Name, SelectionReason: SelectionReasonRetryableStatus, SelectionDetail: "HTTP 500", StatusCode: http.StatusBadGateway, SentTokens: 10, Success: false, CreatedAt: logs[1].CreatedAt.Add(time.Second)},
 	}
 	if err := store.db.Create(&attempts).Error; err != nil {
 		t.Fatal(err)
@@ -902,13 +912,20 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if detail.RequestTotal != 2 || len(detail.Requests) != 2 || detail.Requests[0].ID != "session-request-2" || len(detail.Requests[0].Attempts) != 2 {
+	if detail.RequestTotal != 2 || len(detail.Requests) != 2 || detail.Requests[0].ID != "session-request-1" || len(detail.Requests[1].Attempts) != 2 {
 		t.Fatalf("session detail = %+v", detail)
 	}
-	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Requests[1].CacheWriteTokens != 10 || detail.Requests[1].Attempts[0].CacheWriteTokens != 10 || detail.Requests[1].Attempts[0].SentTokens != 100 {
+	if detail.Summary.NormalInputTokens != 70 || detail.Summary.CacheWriteTokens != 10 || detail.Summary.SentTokens != 120 || detail.Summary.UpstreamCost != 60 || detail.Requests[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].CacheWriteTokens != 10 || detail.Requests[0].Attempts[0].SentTokens != 100 {
 		t.Fatalf("session cache-write detail = %+v", detail)
 	}
-	reasoning, ok := detail.Requests[0].RequestParameters["reasoning"].(map[string]any)
+	if detail.Requests[0].Attempts[0].SelectionReason != SelectionReasonInitialRoute || detail.Requests[1].Attempts[0].SelectionReason != "" || detail.Requests[1].Attempts[1].SelectionReason != SelectionReasonRetryableStatus || detail.Requests[1].Attempts[1].PreviousChannelID != channels[0].ID {
+		t.Fatalf("session selection metadata = %+v", detail.Requests)
+	}
+	secondPage, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{SessionID: "codex-session", TokenID: token.ID, Page: 2, PageSize: 1})
+	if err != nil || len(secondPage.Requests) != 1 || secondPage.Requests[0].ID != "session-request-2" || secondPage.RequestTotal != 2 {
+		t.Fatalf("session detail second page = %+v, %v", secondPage, err)
+	}
+	reasoning, ok := detail.Requests[1].RequestParameters["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "high" {
 		t.Fatalf("detail parameters = %#v", detail.Requests[0].RequestParameters)
 	}
@@ -930,6 +947,9 @@ func TestResponsesAffinityPinsOriginalMapping(t *testing.T) {
 	}
 	if !plan.Affinity || len(plan.Candidates) != 1 || plan.Candidates[0].Mapping.ID != mappings[1].ID {
 		t.Fatalf("affinity plan = %+v", plan)
+	}
+	if plan.InitialSelection.Reason != SelectionReasonResponseAffinity {
+		t.Fatalf("response affinity selection = %+v", plan.InitialSelection)
 	}
 	openUntil := time.Now().Add(time.Minute)
 	if err := store.db.Model(&channels[1]).Update("circuit_open_until", openUntil).Error; err != nil {
@@ -953,6 +973,9 @@ func TestCodexSessionAffinityPinsMappingAndAllowsCircuitFailover(t *testing.T) {
 	if !plan.SessionAffinity || plan.Affinity || len(plan.Candidates) != 2 || plan.Candidates[0].Mapping.ID != mappings[1].ID {
 		t.Fatalf("session affinity plan = %+v", plan)
 	}
+	if plan.InitialSelection.Reason != SelectionReasonSessionAffinity {
+		t.Fatalf("session affinity selection = %+v", plan.InitialSelection)
+	}
 
 	otherPlan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "codex-session-b")
 	if err != nil {
@@ -972,6 +995,82 @@ func TestCodexSessionAffinityPinsMappingAndAllowsCircuitFailover(t *testing.T) {
 	}
 	if !failoverPlan.SessionAffinity || len(failoverPlan.Candidates) != 1 || failoverPlan.Candidates[0].Mapping.ID != mappings[0].ID {
 		t.Fatalf("circuit failover plan = %+v", failoverPlan)
+	}
+	if failoverPlan.InitialSelection.Reason != SelectionReasonCircuitOpen || failoverPlan.InitialSelection.PreviousChannelID != channels[1].ID || failoverPlan.InitialSelection.PreviousChannelName != channels[1].Name || failoverPlan.InitialSelection.Detail == "" {
+		t.Fatalf("circuit failover selection = %+v", failoverPlan.InitialSelection)
+	}
+}
+
+func TestCodexSessionAffinityClassifiesUnavailableTarget(t *testing.T) {
+	tests := []struct {
+		name       string
+		mutate     func(*testing.T, *Store, Channel, ChannelModel)
+		wantReason string
+	}{
+		{
+			name: "channel disabled",
+			mutate: func(t *testing.T, store *Store, channel Channel, _ ChannelModel) {
+				t.Helper()
+				if err := store.db.Model(&channel).Update("enabled", false).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: SelectionReasonChannelDisabled,
+		},
+		{
+			name: "mapping disabled",
+			mutate: func(t *testing.T, store *Store, _ Channel, mapping ChannelModel) {
+				t.Helper()
+				if err := store.db.Model(&mapping).Update("enabled", false).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: SelectionReasonMappingDisabled,
+		},
+		{
+			name: "target deleted",
+			mutate: func(t *testing.T, store *Store, _ Channel, mapping ChannelModel) {
+				t.Helper()
+				if err := store.db.Delete(&mapping).Error; err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantReason: SelectionReasonAffinityTargetMissing,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			store := newTestStore(t)
+			token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+			router := NewRouter(store, NewClientAccessService(store))
+			router.RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session", mappings[0].ID)
+			if err := store.db.Create(&RelayRequestLog{
+				ID: "historical-request", TokenID: token.ID, RequestedModel: model.Name,
+				CodexSessionID: "codex-session", CreatedAt: time.Now().Add(-time.Minute),
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+			if err := store.db.Create(&RelayAttemptLog{
+				RequestID: "historical-request", ChannelID: channels[0].ID, ChannelName: channels[0].Name,
+				ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, CreatedAt: time.Now().Add(-time.Minute),
+			}).Error; err != nil {
+				t.Fatal(err)
+			}
+
+			test.mutate(t, store, channels[0], mappings[0])
+			plan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "codex-session")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(plan.Candidates) != 1 || plan.Candidates[0].Channel.ID != channels[1].ID {
+				t.Fatalf("failover candidates = %+v", plan.Candidates)
+			}
+			selection := plan.InitialSelection
+			if selection.Reason != test.wantReason || selection.PreviousChannelID != channels[0].ID || selection.PreviousChannelName != channels[0].Name {
+				t.Fatalf("selection = %+v, want reason %q and previous channel %d", selection, test.wantReason, channels[0].ID)
+			}
+		})
 	}
 }
 
@@ -1064,6 +1163,9 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	}
 	if len(attemptLogs) != 2 || attemptLogs[0].ChannelName == "" || attemptLogs[0].ChannelBaseURL == "" || attemptLogs[1].ChannelName == "" || attemptLogs[1].NormalInputTokens != 7 || attemptLogs[1].CacheWriteTokens != 1 || attemptLogs[0].SentTokens <= 0 || attemptLogs[1].SentTokens <= 0 || attemptLogs[0].EstimatedCost != 0 || attemptLogs[0].UpstreamCost != 0 || attemptLogs[0].CostSource != CostSourceFailedZero || attemptLogs[1].UpstreamCost != 42 || requestLog.SentTokens != attemptLogs[0].SentTokens+attemptLogs[1].SentTokens {
 		t.Fatalf("attempt channel snapshots = %+v", attemptLogs)
+	}
+	if attemptLogs[0].SelectionReason != SelectionReasonInitialRoute || attemptLogs[1].SelectionReason != SelectionReasonRetryableStatus || attemptLogs[1].SelectionDetail != "HTTP 500" || attemptLogs[1].PreviousChannelID != attemptLogs[0].ChannelID || attemptLogs[1].PreviousChannelName != attemptLogs[0].ChannelName {
+		t.Fatalf("attempt selection metadata = %+v", attemptLogs)
 	}
 	var stat TokenDailyStat
 	if err := store.db.First(&stat).Error; err != nil {
@@ -1206,13 +1308,151 @@ func TestRelayDoesNotCountSentTokensBeforeNetworkAttempt(t *testing.T) {
 	if requestLog.SentTokens != 0 {
 		t.Fatalf("sent tokens = %d, want 0 before an upstream network call", requestLog.SentTokens)
 	}
-	var attempts int64
-	if err := store.db.Model(&RelayAttemptLog{}).Count(&attempts).Error; err != nil {
+	var attempts []RelayAttemptLog
+	if err := store.db.Order("id ASC").Find(&attempts).Error; err != nil {
 		t.Fatal(err)
 	}
-	if attempts != 0 {
-		t.Fatalf("attempt logs = %d, want 0 before an upstream network call", attempts)
+	if len(attempts) != 1 || attempts[0].SentTokens != 0 || attempts[0].SelectionReason != SelectionReasonInitialRoute || attempts[0].ErrorMessage != "gateway preparation failed: credential_decrypt" {
+		t.Fatalf("preparation attempt logs = %+v", attempts)
 	}
+}
+
+func TestRelayRecordsRetrySelectionReasons(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusServiceUnavailable} {
+		t.Run(fmt.Sprintf("status %d", status), func(t *testing.T) {
+			store := newTestStore(t)
+			first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				writer.WriteHeader(status)
+				_, _ = writer.Write([]byte(`{"error":{"code":"retry"}}`))
+			}))
+			defer first.Close()
+			second := successfulResponseServer()
+			defer second.Close()
+			token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+
+			relayTestRequest(t, newTestRelay(store), token)
+			attempts := relayAttempts(t, store)
+			if len(attempts) != 2 || attempts[1].SelectionReason != SelectionReasonRetryableStatus || attempts[1].SelectionDetail != fmt.Sprintf("HTTP %d", status) || attempts[1].PreviousChannelID != attempts[0].ChannelID || attempts[1].PreviousChannelName != attempts[0].ChannelName {
+				t.Fatalf("attempts = %+v", attempts)
+			}
+		})
+	}
+
+	t.Run("transport error", func(t *testing.T) {
+		store := newTestStore(t)
+		second := successfulResponseServer()
+		defer second.Close()
+		token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://network.invalid", second.URL)
+		relay := newTestRelay(store)
+		transportCalls := 0
+		relay.client.Transport = roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			transportCalls++
+			if transportCalls == 1 {
+				return nil, errors.New("network unavailable")
+			}
+			return http.DefaultTransport.RoundTrip(request)
+		})
+
+		relayTestRequest(t, relay, token)
+		attempts := relayAttempts(t, store)
+		if len(attempts) != 2 || attempts[1].SelectionReason != SelectionReasonTransportError || attempts[1].SelectionDetail != "upstream_request" || attempts[1].PreviousChannelID != attempts[0].ChannelID {
+			t.Fatalf("attempts = %+v", attempts)
+		}
+	})
+
+	t.Run("response read error", func(t *testing.T) {
+		store := newTestStore(t)
+		second := successfulResponseServer()
+		defer second.Close()
+		token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://response.invalid", second.URL)
+		relay := newTestRelay(store)
+		transportCalls := 0
+		relay.client.Transport = roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+			transportCalls++
+			if transportCalls == 1 {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       errorReadCloser{},
+					Request:    request,
+				}, nil
+			}
+			return http.DefaultTransport.RoundTrip(request)
+		})
+
+		relayTestRequest(t, relay, token)
+		attempts := relayAttempts(t, store)
+		if len(attempts) != 2 || attempts[1].SelectionReason != SelectionReasonResponseError || attempts[1].SelectionDetail != "response_body_read" || attempts[1].PreviousChannelID != attempts[0].ChannelID {
+			t.Fatalf("attempts = %+v", attempts)
+		}
+	})
+
+	t.Run("gateway preparation error", func(t *testing.T) {
+		store := newTestStore(t)
+		second := successfulResponseServer()
+		defer second.Close()
+		token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://never-called.invalid", second.URL)
+		if err := store.db.Model(&Channel{}).Where("id = ?", channels[0].ID).Update("api_key_cipher", "invalid-ciphertext").Error; err != nil {
+			t.Fatal(err)
+		}
+
+		relayTestRequest(t, newTestRelay(store), token)
+		attempts := relayAttempts(t, store)
+		if len(attempts) != 2 || attempts[0].SentTokens != 0 || attempts[1].SelectionReason != SelectionReasonGatewayPreparationError || attempts[1].SelectionDetail != "credential_decrypt" || attempts[1].PreviousChannelID != attempts[0].ChannelID {
+			t.Fatalf("attempts = %+v", attempts)
+		}
+	})
+
+	t.Run("new circuit", func(t *testing.T) {
+		store := newTestStore(t)
+		first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+			writer.Header().Set("Content-Type", "application/json")
+			writer.WriteHeader(http.StatusInternalServerError)
+			_, _ = writer.Write([]byte(`{"error":{"code":"retry"}}`))
+		}))
+		defer first.Close()
+		second := successfulResponseServer()
+		defer second.Close()
+		token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+		if err := store.db.Model(&Channel{}).Where("id = ?", channels[0].ID).Update("consecutive_failures", 2).Error; err != nil {
+			t.Fatal(err)
+		}
+
+		relayTestRequest(t, newTestRelay(store), token)
+		attempts := relayAttempts(t, store)
+		if len(attempts) != 2 || attempts[1].SelectionReason != SelectionReasonCircuitOpened || attempts[1].SelectionDetail == "" || attempts[1].PreviousChannelID != attempts[0].ChannelID {
+			t.Fatalf("attempts = %+v", attempts)
+		}
+	})
+}
+
+func successfulResponseServer() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"resp_retry","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`))
+	}))
+}
+
+func relayTestRequest(t *testing.T, relay *RelayService, token *ClientToken) {
+	t.Helper()
+	body := []byte(`{"model":"public-model","input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicErr := relay.Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+}
+
+func relayAttempts(t *testing.T, store *Store) []RelayAttemptLog {
+	t.Helper()
+	var attempts []RelayAttemptLog
+	if err := store.db.Order("id ASC").Find(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+	return attempts
 }
 
 func TestRelayMovesCodexSessionAffinityAfterRetryableFailure(t *testing.T) {
