@@ -357,6 +357,48 @@ export type AttemptSelectionReason =
   | 'circuit_opened'
   | ''
 
+export interface RouteDecisionCandidate {
+  /** Candidate channel identifier at decision time. */
+  channelId: number
+  /** Candidate channel name captured at decision time. */
+  channelName: string
+  /** Candidate channel-model mapping identifier. */
+  channelModelId: number
+  /** Upstream model name for this candidate. */
+  upstreamModel: string
+  /** Administrator-configured routing priority. */
+  priority: number
+  /** Administrator-configured base routing weight. */
+  weight: number
+  /** Cache-adjusted estimated request cost in micro-USD. */
+  expectedCostMicros: number
+  /** Recent successful attempts divided by recent completed attempts. */
+  successRate: number
+  /** Recent mean response-header latency in milliseconds. */
+  latencyMs: number
+  /** Recent cached input tokens divided by input tokens. */
+  cacheHitRate: number
+  /** Attempts routed to this mapping in the rolling thirty-minute window. */
+  recentRouteCount: number
+  /** Consecutive latest attempts routed to this mapping. */
+  consecutiveRoutes: number
+  /** Composite expectation score before normalization. */
+  expectation: number
+  /** Normalized probability used for random selection. */
+  probability: number
+  /** Whether the random draw selected this candidate. */
+  selected: boolean
+}
+
+export interface RouteDecision {
+  /** Model routing strategy active for this decision. */
+  strategy: RoutingStrategy
+  /** Probability draw or deterministic affinity mode. */
+  mode: 'probability' | 'session_affinity' | 'response_affinity'
+  /** Eligible candidates and the exact inputs used by the decision. */
+  candidates: RouteDecisionCandidate[]
+}
+
 export interface RelayAttemptLog {
   /** Persistent attempt identifier. */
   id: number
@@ -382,6 +424,8 @@ export interface RelayAttemptLog {
   selectionReason: AttemptSelectionReason
   /** Sanitized, bounded diagnostic detail for the selection reason. */
   selectionDetail: string
+  /** Explainable snapshot of the initial route decision; absent on legacy and retry attempts. */
+  routeDecision?: RouteDecision
   /** Transformed request body or a gateway delta envelope relative to the public request. */
   requestBody: string
   /** Whether requestBody was truncated at the four MiB retention limit. */
@@ -578,6 +622,27 @@ export interface SessionChannel {
   circuitOpenUntil: string | null
   /** Last assignment or attempt timestamp in RFC 3339 format. */
   lastUsedAt: string
+  /** Ordered channel handoff records reconstructed from retained attempts. */
+  migrationHistory: SessionChannelMigration[]
+}
+
+export interface SessionChannelMigration {
+  /** Channel that handled the preceding attempt. */
+  fromChannelId: number
+  /** Historical name of the preceding channel. */
+  fromChannelName: string
+  /** Channel that became the next handoff target. */
+  toChannelId: number
+  /** Historical name of the handoff target. */
+  toChannelName: string
+  /** Stable routing reason code. */
+  reason: string
+  /** Bounded routing diagnostic detail. */
+  detail: string
+  /** Request containing the handoff. */
+  requestId: string
+  /** Time when the handoff attempt was recorded. */
+  occurredAt: string
 }
 
 export interface CodexSessionSummary {

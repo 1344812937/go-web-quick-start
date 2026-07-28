@@ -306,14 +306,25 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 		return result, attemptErr
 	}
 
-	if appErr, failed := upstreamApplicationError(responseBody); failed && response.StatusCode >= 200 && response.StatusCode < 300 && readErr == nil {
+	if appErr := validateBufferedApplicationResponse(execution.endpoint, responseBody); appErr != nil && response.StatusCode >= 200 && response.StatusCode < 300 && readErr == nil {
 		result := &attemptResult{
 			response: response, body: responseBody, requestBody: body, usage: usage, sentTokens: sentTokens,
 			costSource: CostSourceFailedZero, latencyMS: latency, durationMS: elapsedMilliseconds(started, responseFinishedAt),
 			retryReason: SelectionReasonUpstreamApplicationError, retryDetail: truncateRunes(appErr.Message, 512),
 		}
-		result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, appErr.Error())
+		if appErr.penalizesChannel() {
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, appErr.Error())
+		} else {
+			s.recordChannelResponsive(logCtx, candidate.Channel.ID)
+		}
 		s.recordAttempt(logCtx, execution, candidate, selection, *result, response.StatusCode, false, appErr)
+		if !appErr.shouldRetry() {
+			s.addUsage(execution, usage, 0, 0, CostSourceFailedZero, false)
+			execution.responseBody = responseBody
+			s.recordRequest(logCtx, execution, upstreamApplicationErrorStatus, applicationFailureCode(appErr))
+			writeBufferedResponse(writer, response, responseBody)
+			return nil, nil
+		}
 		return result, appErr
 	}
 	if !hasUsage && response.StatusCode >= 200 && response.StatusCode < 300 {
@@ -391,13 +402,13 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			consumeSSEEvent(event, s.estimator, &usage, &upstreamCost, &outputEstimate, &responseID)
 			hasOutput := sseEventHasOutputToken(event)
 			appErr, hasApplicationError := sseApplicationError(event)
-			if sseEventIsTerminalSuccess(event) {
+			if sseEventIsTerminalSuccess(event, execution.endpoint) {
 				terminalSuccess = true
 			}
 
 			if !committed {
 				_, _ = pending.Write(event)
-				if hasApplicationError && !hasOutput {
+				if hasApplicationError && !hasOutput && appErr.shouldRetry() {
 					finishedAt := time.Now()
 					_ = response.Body.Close()
 					execution.durationMS = elapsedMilliseconds(execution.startedAt, finishedAt)
@@ -411,6 +422,13 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 					result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, appErr.Error())
 					s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, appErr)
 					return &result, appErr
+				}
+				if hasApplicationError && !hasOutput {
+					if writeErr := commit(); writeErr != nil {
+						streamErr = writeErr
+						downstreamError = true
+						break
+					}
 				}
 				if hasOutput {
 					recordFirstToken(event, &result, execution, started)
@@ -520,12 +538,13 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 		usage = Usage{InputTokens: execution.inputTokens, OutputTokens: outputEstimate, Source: "estimated_tiktoken"}
 	}
 	logCtx := context.WithoutCancel(ctx)
-	if terminalSuccess {
+	var appErr *upstreamApplicationFailure
+	applicationFailed := errors.As(streamErr, &appErr)
+	if terminalSuccess && !downstreamError && !applicationFailed {
 		streamErr = nil
-		downstreamError = false
 	}
-	clientCanceled := !terminalSuccess && (downstreamError || ctx.Err() != nil || errors.Is(streamErr, context.Canceled))
-	success := terminalSuccess || (streamErr == nil && !clientCanceled)
+	clientCanceled := downstreamError || (!terminalSuccess && (ctx.Err() != nil || errors.Is(streamErr, context.Canceled)))
+	success := terminalSuccess && streamErr == nil && !clientCanceled
 	if clientCanceled {
 		result.outcome = RelayOutcomeCanceled
 	} else if success {
@@ -552,6 +571,8 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 	result.streamError = streamErr
 	if streamErr == nil || clientCanceled {
 		s.recordChannelSuccess(logCtx, candidate.Channel.ID, result.latencyMS)
+	} else if errors.As(streamErr, &appErr) && !appErr.penalizesChannel() {
+		s.recordChannelResponsive(logCtx, candidate.Channel.ID)
 	} else {
 		s.recordChannelFailure(logCtx, candidate.Channel.ID, streamErr.Error())
 	}
@@ -565,9 +586,8 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 	} else if streamErr != nil {
 		requestStatus = upstreamApplicationErrorStatus
 		errorCode = "stream_interrupted"
-		var appErr *upstreamApplicationFailure
 		if errors.As(streamErr, &appErr) {
-			errorCode = "upstream_application_error"
+			errorCode = applicationFailureCode(appErr)
 		}
 	}
 	execution.responseBody = result.body
@@ -695,8 +715,10 @@ func isEventStream(header http.Header) bool {
 }
 
 type upstreamApplicationFailure struct {
-	Message string
-	Code    string
+	Message         string
+	Code            string
+	nonRetryable    bool
+	preserveChannel bool
 }
 
 func (e *upstreamApplicationFailure) Error() string {
@@ -706,13 +728,58 @@ func (e *upstreamApplicationFailure) Error() string {
 	return fmt.Sprintf("upstream application error (%s): %s", e.Code, e.Message)
 }
 
+func (e *upstreamApplicationFailure) shouldRetry() bool {
+	return e != nil && !e.nonRetryable
+}
+
+func (e *upstreamApplicationFailure) penalizesChannel() bool {
+	return e != nil && !e.preserveChannel
+}
+
+func applicationFailureCode(failure *upstreamApplicationFailure) string {
+	if failure != nil && strings.TrimSpace(failure.Code) != "" {
+		return truncateRunes(strings.TrimSpace(failure.Code), 80)
+	}
+	return "upstream_application_error"
+}
+
+func newApplicationFailure(message string, code string) *upstreamApplicationFailure {
+	failure := &upstreamApplicationFailure{Message: truncateRunes(strings.TrimSpace(message), 2000), Code: truncateRunes(strings.TrimSpace(code), 80)}
+	switch strings.ToLower(failure.Code) {
+	case "bad_request", "content_filter", "content_policy_violation", "context_length_exceeded", "invalid_request", "invalid_request_error", "max_output_tokens", "response_cancelled", "unsupported_value":
+		failure.nonRetryable = true
+		failure.preserveChannel = true
+	}
+	return failure
+}
+
+func incompleteApplicationFailure(reason string) *upstreamApplicationFailure {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		failure := newApplicationFailure("upstream response incomplete", "response_incomplete")
+		failure.nonRetryable = true
+		failure.preserveChannel = true
+		return failure
+	}
+	failure := newApplicationFailure("upstream response incomplete: "+reason, reason)
+	switch strings.ToLower(reason) {
+	case "connection_error", "server_error", "timeout", "upstream_interrupted":
+		failure.nonRetryable = false
+		failure.preserveChannel = false
+	default:
+		failure.nonRetryable = true
+		failure.preserveChannel = true
+	}
+	return failure
+}
+
 func upstreamApplicationError(data []byte) (*upstreamApplicationFailure, bool) {
 	var payload map[string]any
 	if err := json.Unmarshal(data, &payload); err != nil {
 		message := strings.TrimSpace(string(data))
 		lower := strings.ToLower(message)
 		if strings.Contains(lower, "model is at capacity") || strings.Contains(lower, "try a different model") {
-			return &upstreamApplicationFailure{Message: truncateRunes(message, 2000), Code: "model_at_capacity"}, true
+			return newApplicationFailure(message, "model_at_capacity"), true
 		}
 		return nil, false
 	}
@@ -722,30 +789,69 @@ func upstreamApplicationError(data []byte) (*upstreamApplicationFailure, bool) {
 		if failure := applicationFailureDetails(value); failure != nil {
 			return failure, true
 		}
-		return &upstreamApplicationFailure{Message: "upstream application error", Code: "upstream_error"}, true
+		return newApplicationFailure("upstream application error", "upstream_error"), true
 	}
-	response, _ := payload["response"].(map[string]any)
+	response := payload
+	if nested, ok := payload["response"].(map[string]any); ok {
+		response = nested
+	}
 	responseStatus, _ := response["status"].(string)
 	if typeName == "response.failed" || strings.EqualFold(responseStatus, "failed") {
 		if failure := applicationFailureDetails(response["error"]); failure != nil {
 			return failure, true
 		}
-		return &upstreamApplicationFailure{Message: "upstream response failed", Code: "response_failed"}, true
+		return newApplicationFailure("upstream response failed", "response_failed"), true
+	}
+	if typeName == "response.incomplete" || strings.EqualFold(responseStatus, "incomplete") {
+		reason := ""
+		if details, ok := response["incomplete_details"].(map[string]any); ok {
+			reason, _ = details["reason"].(string)
+			reason = strings.TrimSpace(reason)
+		}
+		return incompleteApplicationFailure(reason), true
+	}
+	if typeName == "response.cancelled" || strings.EqualFold(responseStatus, "cancelled") || strings.EqualFold(responseStatus, "canceled") {
+		return newApplicationFailure("upstream response cancelled", "response_cancelled"), true
 	}
 	if typeName == "error" {
 		if failure := applicationFailureDetails(payload); failure != nil {
 			return failure, true
 		}
-		return &upstreamApplicationFailure{Message: "upstream application error", Code: "upstream_error"}, true
+		return newApplicationFailure("upstream application error", "upstream_error"), true
 	}
 	return nil, false
+}
+
+func validateBufferedApplicationResponse(endpoint string, data []byte) *upstreamApplicationFailure {
+	if failure, failed := upstreamApplicationError(data); failed {
+		return failure
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil || payload == nil {
+		return newApplicationFailure("upstream returned an invalid JSON response", "invalid_upstream_response")
+	}
+	switch endpoint {
+	case "responses":
+		status, _ := payload["status"].(string)
+		switch strings.ToLower(strings.TrimSpace(status)) {
+		case "completed", "in_progress", "queued":
+			return nil
+		default:
+			return newApplicationFailure("upstream response is missing a valid status", "invalid_upstream_response")
+		}
+	case "chat":
+		if _, ok := payload["choices"].([]any); !ok {
+			return newApplicationFailure("upstream chat response is missing choices", "invalid_upstream_response")
+		}
+	}
+	return nil
 }
 
 func applicationFailureDetails(value any) *upstreamApplicationFailure {
 	switch typed := value.(type) {
 	case string:
 		if message := strings.TrimSpace(typed); message != "" {
-			return &upstreamApplicationFailure{Message: truncateRunes(message, 2000)}
+			return newApplicationFailure(message, "")
 		}
 	case map[string]any:
 		message, _ := typed["message"].(string)
@@ -761,7 +867,7 @@ func applicationFailureDetails(value any) *upstreamApplicationFailure {
 			message = code
 		}
 		if message != "" {
-			return &upstreamApplicationFailure{Message: truncateRunes(message, 2000), Code: truncateRunes(code, 80)}
+			return newApplicationFailure(message, code)
 		}
 	}
 	return nil
@@ -784,7 +890,7 @@ func sseApplicationError(event []byte) (*upstreamApplicationFailure, bool) {
 	return nil, false
 }
 
-func sseEventIsTerminalSuccess(event []byte) bool {
+func sseEventIsTerminalSuccess(event []byte, endpoint string) bool {
 	for _, line := range bytes.Split(event, []byte("\n")) {
 		line = bytes.TrimSpace(line)
 		if !bytes.HasPrefix(line, []byte("data:")) {
@@ -792,11 +898,25 @@ func sseEventIsTerminalSuccess(event []byte) bool {
 		}
 		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
 		if bytes.Equal(data, []byte("[DONE]")) {
-			return true
+			return endpoint != "responses"
 		}
 		var payload map[string]any
-		if json.Unmarshal(data, &payload) == nil && payload["type"] == "response.completed" {
-			return true
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		if endpoint == "responses" {
+			if payload["type"] == "response.completed" {
+				return true
+			}
+			continue
+		}
+		if choices, ok := payload["choices"].([]any); ok {
+			for _, item := range choices {
+				choice, _ := item.(map[string]any)
+				if choice["finish_reason"] != nil {
+					return true
+				}
+			}
 		}
 	}
 	return false
@@ -834,7 +954,7 @@ func storedPayload(data []byte, alreadyTruncated bool) (string, bool) {
 		data = data[:len(data)-1]
 		truncated = true
 	}
-	return string(data), truncated
+	return compressStoredPayload(data), truncated
 }
 
 func publicErrorBody(publicErr *PublicError) []byte {
@@ -1174,6 +1294,12 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 	compactedRequestBody := compactAttemptPayload(result.requestBody, execution.rawBody, execution.requestID)
 	requestBody, requestBodyTruncated := storedPayload(compactedRequestBody, len(result.requestBody) > maxDetailedPayloadBytes)
 	responseBody, responseBodyTruncated := storedPayload(result.body, result.bodyTruncated)
+	routeDecisionJSON := ""
+	if selection.Decision != nil {
+		if encoded, err := json.Marshal(selection.Decision); err == nil {
+			routeDecisionJSON = string(encoded)
+		}
+	}
 	log := RelayAttemptLog{
 		RequestID:             execution.requestID,
 		ChannelID:             candidate.Channel.ID,
@@ -1185,6 +1311,7 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		PreviousChannelName:   truncateRunes(selection.PreviousChannelName, 120),
 		SelectionReason:       truncateRunes(selection.Reason, 48),
 		SelectionDetail:       truncateRunes(selection.Detail, 512),
+		RouteDecisionJSON:     routeDecisionJSON,
 		RequestBody:           requestBody,
 		RequestBodyTruncated:  requestBodyTruncated,
 		ResponseBody:          responseBody,

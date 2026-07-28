@@ -3,6 +3,7 @@ import { computed, ref, watch } from 'vue'
 import { EditPen, Right, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
+import RouteDecisionPanel from '@/components/RouteDecisionPanel.vue'
 import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
 import type { CodexSessionDetail, CodexSessionSummary, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -203,6 +204,21 @@ function assignmentLabel(value: string): string {
   return '最近尝试渠道'
 }
 
+function migrationReasonLabel(value: string): string {
+  const labels: Record<string, string> = {
+    retryable_status: '上次调用返回可重试状态',
+    transport_error: '上次调用发生传输错误',
+    response_error: '读取上游响应失败',
+    upstream_application_error: '上游业务中断',
+    circuit_opened: '原渠道触发熔断',
+    affinity_target_missing: '原会话渠道不可用',
+    channel_disabled: '原渠道已停用',
+    mapping_disabled: '原模型映射已停用',
+    circuit_open: '原渠道熔断中',
+  }
+  return labels[value] ?? (value || '路由重新选择')
+}
+
 function currentChannelState(): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
   const channel = detail.value?.summary.currentChannel
   if (!channel) return { label: '未分配', type: 'info' }
@@ -304,6 +320,16 @@ watch(
           <div class="channel-url"><span>Base URL</span><code>{{ detail.summary.currentChannel.channelBaseUrl }}</code></div>
         </div>
         <div v-else class="muted-text">该会话尚未进入上游渠道</div>
+        <div v-if="detail.summary.currentChannel?.migrationHistory?.length" class="channel-migration-history">
+          <div class="migration-heading"><strong>渠道迁移历史</strong><span>迁移后由接班渠道继续处理，直到接班渠道不可用</span></div>
+          <ol>
+            <li v-for="migration in detail.summary.currentChannel.migrationHistory" :key="`${migration.requestId}-${migration.occurredAt}-${migration.toChannelId}`">
+              <time :datetime="migration.occurredAt">{{ formatDate(migration.occurredAt) }}</time>
+              <div class="migration-route"><strong>{{ migration.fromChannelName || `渠道 #${migration.fromChannelId}` }}</strong><el-icon><Right /></el-icon><strong>{{ migration.toChannelName || `渠道 #${migration.toChannelId}` }}</strong></div>
+              <div class="migration-reason"><span>{{ migrationReasonLabel(migration.reason) }}</span><small v-if="migration.detail">{{ migration.detail }}</small></div>
+            </li>
+          </ol>
+        </div>
       </section>
 
       <section class="timeline-section" aria-label="会话调用时间线">
@@ -348,6 +374,7 @@ watch(
               </div>
 
               <div v-for="(attemptEntry, attemptIndex) in entry.attempts" :key="attemptEntry.attempt.id" class="attempt-sequence">
+                <RouteDecisionPanel v-if="attemptEntry.attempt.routeDecision" :decision="attemptEntry.attempt.routeDecision" />
                 <div v-if="attemptEntry.channelSwitch" class="channel-switch-event">
                   <div class="switch-route">
                     <strong>{{ attemptEntry.channelSwitch.from }}</strong>
@@ -397,6 +424,18 @@ watch(
 .current-channel-grid > div { display: grid; gap: 4px; min-width: 0; }
 .channel-url { grid-column: 1 / -1; }
 .current-channel-grid code, .request-timeline code { overflow-wrap: anywhere; }
+.channel-migration-history { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--rose-border); }
+.migration-heading { display: flex; align-items: baseline; gap: 10px; margin-bottom: 10px; }
+.migration-heading strong { color: var(--rose-text); font-size: 12px; }
+.migration-heading span { color: var(--rose-text-muted); font-size: 10px; }
+.channel-migration-history ol { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
+.channel-migration-history li { display: grid; grid-template-columns: 125px minmax(220px, auto) minmax(0, 1fr); align-items: center; gap: 12px; padding: 8px 10px; border-left: 3px solid var(--rose-warning); background: var(--rose-warning-soft); }
+.channel-migration-history time { color: var(--rose-text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.migration-route, .migration-reason { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.migration-route strong { overflow: hidden; color: var(--rose-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.migration-route .el-icon { flex: 0 0 auto; color: var(--rose-warning); }
+.migration-reason { flex-wrap: wrap; color: var(--rose-warning); font-size: 11px; }
+.migration-reason small { color: var(--rose-text-muted); }
 .timeline-section { min-width: 0; }
 .timeline-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
 .timeline-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }

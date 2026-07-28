@@ -185,6 +185,7 @@ type DashboardBreakdown struct {
 
 type LogQuery struct {
 	Model      string
+	Outcome    string
 	StatusCode int
 	TokenID    uint64
 	ChannelID  uint64
@@ -1050,8 +1051,6 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		return nil, errors.New("统计时间范围仅支持 1、2、3 或 5 天")
 	}
 	now := time.Now()
-	startDate := now.AddDate(0, 0, -(days - 1)).Format(time.DateOnly)
-	endDate := now.Format(time.DateOnly)
 	startTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(days - 1))
 	endTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
 	summary := &DashboardSummary{Daily: []DashboardDaily{}, Channels: []DashboardBreakdown{}, Models: []DashboardBreakdown{}}
@@ -1070,13 +1069,13 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		DurationMS            int64
 	}
 	var total totals
-	err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).Select(
-		"COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, COALESCE(SUM(canceled_count),0) AS canceled_count, "+
-			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, "+
-			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
-			"COALESCE(SUM(first_token_ms),0) AS first_token_ms, COALESCE(SUM(first_token_samples),0) AS first_token_sample_count, "+
-			"COALESCE(SUM(latency_ms),0) AS latency_ms, COALESCE(SUM(latency_samples),0) AS latency_sample_count, COALESCE(SUM(duration_ms),0) AS duration_ms",
-	).Where("date >= ? AND date <= ?", startDate, endDate).Scan(&total).Error
+	err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ? AND created_at < ?", startTime, endTime).Select(
+		"COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, " +
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, " +
+			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, " +
+			"COALESCE(SUM(first_token_ms),0) AS first_token_ms, COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END),0) AS first_token_sample_count, " +
+			"COALESCE(SUM(latency_ms),0) AS latency_ms, COALESCE(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0) AS latency_sample_count, COALESCE(SUM(duration_ms),0) AS duration_ms",
+	).Scan(&total).Error
 	if err != nil {
 		return nil, err
 	}
@@ -1101,17 +1100,16 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	if total.Requests > 0 {
 		summary.AverageDurationMS = float64(total.DurationMS) / float64(total.Requests)
 	}
-	if err := s.store.db.WithContext(ctx).Model(&TokenDailyStat{}).
-		Select("date, COALESCE(SUM(request_count),0) AS requests, COALESCE(SUM(success_count),0) AS successes, COALESCE(SUM(canceled_count),0) AS canceled_count, "+
+	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
+		Select("date(created_at) AS date, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
 			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, "+
 			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
-			"COALESCE(1.0 * SUM(first_token_ms) / NULLIF(SUM(first_token_samples),0),0) AS average_first_token_ms, "+
-			"COALESCE(SUM(first_token_samples),0) AS first_token_sample_count, "+
-			"COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(latency_samples),0),0) AS average_latency_ms, "+
-			"COALESCE(SUM(latency_samples),0) AS latency_sample_count, "+
-			"COALESCE(1.0 * SUM(duration_ms) / NULLIF(SUM(request_count),0),0) AS average_duration_ms, "+
-			"COALESCE(SUM(request_count),0) AS duration_sample_count").
-		Where("date >= ? AND date <= ?", startDate, endDate).Group("date").Order("date asc").Scan(&summary.Daily).Error; err != nil {
+			"COALESCE(1.0 * SUM(first_token_ms) / NULLIF(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END),0),0) AS average_first_token_ms, "+
+			"COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END),0) AS first_token_sample_count, "+
+			"COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0),0) AS average_latency_ms, "+
+			"COALESCE(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0) AS latency_sample_count, "+
+			"COALESCE(1.0 * SUM(duration_ms) / NULLIF(COUNT(*),0),0) AS average_duration_ms, COUNT(*) AS duration_sample_count").
+		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("date(created_at)").Order("date asc").Scan(&summary.Daily).Error; err != nil {
 		return nil, err
 	}
 	dailyByDate := make(map[string]DashboardDaily, len(summary.Daily))
@@ -1130,12 +1128,12 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	if err := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
 		Select("c.name AS name, COUNT(*) AS requests, COALESCE(SUM(a.estimated_cost),0) AS estimated_cost, COALESCE(SUM(a.upstream_cost),0) AS upstream_cost").
 		Joins("JOIN channels AS c ON c.id = a.channel_id").Where("a.created_at >= ? AND a.created_at < ?", startTime, endTime).
-		Group("c.name").Order("upstream_cost desc").Limit(8).Scan(&summary.Channels).Error; err != nil {
+		Group("c.name").Order("upstream_cost desc").Scan(&summary.Channels).Error; err != nil {
 		return nil, err
 	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
 		Select("requested_model AS name, COUNT(*) AS requests, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
-		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("requested_model").Order("upstream_cost desc").Limit(8).Scan(&summary.Models).Error; err != nil {
+		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("requested_model").Order("upstream_cost desc").Scan(&summary.Models).Error; err != nil {
 		return nil, err
 	}
 	return summary, nil
@@ -1182,6 +1180,10 @@ func applyLogFilters(db *gorm.DB, query LogQuery, detailCutoff time.Time) *gorm.
 	}
 	if query.StatusCode > 0 {
 		db = db.Where("status_code = ?", query.StatusCode)
+	}
+	switch strings.TrimSpace(query.Outcome) {
+	case RelayOutcomeSuccess, RelayOutcomeCanceled, RelayOutcomeFailed:
+		db = db.Where("outcome = ?", strings.TrimSpace(query.Outcome))
 	}
 	if query.TokenID > 0 {
 		db = db.Where("token_id = ?", query.TokenID)

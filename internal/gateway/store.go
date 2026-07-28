@@ -79,7 +79,118 @@ func (s *Store) migrate() error {
 	if err := s.backfillRelayOutcomes(); err != nil {
 		return err
 	}
-	return s.backfillCostFields()
+	if err := s.backfillCostFields(); err != nil {
+		return err
+	}
+	if err := s.backfillApplicationOutcomes(); err != nil {
+		return err
+	}
+	if err := s.compressDetailedPayloads(); err != nil {
+		return err
+	}
+	return s.reclaimSQLiteSpaceOnce()
+}
+
+func (s *Store) reclaimSQLiteSpaceOnce() error {
+	if s.db.Dialector.Name() != "sqlite" {
+		return nil
+	}
+	const migrationName = "sqlite_space_reclaim_v1"
+	var migration GatewayMigration
+	err := s.db.First(&migration, "name = ?", migrationName).Error
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return err
+	}
+	if err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
+		return err
+	}
+	if err := s.db.Exec("VACUUM").Error; err != nil {
+		return err
+	}
+	if err := s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error; err != nil {
+		return err
+	}
+	return s.db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+}
+
+func (s *Store) checkpointSQLiteWAL() {
+	if s.db.Dialector.Name() == "sqlite" {
+		_ = s.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)").Error
+	}
+}
+
+func (s *Store) compressDetailedPayloads() error {
+	const migrationName = "compressed_detailed_payloads_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		type requestPayloadRow struct {
+			ID           string
+			RequestBody  string
+			ResponseBody string
+		}
+		var requestRows []requestPayloadRow
+		if err := db.Model(&RelayRequestLog{}).
+			Select("id, request_body, response_body").
+			Where("length(request_body) >= ? OR length(response_body) >= ?", payloadCompressionThreshold, payloadCompressionThreshold).
+			FindInBatches(&requestRows, 100, func(batch *gorm.DB, _ int) error {
+				for _, row := range requestRows {
+					updates := make(map[string]any, 2)
+					if compressed := compressStoredPayload([]byte(row.RequestBody)); compressed != row.RequestBody {
+						updates["request_body"] = compressed
+					}
+					if compressed := compressStoredPayload([]byte(row.ResponseBody)); compressed != row.ResponseBody {
+						updates["response_body"] = compressed
+					}
+					if len(updates) > 0 {
+						if err := batch.Model(&RelayRequestLog{}).Where("id = ?", row.ID).Updates(updates).Error; err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}).Error; err != nil {
+			return err
+		}
+		type attemptPayloadRow struct {
+			ID           uint64
+			RequestBody  string
+			ResponseBody string
+		}
+		var attemptRows []attemptPayloadRow
+		if err := db.Model(&RelayAttemptLog{}).
+			Select("id, request_body, response_body").
+			Where("length(request_body) >= ? OR length(response_body) >= ?", payloadCompressionThreshold, payloadCompressionThreshold).
+			FindInBatches(&attemptRows, 100, func(batch *gorm.DB, _ int) error {
+				for _, row := range attemptRows {
+					updates := make(map[string]any, 2)
+					if compressed := compressStoredPayload([]byte(row.RequestBody)); compressed != row.RequestBody {
+						updates["request_body"] = compressed
+					}
+					if compressed := compressStoredPayload([]byte(row.ResponseBody)); compressed != row.ResponseBody {
+						updates["response_body"] = compressed
+					}
+					if len(updates) > 0 {
+						if err := batch.Model(&RelayAttemptLog{}).Where("id = ?", row.ID).Updates(updates).Error; err != nil {
+							return err
+						}
+					}
+				}
+				return nil
+			}).Error; err != nil {
+			return err
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+	})
 }
 
 func (s *Store) backfillRelayOutcomes() error {
@@ -308,6 +419,7 @@ func (s *Store) cleanupExpired() {
 	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayAttemptLog{}).Error
 	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayRequestLog{}).Error
 	_ = s.db.Where("updated_at < ?", cutoff).Delete(&RelaySessionState{}).Error
+	s.checkpointSQLiteWAL()
 }
 
 func (s *Store) runCleanup() {

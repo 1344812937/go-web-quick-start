@@ -42,16 +42,28 @@ type SessionTitleInput struct {
 }
 
 type SessionChannelView struct {
-	ChannelID        uint64     `json:"channelId"`
-	ChannelName      string     `json:"channelName"`
-	ChannelBaseURL   string     `json:"channelBaseUrl"`
-	ChannelModelID   uint64     `json:"channelModelId"`
-	UpstreamModel    string     `json:"upstreamModel"`
-	AssignmentSource string     `json:"assignmentSource"`
-	Enabled          bool       `json:"enabled"`
-	MappingEnabled   bool       `json:"mappingEnabled"`
-	CircuitOpenUntil *time.Time `json:"circuitOpenUntil"`
-	LastUsedAt       time.Time  `json:"lastUsedAt"`
+	ChannelID        uint64                    `json:"channelId"`
+	ChannelName      string                    `json:"channelName"`
+	ChannelBaseURL   string                    `json:"channelBaseUrl"`
+	ChannelModelID   uint64                    `json:"channelModelId"`
+	UpstreamModel    string                    `json:"upstreamModel"`
+	AssignmentSource string                    `json:"assignmentSource"`
+	Enabled          bool                      `json:"enabled"`
+	MappingEnabled   bool                      `json:"mappingEnabled"`
+	CircuitOpenUntil *time.Time                `json:"circuitOpenUntil"`
+	LastUsedAt       time.Time                 `json:"lastUsedAt"`
+	MigrationHistory []SessionChannelMigration `json:"migrationHistory"`
+}
+
+type SessionChannelMigration struct {
+	FromChannelID   uint64    `json:"fromChannelId"`
+	FromChannelName string    `json:"fromChannelName"`
+	ToChannelID     uint64    `json:"toChannelId"`
+	ToChannelName   string    `json:"toChannelName"`
+	Reason          string    `json:"reason"`
+	Detail          string    `json:"detail"`
+	RequestID       string    `json:"requestId"`
+	OccurredAt      time.Time `json:"occurredAt"`
 }
 
 type SessionLogSummary struct {
@@ -480,6 +492,10 @@ func (s *ManagementService) RenameSession(ctx context.Context, input SessionTitl
 }
 
 func (s *ManagementService) currentSessionChannel(ctx context.Context, summary SessionLogSummary, modelName string, cutoff time.Time) (*SessionChannelView, error) {
+	history, err := s.sessionChannelHistory(ctx, summary, cutoff)
+	if err != nil {
+		return nil, err
+	}
 	if summary.Identified {
 		var model GatewayModel
 		modelErr := s.store.db.WithContext(ctx).Where("name = ?", modelName).First(&model).Error
@@ -504,6 +520,7 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 							MappingEnabled:   mapping.Enabled,
 							CircuitOpenUntil: channel.CircuitOpenUntil,
 							LastUsedAt:       affinity.UpdatedAt,
+							MigrationHistory: history,
 						}, nil
 					} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 						return nil, err
@@ -542,6 +559,7 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 		UpstreamModel:    attempt.UpstreamModel,
 		AssignmentSource: "latest_attempt",
 		LastUsedAt:       attempt.CreatedAt,
+		MigrationHistory: history,
 	}
 	if attempt.Success {
 		current.AssignmentSource = "latest_successful_attempt"
@@ -568,7 +586,51 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 	return current, nil
 }
 
+func (s *ManagementService) sessionChannelHistory(ctx context.Context, summary SessionLogSummary, cutoff time.Time) ([]SessionChannelMigration, error) {
+	attemptDB := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
+		Select("a.*, r.id AS request_log_id, r.created_at AS request_created_at").
+		Joins("JOIN relay_request_logs AS r ON r.id = a.request_id").
+		Where("r.created_at >= ?", cutoff)
+	if summary.Identified {
+		attemptDB = attemptDB.Where("r.token_id = ? AND r.codex_session_id = ?", summary.TokenID, summary.SessionID)
+	} else {
+		attemptDB = attemptDB.Where("r.id = ? AND r.codex_session_id = ''", summary.FallbackRequestID)
+	}
+	type historyAttempt struct {
+		RelayAttemptLog
+		RequestLogID     string    `gorm:"column:request_log_id"`
+		RequestCreatedAt time.Time `gorm:"column:request_created_at"`
+	}
+	var attempts []historyAttempt
+	if err := attemptDB.Order("r.created_at ASC, a.created_at ASC, a.id ASC").Scan(&attempts).Error; err != nil {
+		return nil, err
+	}
+	history := make([]SessionChannelMigration, 0)
+	var previous RelayAttemptLog
+	for _, item := range attempts {
+		current := item.RelayAttemptLog
+		if previous.ChannelID != 0 && current.ChannelID != 0 && previous.ChannelID != current.ChannelID {
+			fromName := current.PreviousChannelName
+			if fromName == "" {
+				fromName = previous.ChannelName
+			}
+			history = append(history, SessionChannelMigration{
+				FromChannelID: previous.ChannelID, FromChannelName: fromName,
+				ToChannelID: current.ChannelID, ToChannelName: current.ChannelName,
+				Reason: current.SelectionReason, Detail: current.SelectionDetail,
+				RequestID: current.RequestID, OccurredAt: current.CreatedAt,
+			})
+		}
+		previous = current
+	}
+	return history, nil
+}
+
 func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog, includePayloads bool) (RelayRequestView, error) {
+	if includePayloads {
+		log.RequestBody = decompressStoredPayload(log.RequestBody)
+		log.ResponseBody = decompressStoredPayload(log.ResponseBody)
+	}
 	attempts := make([]RelayAttemptLog, 0)
 	attemptDB := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID)
 	if !includePayloads {
@@ -579,6 +641,16 @@ func (s *ManagementService) relayRequestView(ctx context.Context, log RelayReque
 	}
 	channelCache := make(map[uint64]Channel)
 	for index := range attempts {
+		if includePayloads {
+			attempts[index].RequestBody = decompressStoredPayload(attempts[index].RequestBody)
+			attempts[index].ResponseBody = decompressStoredPayload(attempts[index].ResponseBody)
+		}
+		if attempts[index].RouteDecisionJSON != "" {
+			var decision RouteDecision
+			if json.Unmarshal([]byte(attempts[index].RouteDecisionJSON), &decision) == nil {
+				attempts[index].RouteDecision = &decision
+			}
+		}
 		if attempts[index].ChannelName != "" && attempts[index].ChannelBaseURL != "" {
 			continue
 		}

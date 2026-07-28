@@ -27,6 +27,35 @@ type RouteCandidate struct {
 	RecentSuccessRate  float64
 	RecentSuccessCount int64
 	RecentAttemptCount int64
+	RecentLatencyMS    float64
+	RecentCacheRate    float64
+	RecentRouteCount   int64
+	ConsecutiveRoutes  int64
+	MetricsLoaded      bool
+}
+
+type RouteDecisionCandidate struct {
+	ChannelID          uint64  `json:"channelId"`
+	ChannelName        string  `json:"channelName"`
+	ChannelModelID     uint64  `json:"channelModelId"`
+	UpstreamModel      string  `json:"upstreamModel"`
+	Priority           int     `json:"priority"`
+	Weight             int     `json:"weight"`
+	ExpectedCostMicros int64   `json:"expectedCostMicros"`
+	SuccessRate        float64 `json:"successRate"`
+	LatencyMS          float64 `json:"latencyMs"`
+	CacheHitRate       float64 `json:"cacheHitRate"`
+	RecentRouteCount   int64   `json:"recentRouteCount"`
+	ConsecutiveRoutes  int64   `json:"consecutiveRoutes"`
+	Expectation        float64 `json:"expectation"`
+	Probability        float64 `json:"probability"`
+	Selected           bool    `json:"selected"`
+}
+
+type RouteDecision struct {
+	Strategy   string                   `json:"strategy"`
+	Mode       string                   `json:"mode"`
+	Candidates []RouteDecisionCandidate `json:"candidates"`
 }
 
 type RoutePlan struct {
@@ -43,6 +72,7 @@ type RouteSelection struct {
 	PreviousChannelName string
 	Reason              string
 	Detail              string
+	Decision            *RouteDecision
 }
 
 type weightedPriorityKey struct {
@@ -107,7 +137,7 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		return &RoutePlan{
 			Model:            model,
 			Candidates:       []RouteCandidate{*candidate},
-			InitialSelection: RouteSelection{Reason: SelectionReasonResponseAffinity},
+			InitialSelection: RouteSelection{Reason: SelectionReasonResponseAffinity, Decision: deterministicRouteDecision(model.RoutingStrategy, "response_affinity", []RouteCandidate{*candidate})},
 			Affinity:         true,
 		}, nil
 	}
@@ -128,10 +158,11 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		if affinity != nil {
 			r.orderCandidatesWithoutWeightedAdvance(model.RoutingStrategy, candidates)
 			if pinCandidate(candidates, affinity.ChannelModelID) {
-				initialSelection = RouteSelection{Reason: SelectionReasonSessionAffinity}
+				initialSelection = RouteSelection{Reason: SelectionReasonSessionAffinity, Decision: deterministicRouteDecision(model.RoutingStrategy, "session_affinity", candidates)}
 			} else {
-				r.orderCandidates(model.RoutingStrategy, candidates)
+				decision := r.orderCandidates(model.RoutingStrategy, candidates)
 				initialSelection = r.unavailableSessionSelection(ctx, token.ID, model, sessionKey, affinity.ChannelModelID)
+				initialSelection.Decision = decision
 			}
 			return &RoutePlan{
 				Model:                    model,
@@ -142,7 +173,8 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 			}, nil
 		}
 	}
-	r.orderCandidates(model.RoutingStrategy, candidates)
+	decision := r.orderCandidates(model.RoutingStrategy, candidates)
+	initialSelection.Decision = decision
 	return &RoutePlan{Model: model, Candidates: candidates, InitialSelection: initialSelection}, nil
 }
 
@@ -241,6 +273,10 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 	if err != nil {
 		return nil, err
 	}
+	recentRouting, err := loadRecentRoutingMetrics(ctx, r.store.db, channelModelIDs, now)
+	if err != nil {
+		return nil, err
+	}
 	candidates := make([]RouteCandidate, 0, len(mappings))
 	for _, mapping := range mappings {
 		channel, exists := channelsByID[mapping.ChannelID]
@@ -250,8 +286,10 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 		if !channel.Enabled || (channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(now)) {
 			continue
 		}
-		usage := Usage{InputTokens: inputTokens, OutputTokens: outputTokens}
 		metric := recentSuccess.ByChannelModel[mapping.ID]
+		routingMetric := recentRouting[mapping.ID]
+		expectedCachedTokens := int64(math.Round(float64(max(inputTokens, 0)) * routingMetric.CacheRate))
+		usage := Usage{InputTokens: inputTokens, OutputTokens: outputTokens, CachedTokens: expectedCachedTokens}
 		candidates = append(candidates, RouteCandidate{
 			Channel:            channel,
 			Mapping:            mapping,
@@ -259,6 +297,11 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 			RecentSuccessRate:  metric.rate(),
 			RecentSuccessCount: metric.Successes,
 			RecentAttemptCount: metric.Attempts,
+			RecentLatencyMS:    routingMetric.LatencyMS,
+			RecentCacheRate:    routingMetric.CacheRate,
+			RecentRouteCount:   routingMetric.RouteCount,
+			ConsecutiveRoutes:  routingMetric.ConsecutiveRoutes,
+			MetricsLoaded:      true,
 		})
 	}
 	return candidates, nil
@@ -297,7 +340,10 @@ func (r *Router) recentOutputMedian(ctx context.Context, modelName string) int64
 	return values[len(values)/2]
 }
 
-func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) {
+func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) *RouteDecision {
+	if len(candidates) > 0 && candidates[0].MetricsLoaded {
+		return r.expectationProbabilityOrder(strategy, candidates)
+	}
 	switch strategy {
 	case RoutingLowestCost:
 		sortCandidatesByCost(candidates)
@@ -308,6 +354,7 @@ func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) {
 	default:
 		r.weightedPriorityOrder(candidates)
 	}
+	return nil
 }
 
 func (r *Router) orderCandidatesWithoutWeightedAdvance(strategy string, candidates []RouteCandidate) {
@@ -592,6 +639,23 @@ func (r *Router) RecordSessionAffinity(ctx context.Context, tokenID uint64, mode
 }
 
 func (r *Router) RecordSessionAffinityAfterSuccess(ctx context.Context, tokenID uint64, modelID uint64, sessionKey string, previousChannelModelID uint64, successfulChannelModelID uint64) {
+	if tokenID == 0 || modelID == 0 || sessionKey == "" || successfulChannelModelID == 0 {
+		return
+	}
+	var current SessionAffinity
+	err := r.store.db.WithContext(ctx).Where("token_id = ? AND model_id = ? AND session_hash = ? AND expires_at > ?", tokenID, modelID, hashSecret(sessionKey), time.Now()).First(&current).Error
+	if previousChannelModelID == 0 {
+		if err == nil || !errors.Is(err, gorm.ErrRecordNotFound) {
+			return
+		}
+	} else {
+		if err != nil {
+			return
+		}
+		if current.ChannelModelID != previousChannelModelID {
+			return
+		}
+	}
 	if previousChannelModelID != 0 && previousChannelModelID != successfulChannelModelID && r.sessionMappingAvailable(ctx, modelID, previousChannelModelID) {
 		return
 	}

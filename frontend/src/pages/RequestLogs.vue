@@ -17,7 +17,7 @@ const total = ref(0)
 const models = ref<GatewayModel[]>([])
 const channels = ref<Channel[]>([])
 const tokens = ref<ClientToken[]>([])
-const filters = reactive({ model: '', channelId: '', tokenId: '', status: '', range: todayLogRange() as Date[] | null })
+const filters = reactive({ model: '', channelId: '', tokenId: '', outcome: '', range: todayLogRange() as Date[] | null })
 const pagination = reactive({ page: 1, pageSize: 50 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
@@ -84,6 +84,7 @@ function outcomeLabel(log: RelayRequestLog): string {
 function outcomeType(log: RelayRequestLog): 'success' | 'warning' | 'danger' | 'info' {
   if (log.outcome === 'success' || (log.outcome === '' && log.statusCode >= 200 && log.statusCode < 300)) return 'success'
   if (log.outcome === 'canceled' || log.statusCode === 499) return 'warning'
+  if (log.outcome === 'failed') return 'danger'
   return statusType(log.statusCode)
 }
 
@@ -114,7 +115,7 @@ async function loadLogs() {
   if (filters.model) query.set('model', filters.model)
   if (filters.channelId) query.set('channelId', filters.channelId)
   if (filters.tokenId) query.set('tokenId', filters.tokenId)
-  if (filters.status) query.set('status', filters.status)
+  if (filters.outcome) query.set('outcome', filters.outcome)
   if (filters.range?.length === 2) {
     query.set('from', filters.range[0].toISOString())
     query.set('to', filters.range[1].toISOString())
@@ -137,7 +138,7 @@ function searchLogs() {
 }
 
 function resetLogs() {
-  Object.assign(filters, { model: '', channelId: '', tokenId: '', status: '', range: todayLogRange() })
+  Object.assign(filters, { model: '', channelId: '', tokenId: '', outcome: '', range: todayLogRange() })
   pagination.page = 1
   void loadLogs()
 }
@@ -163,7 +164,7 @@ onMounted(async () => {
       <el-select v-model="filters.model" clearable placeholder="全部模型"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.name" /></el-select>
       <el-select v-model="filters.channelId" clearable placeholder="全部渠道"><el-option v-for="channel in channels" :key="channel.id" :label="channel.name" :value="String(channel.id)" /></el-select>
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
-      <el-select v-model="filters.status" clearable placeholder="全部状态"><el-option label="成功 2xx" value="200" /><el-option label="客户端取消 499" value="499" /><el-option label="限流 429" value="429" /><el-option label="服务不可用 503" value="503" /></el-select>
+      <el-select v-model="filters.outcome" clearable placeholder="全部结果"><el-option label="成功" value="success" /><el-option label="客户端取消" value="canceled" /><el-option label="失败" value="failed" /></el-select>
       <el-date-picker v-model="filters.range" type="datetimerange" format="YYYY-MM-DD HH:mm:ss" :default-time="logDateDefaultTimes" :shortcuts="logDateRangeShortcuts" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
       <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetLogs">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchLogs">查询</el-button></div>
     </section>

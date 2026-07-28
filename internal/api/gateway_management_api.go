@@ -332,7 +332,8 @@ func (a *GatewayManagementApi) dashboard(c *gin.Context) {
 
 func (a *GatewayManagementApi) logs(c *gin.Context) {
 	query := gateway.LogQuery{
-		Model: c.Query("model"),
+		Model:   c.Query("model"),
+		Outcome: c.Query("outcome"),
 	}
 	query.StatusCode, _ = strconv.Atoi(c.Query("status"))
 	query.TokenID, _ = strconv.ParseUint(c.Query("tokenId"), 10, 64)

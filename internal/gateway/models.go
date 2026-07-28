@@ -154,7 +154,7 @@ type RelayRequestLog struct {
 }
 
 func (log *RelayRequestLog) BeforeCreate(_ *gorm.DB) error {
-	if log.Outcome == "" || log.Outcome == RelayOutcomeFailed && ((log.StatusCode >= 200 && log.StatusCode < 300 && log.ErrorCode == "") || log.StatusCode == statusClientClosedRequest || log.ErrorCode == "request_canceled") {
+	if log.Outcome == "" {
 		log.Outcome = relayRequestOutcome(log.StatusCode, log.ErrorCode)
 	}
 	return nil
@@ -189,29 +189,32 @@ type RelayAttemptLog struct {
 	// SelectionReason is the stable reason code explaining why this attempt's channel was selected.
 	SelectionReason string `gorm:"size:48" json:"selectionReason"`
 	// SelectionDetail contains a sanitized, bounded diagnostic detail for SelectionReason.
-	SelectionDetail       string    `gorm:"size:512" json:"selectionDetail"`
-	RequestBody           string    `gorm:"type:text" json:"requestBody"`
-	RequestBodyTruncated  bool      `gorm:"not null;default:false" json:"requestBodyTruncated"`
-	ResponseBody          string    `gorm:"type:text" json:"responseBody"`
-	ResponseBodyTruncated bool      `gorm:"not null;default:false" json:"responseBodyTruncated"`
-	StatusCode            int       `gorm:"not null" json:"statusCode"`
-	InputTokens           int64     `gorm:"not null;default:0" json:"inputTokens"`
-	NormalInputTokens     int64     `gorm:"not null;default:0" json:"normalInputTokens"`
-	OutputTokens          int64     `gorm:"not null;default:0" json:"outputTokens"`
-	CachedTokens          int64     `gorm:"not null;default:0" json:"cachedTokens"`
-	CacheWriteTokens      int64     `gorm:"not null;default:0" json:"cacheWriteTokens"`
-	SentTokens            int64     `gorm:"not null;default:0" json:"sentTokens"`
-	EstimatedCost         int64     `gorm:"not null;default:0" json:"estimatedCostMicros"`
-	UpstreamCost          int64     `gorm:"not null;default:0" json:"upstreamCostMicros"`
-	CostSource            string    `gorm:"size:32" json:"costSource"`
-	UsageSource           string    `gorm:"size:32" json:"usageSource"`
-	FirstTokenMS          int64     `gorm:"not null;default:0" json:"firstTokenMs"`
-	LatencyMS             int64     `gorm:"not null;default:0" json:"latencyMs"`
-	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
-	Success               bool      `gorm:"not null;default:false" json:"success"`
-	Outcome               string    `gorm:"size:16;index;not null;default:failed" json:"outcome"`
-	ErrorMessage          string    `gorm:"type:text" json:"errorMessage"`
-	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
+	SelectionDetail string `gorm:"size:512" json:"selectionDetail"`
+	// RouteDecisionJSON preserves the candidate scores and probabilities used for the initial route.
+	RouteDecisionJSON     string         `gorm:"type:text" json:"-"`
+	RouteDecision         *RouteDecision `gorm:"-" json:"routeDecision,omitempty"`
+	RequestBody           string         `gorm:"type:text" json:"requestBody"`
+	RequestBodyTruncated  bool           `gorm:"not null;default:false" json:"requestBodyTruncated"`
+	ResponseBody          string         `gorm:"type:text" json:"responseBody"`
+	ResponseBodyTruncated bool           `gorm:"not null;default:false" json:"responseBodyTruncated"`
+	StatusCode            int            `gorm:"not null" json:"statusCode"`
+	InputTokens           int64          `gorm:"not null;default:0" json:"inputTokens"`
+	NormalInputTokens     int64          `gorm:"not null;default:0" json:"normalInputTokens"`
+	OutputTokens          int64          `gorm:"not null;default:0" json:"outputTokens"`
+	CachedTokens          int64          `gorm:"not null;default:0" json:"cachedTokens"`
+	CacheWriteTokens      int64          `gorm:"not null;default:0" json:"cacheWriteTokens"`
+	SentTokens            int64          `gorm:"not null;default:0" json:"sentTokens"`
+	EstimatedCost         int64          `gorm:"not null;default:0" json:"estimatedCostMicros"`
+	UpstreamCost          int64          `gorm:"not null;default:0" json:"upstreamCostMicros"`
+	CostSource            string         `gorm:"size:32" json:"costSource"`
+	UsageSource           string         `gorm:"size:32" json:"usageSource"`
+	FirstTokenMS          int64          `gorm:"not null;default:0" json:"firstTokenMs"`
+	LatencyMS             int64          `gorm:"not null;default:0" json:"latencyMs"`
+	DurationMS            int64          `gorm:"not null;default:0" json:"durationMs"`
+	Success               bool           `gorm:"not null;default:false" json:"success"`
+	Outcome               string         `gorm:"size:16;index;not null;default:failed" json:"outcome"`
+	ErrorMessage          string         `gorm:"type:text" json:"errorMessage"`
+	CreatedAt             time.Time      `gorm:"index" json:"createdAt"`
 }
 
 func (log *RelayAttemptLog) BeforeCreate(_ *gorm.DB) error {

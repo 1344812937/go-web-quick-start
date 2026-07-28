@@ -564,7 +564,7 @@ onUnmounted(() => {
         <el-table-column label="渠道" min-width="190">
           <template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.baseUrl }}</small></div></template>
         </el-table-column>
-        <el-table-column label="状态" width="220">
+        <el-table-column label="状态" width="180">
           <template #default="scope">
             <div class="channel-state-cell" :class="{ 'is-circuit-open': isCircuitOpen(scope.row) }">
               <div class="channel-state-heading">
@@ -577,10 +577,10 @@ onUnmounted(() => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="价格倍率" width="104" align="right">
+        <el-table-column label="价格倍率" width="92" align="right">
           <template #default="scope"><span class="price-multiplier">{{ formatPriceMultiplier(scope.row.priceMultiplierBasisPoints) }}</span></template>
         </el-table-column>
-        <el-table-column label="近 30 分钟成功率" width="170" align="right">
+        <el-table-column label="近 30 分钟成功率" width="154" align="right">
           <template #default="scope">
             <div class="metric-copy success-metric">
               <strong>{{ formatPercent(scope.row.metrics.recentSuccessRate) }}</strong>
@@ -785,10 +785,10 @@ onUnmounted(() => {
 :deep(.el-table__body tr.channel-row--circuit-open > td.el-table__cell),
 :deep(.el-table__body tr.channel-row--circuit-open:hover > td.el-table__cell) { background: var(--rose-danger-soft); }
 :deep(.el-table__body tr.channel-row--circuit-open > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--rose-danger); }
-.channel-state-cell { display: grid; min-width: 0; gap: 5px; }
-.channel-state-heading { display: flex; align-items: center; gap: 8px; }
+.channel-state-cell { display: grid; min-width: 0; gap: 3px; }
+.channel-state-heading { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .channel-state-heading strong { color: var(--rose-danger); font-family: var(--rose-font-mono); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.channel-state-cell small { display: block; overflow: hidden; color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.channel-state-cell small { display: block; max-width: 100%; overflow: hidden; color: var(--rose-text-muted); font-size: 11px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
 .channel-state-cell.is-circuit-open small { color: var(--rose-danger); cursor: help; }
 .reset-circuit-button { color: var(--rose-danger); }
 .model-discovery-heading { margin-top: 0; }
@@ -808,7 +808,7 @@ onUnmounted(() => {
 .channel-model-more-tag { flex-shrink: 0; cursor: help; font-variant-numeric: tabular-nums; }
 .channel-model-overflow-content { display: flex; flex-wrap: wrap; gap: 6px; max-width: 360px; max-height: 220px; overflow-y: auto; padding: 2px; }
 .price-multiplier { color: var(--rose-text); font-family: var(--rose-font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
-.latency-metric-cell { display: flex; align-items: center; gap: 12px; min-height: 48px; }
+.latency-metric-cell { display: flex; align-items: center; gap: 8px; min-height: 48px; }
 .metric-copy { display: grid; min-width: 0; gap: 2px; font-variant-numeric: tabular-nums; }
 .metric-copy strong { color: var(--rose-text); font-size: 13px; font-weight: 650; }
 .metric-copy small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; white-space: nowrap; }
