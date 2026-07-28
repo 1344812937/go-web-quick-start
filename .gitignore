@@ -9,6 +9,7 @@
 /.claude/
 /.codegraph/
 /.env
+/runtime
 /frontend/dist/
 /frontend/node_modules/
 /data/
