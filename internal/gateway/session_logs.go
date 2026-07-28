@@ -130,7 +130,7 @@ func normalizeSessionPage(page *int, pageSize *int) {
 
 func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQuery) (*SessionLogPage, error) {
 	normalizeSessionPage(&query.Page, &query.PageSize)
-	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	cutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 
 	grouped := applySessionLogFilters(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}), query, cutoff).
 		Select("token_id, " + sessionGroupExpression + " AS group_id").
@@ -207,13 +207,13 @@ func applySessionLogFilters(db *gorm.DB, query SessionLogQuery, cutoff time.Time
 		db = db.Where("token_id = ?", query.TokenID)
 	}
 	if query.ChannelID > 0 {
-		db = db.Where("EXISTS (SELECT 1 FROM relay_attempt_logs a WHERE a.request_id = relay_request_logs.id AND a.channel_id = ?)", query.ChannelID)
+		db = db.Where("(SELECT a.channel_id FROM relay_attempt_logs a WHERE a.request_id = relay_request_logs.id ORDER BY a.id DESC LIMIT 1) = ?", query.ChannelID)
 	}
 	if !query.From.IsZero() {
-		db = db.Where("created_at >= ?", query.From)
+		db = db.Where("created_at >= ?", utcQueryTime(query.From))
 	}
 	if !query.To.IsZero() {
-		db = db.Where("created_at <= ?", query.To)
+		db = db.Where("created_at <= ?", utcInclusiveMillisecondEnd(query.To))
 	}
 	return db
 }
@@ -251,7 +251,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	if (query.SessionID == "" && query.RequestID == "") || (query.SessionID != "" && query.TokenID == 0) {
 		return nil, errors.New("sessionId with tokenId or requestId is required")
 	}
-	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	cutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	base := applySessionDetailStatus(applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query), query.Status)
 	var requestTotal int64
 	if err := base.Count(&requestTotal).Error; err != nil {
@@ -392,7 +392,9 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 		}
 	}
 	var latest RelayRequestLog
-	if err := latestDB.Order("created_at DESC, id DESC").First(&latest).Error; err != nil {
+	if err := latestDB.
+		Order("CASE WHEN codex_session_source IN ('codex_title_generation', 'codex_guardian') THEN 1 ELSE 0 END ASC").
+		Order("created_at DESC, id DESC").First(&latest).Error; err != nil {
 		return err
 	}
 	summary.TokenID = latest.TokenID
@@ -444,7 +446,7 @@ func (s *ManagementService) RenameSession(ctx context.Context, input SessionTitl
 	if (input.SessionID == "" && input.RequestID == "") || (input.SessionID != "" && input.TokenID == 0) {
 		return errors.New("sessionId with tokenId or requestId is required")
 	}
-	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	cutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	return s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
 		if input.SessionID == "" {
 			result := db.Model(&RelayRequestLog{}).
@@ -538,7 +540,8 @@ func (s *ManagementService) currentSessionChannel(ctx context.Context, summary S
 
 	attemptDB := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
 		Select("a.*").Joins("JOIN relay_request_logs AS r ON r.id = a.request_id").
-		Where("r.created_at >= ?", cutoff)
+		Where("r.created_at >= ?", cutoff).
+		Where("r.codex_session_source NOT IN ?", codexAuxiliarySessionSources)
 	if summary.Identified {
 		attemptDB = attemptDB.Where("r.token_id = ? AND r.codex_session_id = ?", summary.TokenID, summary.SessionID)
 	} else {
@@ -590,7 +593,8 @@ func (s *ManagementService) sessionChannelHistory(ctx context.Context, summary S
 	attemptDB := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
 		Select("a.*, r.id AS request_log_id, r.created_at AS request_created_at").
 		Joins("JOIN relay_request_logs AS r ON r.id = a.request_id").
-		Where("r.created_at >= ?", cutoff)
+		Where("r.created_at >= ?", cutoff).
+		Where("r.codex_session_source NOT IN ?", codexAuxiliarySessionSources)
 	if summary.Identified {
 		attemptDB = attemptDB.Where("r.token_id = ? AND r.codex_session_id = ?", summary.TokenID, summary.SessionID)
 	} else {

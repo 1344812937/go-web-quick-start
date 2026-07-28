@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
+import { Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Channel, ChannelModel, GatewayModel, RoutingStrategy } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -24,10 +24,19 @@ const channels = ref<Channel[]>([])
 const dialogOpen = ref(false)
 const editingId = ref<number | null>(null)
 const deletingModelId = ref<number | null>(null)
+const modelSearchQuery = ref('')
+const expandedStrategySections = ref<string[]>([])
+const strategyDetailsOpen = computed(() => expandedStrategySections.value.includes('strategy-guide'))
 const form = reactive<{ name: string; routingStrategy: RoutingStrategy; enabled: boolean }>({ name: '', routingStrategy: 'priority_weighted', enabled: true })
 const dialogTitle = computed(() => editingId.value ? '编辑公开模型' : '新增公开模型')
 const sortedModels = computed(() => [...models.value].sort((left, right) => modelUsageCount(right.id) - modelUsageCount(left.id)
   || right.name.localeCompare(left.name, undefined, { numeric: true, sensitivity: 'base' })))
+const filteredModels = computed(() => {
+  const query = modelSearchQuery.value.trim().toLocaleLowerCase()
+  if (!query) return sortedModels.value
+  return sortedModels.value.filter((model) => model.name.toLocaleLowerCase().includes(query))
+})
+const modelTableEmptyText = computed(() => modelSearchQuery.value.trim() ? '未找到匹配的公开模型' : '还没有公开模型')
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
   { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按配置权重和近 30 分钟成功率分配' },
   { value: 'lowest_cost', label: '最低成本', note: '按本次预计成本优势和近 30 分钟成功率动态分配' },
@@ -153,15 +162,111 @@ onMounted(loadData)
 </script>
 
 <template>
-  <div class="page-stack">
+  <div class="page-stack model-route-page" :class="{ 'is-strategy-open': strategyDetailsOpen }">
     <header class="page-heading">
       <div><h1>模型路由</h1><p>管理公开模型名称、候选渠道矩阵和动态调度策略</p></div>
       <div class="page-actions"><el-tooltip content="刷新模型列表" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新模型列表" @click="loadData" /></el-tooltip><el-button type="primary" :icon="Plus" @click="openEditor()">新增模型</el-button></div>
     </header>
 
+    <section class="surface-panel strategy-model-panel" aria-labelledby="strategy-model-title">
+      <el-collapse v-model="expandedStrategySections" class="strategy-collapse">
+        <el-collapse-item name="strategy-guide">
+          <template #title>
+            <div class="strategy-model-heading">
+              <div>
+                <span class="section-eyebrow">ROUTING MODEL</span>
+                <h2 id="strategy-model-title">三种路由策略如何选择渠道</h2>
+                <p>候选池会先排除已停用、已熔断的渠道。展开查看评分、加权和抽样规则。</p>
+              </div>
+              <div class="probability-equation" aria-label="统一概率公式">
+                <span>统一抽样模型</span>
+                <code>P<sub>i</sub> = E<sub>i</sub> / &Sigma;E<sub>j</sub></code>
+                <small>分数越高，被选中的概率越大</small>
+              </div>
+            </div>
+          </template>
+
+          <div class="strategy-model-grid">
+            <article class="strategy-model-card is-priority">
+          <header>
+            <span class="strategy-index">01</span>
+            <div><h3>优先级加权</h3><p>先锁定最高优先级，再在组内按综合期望值抽样。</p></div>
+          </header>
+          <div class="strategy-formula">
+            <span>候选期望值</span>
+            <code>E<sub>i</sub> = 1[p<sub>i</sub> = p<sub>max</sub>] &times; B<sub>i</sub> &times; (0.95 + 0.05A<sub>i</sub>)</code>
+          </div>
+          <ol class="strategy-steps">
+            <li><strong>分组</strong><span>只保留优先级 <code>p<sub>max</sub></code> 的渠道，低优先级本轮概率为 0。</span></li>
+            <li><strong>加权</strong><span>配置权重、成功率、缓存收益和近期分流情况共同形成 <code>B<sub>i</sub></code>。</span></li>
+            <li><strong>选择</strong><span>同级渠道按 <code>P<sub>i</sub></code> 随机抽样，不是固定轮询第一名。</span></li>
+          </ol>
+          <p class="strategy-conclusion"><strong>适合：</strong>有明确主备层级，同时希望同级渠道自动均衡。</p>
+            </article>
+
+            <article class="strategy-model-card is-cost">
+          <header>
+            <span class="strategy-index">02</span>
+            <div><h3>最低成本</h3><p>价格越接近当前最低成本，获得的抽样加成越高。</p></div>
+          </header>
+          <div class="strategy-formula">
+            <span>成本优势与期望值</span>
+            <code>A<sub>i</sub> = (c<sub>min</sub> + 1) / (c<sub>i</sub> + 1)</code>
+            <code>E<sub>i</sub> = B<sub>i</sub> &times; (0.90 + 0.10A<sub>i</sub>)</code>
+          </div>
+          <ol class="strategy-steps">
+            <li><strong>估价</strong><span><code>c<sub>i</sub></code> 按本次输入、预计输出及历史缓存率估算实际费用。</span></li>
+            <li><strong>比较</strong><span>最便宜渠道的 <code>A<sub>i</sub> = 1</code>，成本越高，优势系数越低。</span></li>
+            <li><strong>选择</strong><span>成本因子位于 0.90～1.00，稳定性、缓存和分流均衡仍会影响结果。</span></li>
+          </ol>
+          <p class="strategy-conclusion"><strong>适合：</strong>控制总体费用，但不希望低价渠道垄断或牺牲可用性。</p>
+            </article>
+
+            <article class="strategy-model-card is-latency">
+          <header>
+            <span class="strategy-index">03</span>
+            <div><h3>最低延迟</h3><p>响应越接近当前最快渠道，获得的抽样加成越高。</p></div>
+          </header>
+          <div class="strategy-formula">
+            <span>延迟优势与期望值</span>
+            <code>T<sub>i</sub> = min(l<sub>min</sub> / l<sub>i</sub>, 1)</code>
+            <code>E<sub>i</sub> = B<sub>i</sub> &times; (0.70 + 0.30T<sub>i</sub>) &times; (0.95 + 0.05A<sub>i</sub>)</code>
+          </div>
+          <ol class="strategy-steps">
+            <li><strong>采样</strong><span><code>l<sub>i</sub></code> 优先取近 30 分钟平均延迟，没有样本时回退到 EWMA。</span></li>
+            <li><strong>探测</strong><span>完全没有延迟样本的渠道按当前最快值参与，保留获得真实样本的机会。</span></li>
+            <li><strong>选择</strong><span>延迟因子位于 0.70～1.00，同时保留 0.95～1.00 的成本修正。</span></li>
+          </ol>
+          <p class="strategy-conclusion"><strong>适合：</strong>交互式请求、首响应敏感场景，并允许持续探测新渠道。</p>
+            </article>
+          </div>
+
+          <footer class="factor-legend">
+            <div class="base-equation">
+              <span>三种策略共享的基础分</span>
+              <code>B<sub>i</sub> = max(w<sub>i</sub>, 1) / 100 &times; D<sub>i</sub> &times; S<sub>i</sub> &times; H<sub>i</sub> &times; K<sub>i</sub></code>
+            </div>
+            <dl>
+              <div><dt>w</dt><dd>配置权重，最小按 1 计算</dd></div>
+              <div><dt>D</dt><dd><code>1 / (1 + 4r)</code>，r 为最近最多 100 次路由占比</dd></div>
+              <div><dt>S</dt><dd><code>0.75 + 0.5s</code>，s 为近 30 分钟成功率</dd></div>
+              <div><dt>H / K</dt><dd><code>0.5 + 1.5h</code> / <code>0.8 + 0.4k</code>，无样本均为 1</dd></div>
+              <div><dt>A</dt><dd><code>(c<sub>min</sub> + 1) / (c<sub>i</sub> + 1)</code></dd></div>
+              <div><dt>T</dt><dd><code>min(l<sub>min</sub> / l<sub>i</sub>, 1)</code></dd></div>
+            </dl>
+            <p>无成功率样本按 100% 处理；无缓存样本时缓存系数保持 1，不奖励也不惩罚。</p>
+          </footer>
+        </el-collapse-item>
+      </el-collapse>
+    </section>
+
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>模型路由加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="sortedModels" row-key="id" empty-text="还没有公开模型">
+      <header class="model-list-toolbar">
+        <div><strong>公开模型列表</strong><span>{{ filteredModels.length }} / {{ models.length }} 个模型</span></div>
+        <el-input v-model="modelSearchQuery" class="model-search" clearable :prefix-icon="Search" aria-label="按模型名称搜索" placeholder="搜索模型名称" />
+      </header>
+      <el-table v-loading="loading" :data="filteredModels" row-key="id" scrollbar-always-on :empty-text="modelTableEmptyText">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="candidate-matrix">
@@ -213,6 +318,54 @@ onMounted(loadData)
 </template>
 
 <style scoped>
+.strategy-model-panel { flex: none; overflow: hidden; }
+.strategy-collapse { border: 0; }
+.strategy-collapse :deep(.el-collapse-item__header) { height: auto; min-height: 72px; padding: 0 18px 0 0; border: 0; background: var(--rose-surface-muted); line-height: normal; }
+.strategy-collapse :deep(.el-collapse-item__arrow) { flex: none; margin-left: 14px; color: var(--rose-text-muted); font-size: 16px; }
+.strategy-collapse :deep(.el-collapse-item__wrap) { border: 0; }
+.strategy-collapse :deep(.el-collapse-item__content) { padding: 0; }
+.strategy-model-heading { display: flex; flex: 1; align-items: center; justify-content: space-between; gap: 24px; min-width: 0; padding: 14px 0 14px 20px; }
+.strategy-model-heading > div:first-child { min-width: 0; }
+.section-eyebrow { display: block; margin-bottom: 5px; color: var(--rose-primary-hover); font: 650 10px/1 var(--rose-font-mono); letter-spacing: .12em; }
+.strategy-model-heading h2 { color: var(--rose-text); font-size: 16px; font-weight: 650; }
+.strategy-model-heading p { max-width: 760px; margin-top: 4px; color: var(--rose-text-muted); font-size: 12px; line-height: 1.55; }
+.probability-equation { flex: 0 0 auto; display: grid; grid-template-columns: auto auto; align-items: center; gap: 3px 12px; min-width: 270px; padding-left: 20px; border-left: 1px solid var(--rose-border-strong); }
+.probability-equation span { color: var(--rose-text-muted); font-size: 10px; }
+.probability-equation code { grid-row: span 2; color: var(--rose-primary-hover); font-size: 15px; font-weight: 650; white-space: nowrap; }
+.probability-equation small { color: var(--rose-text-subtle); font-size: 10px; }
+.strategy-model-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.strategy-model-card { min-width: 0; padding: 18px 20px 16px; }
+.strategy-model-card + .strategy-model-card { border-left: 1px solid var(--rose-border); }
+.strategy-model-card > header { display: grid; grid-template-columns: 30px minmax(0, 1fr); gap: 10px; min-height: 54px; }
+.strategy-index { display: grid; width: 28px; height: 28px; place-items: center; border: 1px solid var(--rose-border-strong); border-radius: var(--rose-radius-control); color: var(--rose-text-muted); font: 650 10px/1 var(--rose-font-mono); }
+.strategy-model-card h3 { color: var(--rose-text); font-size: 14px; font-weight: 650; }
+.strategy-model-card header p { margin-top: 3px; color: var(--rose-text-muted); font-size: 11px; line-height: 1.45; }
+.strategy-formula { display: grid; align-content: start; gap: 6px; min-height: 88px; margin: 14px 0; padding: 11px 12px; border-left: 3px solid var(--rose-primary); background: var(--rose-surface-muted); }
+.is-cost .strategy-formula { border-left-color: var(--rose-amber); }
+.is-latency .strategy-formula { border-left-color: var(--rose-teal); }
+.strategy-formula span { color: var(--rose-text-subtle); font-size: 9px; font-weight: 650; letter-spacing: .04em; }
+.strategy-formula code { color: var(--rose-text); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
+.strategy-steps { display: grid; gap: 9px; margin: 0; padding: 0; list-style: none; }
+.strategy-steps li { display: grid; grid-template-columns: 42px minmax(0, 1fr); gap: 8px; color: var(--rose-text-muted); font-size: 11px; line-height: 1.5; }
+.strategy-steps strong { color: var(--rose-text); font-weight: 650; }
+.strategy-steps code { color: var(--rose-primary-hover); }
+.strategy-conclusion { min-height: 48px; margin: 14px 0 0; padding-top: 12px; border-top: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); font-size: 11px; line-height: 1.5; }
+.strategy-conclusion strong { color: var(--rose-text); }
+.factor-legend { padding: 14px 20px 16px; border-top: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
+.base-equation { display: flex; align-items: baseline; flex-wrap: wrap; gap: 7px 14px; }
+.base-equation span { color: var(--rose-text-muted); font-size: 10px; font-weight: 650; }
+.base-equation code { color: var(--rose-text); font-size: 11px; }
+.factor-legend dl { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 0; margin: 12px 0 0; border: 1px solid var(--rose-border); background: var(--rose-surface); }
+.factor-legend dl > div { min-width: 0; padding: 9px 10px; }
+.factor-legend dl > div + div { border-left: 1px solid var(--rose-border); }
+.factor-legend dt { color: var(--rose-primary-hover); font: 650 11px/1 var(--rose-font-mono); }
+.factor-legend dd { margin: 5px 0 0; color: var(--rose-text-muted); font-size: 10px; line-height: 1.35; }
+.factor-legend > p { margin: 9px 0 0; color: var(--rose-text-subtle); font-size: 10px; }
+.model-list-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 58px; padding: 10px 16px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
+.model-list-toolbar > div { display: grid; gap: 2px; min-width: 0; }
+.model-list-toolbar strong { color: var(--rose-text); font-size: 14px; font-weight: 650; }
+.model-list-toolbar span { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.model-search { width: min(320px, 42vw); }
 .candidate-matrix { padding: 12px 24px 20px 54px; background: var(--rose-surface-muted); }
 .matrix-heading { display: flex; justify-content: space-between; align-items: center; padding: 0 0 10px; color: var(--rose-text-muted); font-size: 12px; }
 .matrix-heading strong { color: var(--rose-text); }
@@ -221,5 +374,41 @@ onMounted(loadData)
 .success-rate-cell small { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
 .select-option { display: grid; line-height: 1.3; }
 .select-option small { color: var(--rose-text-muted); font-size: 11px; }
-@media (max-width: 640px) { .candidate-matrix { padding: 10px; } }
+@media (min-width: 961px) {
+  .model-route-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; }
+  .model-route-page > .table-panel { display: flex; flex-direction: column; min-height: 0; }
+  .model-route-page > .table-panel > .el-table { flex: 1; min-height: 0; }
+  .model-route-page.is-strategy-open { display: block; overflow-y: auto; scrollbar-gutter: stable; }
+  .model-route-page.is-strategy-open > * + * { margin-top: 16px; }
+  .model-route-page.is-strategy-open > .table-panel > .el-table { max-height: 520px; }
+}
+@media (max-width: 980px) {
+  .strategy-model-grid { grid-template-columns: 1fr; }
+  .strategy-model-card + .strategy-model-card { border-top: 1px solid var(--rose-border); border-left: 0; }
+  .strategy-model-card > header, .strategy-formula, .strategy-conclusion { min-height: 0; }
+  .factor-legend dl { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .factor-legend dl > div:nth-child(4) { border-left: 0; }
+  .factor-legend dl > div:nth-child(n + 4) { border-top: 1px solid var(--rose-border); }
+}
+@media (max-width: 720px) {
+  .strategy-model-heading { align-items: flex-start; flex-direction: column; padding: 16px; }
+  .probability-equation { width: 100%; min-width: 0; padding: 12px 0 0; border-top: 1px solid var(--rose-border-strong); border-left: 0; }
+  .strategy-model-card { padding: 16px; }
+  .factor-legend { padding: 14px 16px; }
+  .factor-legend dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .factor-legend dl > div:nth-child(odd) { border-left: 0; }
+  .factor-legend dl > div:nth-child(even) { border-left: 1px solid var(--rose-border); }
+  .factor-legend dl > div:nth-child(n + 3) { border-top: 1px solid var(--rose-border); }
+}
+@media (max-width: 640px) {
+  .model-list-toolbar { align-items: stretch; flex-direction: column; gap: 8px; }
+  .model-search { width: 100%; }
+  .candidate-matrix { padding: 10px; }
+}
+@media (max-width: 460px) {
+  .probability-equation { grid-template-columns: 1fr; }
+  .probability-equation code { grid-row: auto; white-space: normal; }
+  .factor-legend dl { grid-template-columns: 1fr; }
+  .factor-legend dl > div + div { border-top: 1px solid var(--rose-border); border-left: 0; }
+}
 </style>

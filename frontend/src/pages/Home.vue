@@ -192,7 +192,7 @@ onMounted(loadDashboard)
           <small>{{ availableChannels ? '至少一个渠道可调度' : '当前无可用渠道' }}</small>
         </article>
       </section>
-      <p class="historical-cost-note">{{ selectedRangeLabel }}按服务器本地自然日统计，费用优先采用上游返回值。</p>
+      <p class="historical-cost-note">{{ selectedRangeLabel }}按东八区自然日和请求级记录统计；重试不会重复累计 Token 与费用，费用优先采用最终上游返回值。</p>
 
       <section class="surface-panel quick-start-panel">
         <header class="panel-heading">
@@ -249,10 +249,10 @@ onMounted(loadDashboard)
 
         <div class="dashboard-tables">
           <section class="surface-panel">
-            <header class="panel-heading"><div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，按尝试次数统计</p></div></header>
+            <header class="panel-heading"><div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，每个请求按最终渠道统计一次</p></div></header>
             <el-table :data="dashboard?.channels ?? []" empty-text="暂无渠道调用">
               <el-table-column prop="name" label="渠道" min-width="140" />
-              <el-table-column label="尝试" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
+              <el-table-column label="请求" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
               <el-table-column label="费用" width="150" align="right">
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>

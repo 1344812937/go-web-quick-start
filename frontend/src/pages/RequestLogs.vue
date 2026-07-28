@@ -1,13 +1,13 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Coin, Connection, DataLine, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { Coin, Connection, DataLine, Delete, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
-import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, RelayRequestLog } from '@/types/gateway'
+import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, LogPayloadCleanupResult, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
-import { logDateDefaultTimes, logDateRangeShortcuts, todayLogRange } from '@/utils/logDateRanges'
+import { logDateDefaultTimes, logDateRangeShortcuts, toEastEightISOString, todayLogRange } from '@/utils/logDateRanges'
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -22,6 +22,7 @@ const pagination = reactive({ page: 1, pageSize: 50 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
+const clearingPayloads = ref(false)
 
 function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(micros / 1_000_000)
@@ -32,7 +33,7 @@ function formatPercent(value: number): string {
 }
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'Asia/Shanghai' }).format(new Date(value))
 }
 
 function formatTiming(value: number): string {
@@ -117,8 +118,8 @@ async function loadLogs() {
   if (filters.tokenId) query.set('tokenId', filters.tokenId)
   if (filters.outcome) query.set('outcome', filters.outcome)
   if (filters.range?.length === 2) {
-    query.set('from', filters.range[0].toISOString())
-    query.set('to', filters.range[1].toISOString())
+    query.set('from', toEastEightISOString(filters.range[0]))
+    query.set('to', toEastEightISOString(filters.range[1]))
   }
   try {
     const page = await request<LogPage>(`/admin/gateway/logs?${query}`)
@@ -143,6 +144,30 @@ function resetLogs() {
   void loadLogs()
 }
 
+async function clearHistoricalPayloads() {
+  try {
+    await ElMessageBox.confirm(
+      '将永久清空 30 分钟前调用日志中的请求参数、请求正文和响应正文。状态、Token、费用和耗时统计会保留。',
+      '清理历史参数与明细',
+      { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  clearingPayloads.value = true
+  try {
+    const result = await request<LogPayloadCleanupResult>('/admin/gateway/logs/clear-payloads', { method: 'POST' })
+    payloadDialogOpen.value = false
+    selectedRequest.value = null
+    ElMessage.success(`已清理 ${result.requestLogsCleared} 条调用和 ${result.attemptLogsCleared} 条上游尝试的参数与明细`)
+    await loadLogs()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '历史参数与明细清理失败')
+  } finally {
+    clearingPayloads.value = false
+  }
+}
+
 onMounted(async () => {
   try {
     await loadOptions()
@@ -154,10 +179,13 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="page-stack">
+  <div class="page-stack log-page">
     <header class="page-heading">
-      <div><h1>调用日志</h1><p>默认显示今天，可查询 5 天内的请求状态、重试尝试与费用</p></div>
-      <div class="page-actions"><el-tooltip content="刷新调用日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新调用日志" @click="loadLogs" /></el-tooltip></div>
+      <div><h1>调用日志</h1><p>默认按东八区显示今天，可查询 5 天内的请求状态、重试尝试与费用</p></div>
+      <div class="page-actions">
+        <el-button type="danger" plain :icon="Delete" :loading="clearingPayloads" @click="clearHistoricalPayloads">清理 30 分钟前明细</el-button>
+        <el-tooltip content="刷新调用日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新调用日志" @click="loadLogs" /></el-tooltip>
+      </div>
     </header>
 
     <section class="filter-bar" aria-label="日志筛选">
@@ -204,7 +232,7 @@ onMounted(async () => {
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="logs" row-key="id" empty-text="当前筛选条件下没有调用日志">
+      <el-table v-loading="loading" :data="logs" row-key="id" max-height="var(--log-table-max-height)" empty-text="当前筛选条件下没有调用日志">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="attempt-list">
@@ -242,7 +270,7 @@ onMounted(async () => {
         <el-table-column label="请求延迟" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.latencyMs) }}</template></el-table-column>
         <el-table-column label="请求耗时" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.durationMs) }}</template></el-table-column>
         <el-table-column label="尝试" width="72" align="right" prop="attemptCount" />
-        <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><el-tooltip content="查看完整请求与响应" placement="top"><el-button class="table-action-button" text :icon="View" :loading="payloadLoadingId === scope.row.id" aria-label="查看完整请求与响应" @click="showPayloads(scope.row)" /></el-tooltip></template></el-table-column>
+        <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><el-tooltip content="查看调用记录" placement="top"><el-button class="table-action-button" text :icon="View" :loading="payloadLoadingId === scope.row.id" aria-label="查看调用记录" @click="showPayloads(scope.row)" /></el-tooltip></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadLogs" /></footer>
     </section>
@@ -251,6 +279,7 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.log-page { --log-table-max-height: max(240px, calc(100dvh - 520px)); }
 .attempt-list { display: grid; gap: 8px; padding: 14px 24px 18px 54px; background: var(--rose-surface-muted); }
 .attempt-list > header { display: flex; justify-content: space-between; color: var(--rose-text-muted); font-size: 12px; }
 .attempt-list > header strong { color: var(--rose-text); }
@@ -263,5 +292,24 @@ onMounted(async () => {
 .cost-breakdown strong { color: var(--rose-text); font-variant-numeric: tabular-nums; }
 .cost-breakdown small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; }
 .source-breakdown { justify-items: start; }
+@media (min-width: 961px) {
+  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; }
+  .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .log-page .metric-cell { min-height: 80px; padding-block: 10px; border-right: 1px solid var(--rose-border); border-bottom: 0; }
+  .log-page .metric-cell:nth-child(3) { border-right: 1px solid var(--rose-border); }
+  .log-page .metric-cell:nth-child(-n + 3) { border-bottom: 0; }
+  .log-page .metric-cell:last-child { border-right: 0; }
+  .log-page .metric-cell strong { margin-top: 5px; font-size: 17px; }
+  .log-page .metric-cell small { margin-top: 3px; }
+  .table-panel { display: flex; flex-direction: column; min-height: 0; }
+  .table-panel > .el-table { flex: 1; min-height: 0; }
+  .table-pagination { flex: none; }
+}
+@media (min-width: 961px) and (max-width: 1360px) {
+  .log-page .filter-bar { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .log-page .filter-bar .el-date-editor { grid-column: span 3; }
+}
 @media (max-width: 720px) { .attempt-list { padding: 10px; overflow-x: auto; } }
+@media (max-width: 1360px) { .log-page { --log-table-max-height: max(240px, calc(100dvh - 680px)); } }
+@media (max-width: 720px) { .log-page { --log-table-max-height: 420px; } }
 </style>

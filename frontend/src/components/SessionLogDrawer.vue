@@ -83,7 +83,7 @@ const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requ
 })))
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'Asia/Shanghai' }).format(new Date(value))
 }
 
 function formatUSD(micros: number): string {

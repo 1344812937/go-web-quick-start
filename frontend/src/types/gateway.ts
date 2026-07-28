@@ -1,6 +1,7 @@
 export type RoutingStrategy = 'priority_weighted' | 'lowest_cost' | 'lowest_latency'
 export type CostSource = 'upstream' | 'estimated_fallback' | 'mixed' | 'failed_zero'
 export type RelayOutcome = 'success' | 'canceled' | 'failed'
+export type PayloadLogDetail = 'default' | 'summary' | 'none'
 
 export interface AdminSession {
   /** Persistent administrator identifier. */
@@ -265,7 +266,7 @@ export interface IssuedClientToken {
 }
 
 export interface DashboardDaily {
-  /** Server-local calendar date in YYYY-MM-DD format. */
+  /** UTC+8 calendar date in YYYY-MM-DD format. */
   date: string
   /** Requests received on the date. */
   requests: number
@@ -298,7 +299,7 @@ export interface DashboardDaily {
 export interface DashboardBreakdown {
   /** Channel or public model label. */
   name: string
-  /** Requests represented by this row. */
+  /** Request-level records represented by this row; retries never add another count. */
   requests: number
   /** Estimated cost in micro-USD. */
   estimatedCostMicros: number
@@ -376,12 +377,20 @@ export interface RouteDecisionCandidate {
   successRate: number
   /** Recent mean response-header latency in milliseconds. */
   latencyMs: number
-  /** Recent cached input tokens divided by input tokens. */
+  /** Recent calls with cached input divided by calls with reported input usage. */
   cacheHitRate: number
-  /** Attempts routed to this mapping in the rolling thirty-minute window. */
+  /** Recent calls with reported input usage used for cache-hit calculation. */
+  cacheSampleCount: number
+  /** Recent cached input tokens divided by input tokens. */
+  cacheRate: number
+  /** Recent reported input tokens used for cache-rate calculation. */
+  cacheTokenCount: number
+  /** Calls routed to this mapping within the latest site-wide routing sample. */
   recentRouteCount: number
-  /** Consecutive latest attempts routed to this mapping. */
-  consecutiveRoutes: number
+  /** Share of the latest site-wide routing sample routed to this mapping. */
+  recentRouteShare: number
+  /** Actual number of calls available in the latest routing sample, up to 100. */
+  routeSampleSize: number
   /** Composite expectation score before normalization. */
   expectation: number
   /** Normalized probability used for random selection. */
@@ -426,6 +435,8 @@ export interface RelayAttemptLog {
   selectionDetail: string
   /** Explainable snapshot of the initial route decision; absent on legacy and retry attempts. */
   routeDecision?: RouteDecision
+  /** Payload retention detail captured when this public request entered the gateway. */
+  payloadLogDetail: PayloadLogDetail
   /** Transformed request body or a gateway delta envelope relative to the public request. */
   requestBody: string
   /** Whether requestBody was truncated at the four MiB retention limit. */
@@ -497,6 +508,8 @@ export interface RelayRequestLog {
   sessionName: string
   /** Allowlisted non-content API parameters retained for five-day diagnostics. */
   requestParameters: Record<string, unknown>
+  /** Payload retention detail captured when this request entered the gateway. */
+  payloadLogDetail: PayloadLogDetail
   /** Original request body or a gateway delta envelope with already-retained context omitted. */
   requestBody: string
   /** Whether requestBody was truncated at the four MiB retention limit. */
@@ -599,6 +612,15 @@ export interface LogPage {
   page: number
   /** Maximum rows returned in this page. */
   pageSize: number
+}
+
+export interface LogPayloadCleanupResult {
+  /** Exclusive UTC cutoff used to select request logs for cleanup. */
+  cutoffAt: string
+  /** Number of request-log rows whose parameter or payload fields were cleared. */
+  requestLogsCleared: number
+  /** Number of upstream-attempt rows whose payload fields were cleared. */
+  attemptLogsCleared: number
 }
 
 export interface SessionChannel {
@@ -753,5 +775,7 @@ export interface ApplicationSettings {
     streamIdleTimeoutSeconds: number
     sessionTTLHours: number
     secureCookie: boolean
+    /** Detail retained for request parameters and responses on newly entering calls. */
+    payloadLogDetail: PayloadLogDetail
   }
 }

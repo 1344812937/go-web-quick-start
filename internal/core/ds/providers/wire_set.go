@@ -1,12 +1,13 @@
 package providers
 
 import (
-	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
 	"os"
 	"path/filepath"
 
+	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func NewMultiDataSource() *tx.MultiDataSource {
@@ -32,7 +33,7 @@ func getPrimaryDS() *tx.DataSource {
 	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		panic("failed to create database directory: " + err.Error())
 	}
-	db, err := gorm.Open(sqlite.Open(primaryDBPath), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(primaryDBPath), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		panic("failed to connect database: " + err.Error())
 	}

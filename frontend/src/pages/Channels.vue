@@ -298,7 +298,7 @@ function restoreAllOfficialPrices() {
 }
 
 function formatDiscoveryTime(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Shanghai' }).format(new Date(value))
 }
 
 async function discoverChannelModels(showSuccess = false) {
@@ -561,10 +561,10 @@ onUnmounted(() => {
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>渠道加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <el-table v-loading="loading" :data="channels" row-key="id" empty-text="还没有渠道" :row-class-name="channelRowClassName">
-        <el-table-column label="渠道" min-width="190">
+        <el-table-column label="渠道" width="228" fixed="left">
           <template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.baseUrl }}</small></div></template>
         </el-table-column>
-        <el-table-column label="状态" width="180">
+        <el-table-column label="状态" width="116">
           <template #default="scope">
             <div class="channel-state-cell" :class="{ 'is-circuit-open': isCircuitOpen(scope.row) }">
               <div class="channel-state-heading">
@@ -577,7 +577,7 @@ onUnmounted(() => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="价格倍率" width="92" align="right">
+        <el-table-column label="价格倍率" width="88" align="right">
           <template #default="scope"><span class="price-multiplier">{{ formatPriceMultiplier(scope.row.priceMultiplierBasisPoints) }}</span></template>
         </el-table-column>
         <el-table-column label="近 30 分钟成功率" width="154" align="right">
@@ -786,6 +786,7 @@ onUnmounted(() => {
 :deep(.el-table__body tr.channel-row--circuit-open:hover > td.el-table__cell) { background: var(--rose-danger-soft); }
 :deep(.el-table__body tr.channel-row--circuit-open > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--rose-danger); }
 .channel-state-cell { display: grid; min-width: 0; gap: 3px; }
+.channel-state-cell :deep(.el-tag) { max-width: 100%; }
 .channel-state-heading { display: flex; align-items: center; gap: 5px; min-width: 0; }
 .channel-state-heading strong { color: var(--rose-danger); font-family: var(--rose-font-mono); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .channel-state-cell small { display: block; max-width: 100%; overflow: hidden; color: var(--rose-text-muted); font-size: 11px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }

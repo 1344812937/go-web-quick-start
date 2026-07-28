@@ -70,6 +70,7 @@ type relayExecution struct {
 	durationMS               int64
 	responseBody             []byte
 	responseBodyTruncated    bool
+	payloadLogDetail         string
 }
 
 type attemptResult struct {
@@ -117,15 +118,16 @@ func NewRelayService(store *Store, router *Router, estimator *TokenEstimator, co
 
 func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, headers http.Header, rawQuery string, endpoint string, token *ClientToken, payload *RelayPayload, rawBody []byte) *PublicError {
 	execution := &relayExecution{
-		requestID:    uuid.NewString(),
-		token:        token,
-		endpoint:     endpoint,
-		payload:      payload,
-		rawBody:      rawBody,
-		inputTokens:  s.estimator.EstimateJSON(rawBody),
-		startedAt:    time.Now(),
-		usageSources: make(map[string]struct{}),
-		costSources:  make(map[string]struct{}),
+		requestID:        uuid.NewString(),
+		token:            token,
+		endpoint:         endpoint,
+		payload:          payload,
+		rawBody:          rawBody,
+		inputTokens:      s.estimator.EstimateJSON(rawBody),
+		startedAt:        time.Now(),
+		usageSources:     make(map[string]struct{}),
+		costSources:      make(map[string]struct{}),
+		payloadLogDetail: s.currentPayloadLogDetail(),
 	}
 	writer.Header().Set("X-Request-Id", execution.requestID)
 
@@ -151,9 +153,7 @@ func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, he
 		candidate := plan.Candidates[index]
 		execution.attempts++
 		result, attemptErr := s.performAttempt(ctx, writer, headers, rawQuery, execution, candidate, selection, index == maxAttempts-1, plan.Affinity)
-		if result != nil {
-			s.addUsage(execution, result.usage, result.estimatedCost, result.upstreamCost, result.costSource, result.outcome == RelayOutcomeCanceled)
-		}
+		s.addCanceledAttemptUsage(execution, result)
 		if attemptErr == nil {
 			return nil
 		}
@@ -183,6 +183,20 @@ func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, he
 	execution.responseBody = publicErrorBody(publicErr)
 	s.recordRequest(context.WithoutCancel(ctx), execution, publicErr.Status, publicErr.Code)
 	return publicErr
+}
+
+func (s *RelayService) currentPayloadLogDetail() string {
+	if s.configManager == nil {
+		return config.PayloadLogDetailDefault
+	}
+	return config.EffectivePayloadLogDetail(s.configManager.GetConfig())
+}
+
+func (s *RelayService) addCanceledAttemptUsage(execution *relayExecution, result *attemptResult) {
+	if result == nil || result.outcome != RelayOutcomeCanceled {
+		return
+	}
+	s.addUsage(execution, result.usage, result.estimatedCost, result.upstreamCost, result.costSource, true)
 }
 
 func routePublicError(err error) *PublicError {
@@ -946,9 +960,13 @@ func (c *payloadCapture) Snapshot() ([]byte, bool) {
 }
 
 func storedPayload(data []byte, alreadyTruncated bool) (string, bool) {
-	truncated := alreadyTruncated || len(data) > maxDetailedPayloadBytes
-	if len(data) > maxDetailedPayloadBytes {
-		data = data[:maxDetailedPayloadBytes]
+	return storedPayloadWithLimit(data, alreadyTruncated, maxDetailedPayloadBytes)
+}
+
+func storedPayloadWithLimit(data []byte, alreadyTruncated bool, limit int) (string, bool) {
+	truncated := alreadyTruncated || len(data) > limit
+	if len(data) > limit {
+		data = data[:limit]
 	}
 	for len(data) > 0 && !utf8.Valid(data) {
 		data = data[:len(data)-1]
@@ -1292,8 +1310,8 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		result.costSource = CostSourceFailedZero
 	}
 	compactedRequestBody := compactAttemptPayload(result.requestBody, execution.rawBody, execution.requestID)
-	requestBody, requestBodyTruncated := storedPayload(compactedRequestBody, len(result.requestBody) > maxDetailedPayloadBytes)
-	responseBody, responseBodyTruncated := storedPayload(result.body, result.bodyTruncated)
+	requestBody, requestBodyTruncated := retainLoggedPayload(execution.payloadLogDetail, compactedRequestBody, len(result.requestBody) > maxDetailedPayloadBytes)
+	responseBody, responseBodyTruncated := retainLoggedPayload(execution.payloadLogDetail, result.body, result.bodyTruncated)
 	routeDecisionJSON := ""
 	if selection.Decision != nil {
 		if encoded, err := json.Marshal(selection.Decision); err == nil {
@@ -1312,6 +1330,7 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		SelectionReason:       truncateRunes(selection.Reason, 48),
 		SelectionDetail:       truncateRunes(selection.Detail, 512),
 		RouteDecisionJSON:     routeDecisionJSON,
+		PayloadLogDetail:      execution.payloadLogDetail,
 		RequestBody:           requestBody,
 		RequestBodyTruncated:  requestBodyTruncated,
 		ResponseBody:          responseBody,
@@ -1367,8 +1386,14 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	if durationMS == 0 {
 		durationMS = elapsedMilliseconds(execution.startedAt, now)
 	}
-	responseBody, responseBodyTruncated := storedPayload(execution.responseBody, execution.responseBodyTruncated)
+	responseBody, responseBodyTruncated := retainLoggedPayload(execution.payloadLogDetail, execution.responseBody, execution.responseBodyTruncated)
 	sessionName := requestSessionName(execution.rawBody)
+	loggedSessionID, loggedSessionSource := loggedCodexSessionIdentity(execution.payload.SessionKey, execution.payload.SessionSource)
+	codexPromptHash, codexTitleRequest, codexGeneratedTitle := codexLogPayloadMetadata(execution.rawBody, execution.responseBody)
+	requestParametersJSON := execution.payload.RequestParametersJSON
+	if execution.payloadLogDetail == config.PayloadLogDetailNone {
+		requestParametersJSON = ""
+	}
 	log := RelayRequestLog{
 		ID:                    execution.requestID,
 		TokenID:               execution.token.ID,
@@ -1376,10 +1401,14 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		TokenKeyPrefix:        execution.token.KeyPrefix,
 		Endpoint:              execution.endpoint,
 		RequestedModel:        execution.payload.Model,
-		CodexSessionID:        truncateRunes(execution.payload.SessionKey, 512),
-		CodexSessionSource:    execution.payload.SessionSource,
+		CodexSessionID:        truncateRunes(loggedSessionID, 512),
+		CodexSessionSource:    loggedSessionSource,
 		SessionName:           sessionName,
-		RequestParametersJSON: execution.payload.RequestParametersJSON,
+		CodexPromptHash:       codexPromptHash,
+		CodexTitleRequest:     codexTitleRequest,
+		CodexGeneratedTitle:   codexGeneratedTitle,
+		RequestParametersJSON: requestParametersJSON,
+		PayloadLogDetail:      execution.payloadLogDetail,
 		ResponseBody:          responseBody,
 		ResponseBodyTruncated: responseBodyTruncated,
 		StatusCode:            status,
@@ -1419,7 +1448,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		latencySamples = 1
 	}
 	stat := TokenDailyStat{
-		Date:              now.Format(time.DateOnly),
+		Date:              eastEightDate(now),
 		TokenID:           execution.token.ID,
 		RequestCount:      1,
 		SuccessCount:      successCount,
@@ -1446,19 +1475,37 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		responseForManifest = execution.responseBody
 	}
 	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		mergedTitle, err := s.store.mergePrecedingCodexTitleRequest(db, &log, execution.rawBody, execution.startedAt.UTC())
+		if err != nil {
+			return err
+		}
+		effectiveSessionName := sessionName
+		if mergedTitle != "" {
+			effectiveSessionName = mergedTitle
+			log.SessionName = mergedTitle
+		}
 		compactedRequestBody := compactSessionPayload(
 			db,
 			execution.token.ID,
-			execution.payload.SessionKey,
+			loggedSessionID,
 			execution.requestID,
-			sessionName,
+			effectiveSessionName,
 			execution.rawBody,
 			responseForManifest,
 			now,
 		)
-		log.RequestBody, log.RequestBodyTruncated = storedPayload(compactedRequestBody, len(execution.rawBody) > maxDetailedPayloadBytes)
+		log.RequestBody, log.RequestBodyTruncated = retainLoggedPayload(execution.payloadLogDetail, compactedRequestBody, len(execution.rawBody) > maxDetailedPayloadBytes)
 		if err := db.Create(&log).Error; err != nil {
 			return err
+		}
+		canonicalSessionID, title, err := s.store.mergeFollowingCodexTitleRequest(db, &log, execution.startedAt.UTC())
+		if err != nil {
+			return err
+		}
+		if canonicalSessionID != "" {
+			log.CodexSessionID = canonicalSessionID
+			log.CodexSessionSource = codexTitleSessionSource
+			log.SessionName = title
 		}
 		return db.Clauses(clause.OnConflict{
 			Columns: []clause.Column{{Name: "date"}, {Name: "token_id"}},

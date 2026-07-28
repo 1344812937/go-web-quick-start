@@ -21,6 +21,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 type disconnectedStreamWriter struct {
@@ -86,7 +87,7 @@ func (w *failAfterWritesStreamWriter) Flush() {}
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
 	dsn := fmt.Sprintf("file:%s?mode=memory&cache=shared", strings.ReplaceAll(t.Name(), "/", "_"))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -660,7 +661,7 @@ func TestExplicitFailedOutcomeSurvivesHTTP200AndOutcomeFiltering(t *testing.T) {
 func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	store := newTestStore(t)
 	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
-	now := time.Now()
+	now := time.Now().UTC()
 	stat := TokenDailyStat{
 		Date: now.Format(time.DateOnly), TokenID: 1, RequestCount: 8, SuccessCount: 6,
 		InputTokens: 100, OutputTokens: 40, EstimatedCost: 900, UpstreamCost: 700,
@@ -693,19 +694,121 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	if len(summary.Channels) != 1 || summary.Channels[0].Requests != 1 || summary.Channels[0].UpstreamCost != 30 || len(summary.Models) != 1 || summary.Models[0].Requests != 1 || summary.Models[0].UpstreamCost != 30 {
 		t.Fatalf("dashboard breakdowns = channels %+v models %+v", summary.Channels, summary.Models)
 	}
-	if len(summary.Daily) != 1 || summary.Daily[0].Date != now.Format(time.DateOnly) || summary.Daily[0].Requests != 1 {
+	if len(summary.Daily) != 1 || summary.Daily[0].Date != eastEightDate(now) || summary.Daily[0].Requests != 1 {
 		t.Fatalf("dashboard daily = %+v", summary.Daily)
+	}
+}
+
+func TestDashboardChannelBreakdownCountsEachRequestOnce(t *testing.T) {
+	store := newTestStore(t)
+	_, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	now := time.Now().UTC()
+	requests := []RelayRequestLog{
+		{ID: "retried-request", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusOK, InputTokens: 100, OutputTokens: 20, EstimatedCost: 70, UpstreamCost: 60, AttemptCount: 2, CreatedAt: now},
+		{ID: "unrouted-request", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusServiceUnavailable, AttemptCount: 0, CreatedAt: now},
+	}
+	if err := store.db.Create(&requests).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempts := []RelayAttemptLog{
+		{RequestID: requests[0].ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusBadGateway, EstimatedCost: 999, UpstreamCost: 999, Success: false, CreatedAt: now.Add(-time.Second)},
+		{RequestID: requests[0].ID, ChannelID: channels[1].ID, ChannelName: channels[1].Name, ChannelModelID: mappings[1].ID, UpstreamModel: mappings[1].UpstreamModel, StatusCode: http.StatusOK, EstimatedCost: 70, UpstreamCost: 60, Success: true, CreatedAt: now},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := NewManagementService(store).Dashboard(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Requests != 2 || summary.UpstreamCost != 60 || summary.EstimatedCost != 70 {
+		t.Fatalf("dashboard totals = %+v", summary)
+	}
+	if len(summary.Channels) != 2 {
+		t.Fatalf("channel breakdown = %+v", summary.Channels)
+	}
+	byName := make(map[string]DashboardBreakdown, len(summary.Channels))
+	for _, item := range summary.Channels {
+		byName[item.Name] = item
+	}
+	if final := byName[channels[1].Name]; final.Requests != 1 || final.UpstreamCost != 60 || final.EstimatedCost != 70 {
+		t.Fatalf("final channel breakdown = %+v", final)
+	}
+	if unrouted := byName["未归属渠道"]; unrouted.Requests != 1 || unrouted.UpstreamCost != 0 || unrouted.EstimatedCost != 0 {
+		t.Fatalf("unrouted breakdown = %+v", unrouted)
+	}
+}
+
+func TestRetryFailureUsageIsNotAddedToRequestTotals(t *testing.T) {
+	store := newTestStore(t)
+	relay := newTestRelay(store)
+	execution := &relayExecution{usageSources: map[string]struct{}{}, costSources: map[string]struct{}{}}
+	failed := &attemptResult{usage: Usage{InputTokens: 100, OutputTokens: 20, Source: "upstream"}, outcome: RelayOutcomeFailed}
+	relay.addCanceledAttemptUsage(execution, failed)
+	if execution.usage.InputTokens != 0 || execution.usage.OutputTokens != 0 || execution.estimatedCost != 0 || execution.upstreamCost != 0 || len(execution.usageSources) != 0 {
+		t.Fatalf("failed retry usage leaked into request totals: %+v", execution)
+	}
+	canceled := &attemptResult{usage: Usage{InputTokens: 10, OutputTokens: 2, Source: "estimated_tiktoken"}, estimatedCost: 5, upstreamCost: 5, costSource: CostSourceFallback, outcome: RelayOutcomeCanceled}
+	relay.addCanceledAttemptUsage(execution, canceled)
+	if execution.usage.InputTokens != 10 || execution.usage.OutputTokens != 2 || execution.estimatedCost != 5 || execution.upstreamCost != 5 {
+		t.Fatalf("canceled final attempt usage was not retained: %+v", execution)
+	}
+}
+
+func TestBackfillRequestStatisticsUsesFinalAttemptAndRebuildsTokenStats(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	requestLog := RelayRequestLog{
+		ID: "historical-retry", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess,
+		InputTokens: 110, NormalInputTokens: 107, OutputTokens: 25, CachedTokens: 2, CacheWriteTokens: 1, SentTokens: 30,
+		EstimatedCost: 15, UpstreamCost: 42, CostSource: CostSourceUpstream, UsageSource: "mixed", AttemptCount: 2, CreatedAt: now,
+	}
+	if err := store.db.Create(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempts := []RelayAttemptLog{
+		{RequestID: requestLog.ID, ChannelID: 1, ChannelModelID: 1, UpstreamModel: "model-a", InputTokens: 100, NormalInputTokens: 100, OutputTokens: 20, Outcome: RelayOutcomeFailed, CreatedAt: now.Add(-time.Second)},
+		{RequestID: requestLog.ID, ChannelID: 2, ChannelModelID: 2, UpstreamModel: "model-a", InputTokens: 10, NormalInputTokens: 7, OutputTokens: 5, CachedTokens: 2, CacheWriteTokens: 1, EstimatedCost: 15, UpstreamCost: 42, CostSource: CostSourceUpstream, UsageSource: "upstream", Success: true, Outcome: RelayOutcomeSuccess, CreatedAt: now},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&TokenDailyStat{Date: now.Format(time.DateOnly), TokenID: 7, RequestCount: 1, InputTokens: 110, OutputTokens: 25, EstimatedCost: 15, UpstreamCost: 42}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.backfillRequestStatisticsFromFinalAttempts(); err != nil {
+		t.Fatal(err)
+	}
+	var corrected RelayRequestLog
+	if err := store.db.First(&corrected, "id = ?", requestLog.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if corrected.InputTokens != 10 || corrected.NormalInputTokens != 7 || corrected.OutputTokens != 5 || corrected.CachedTokens != 2 || corrected.CacheWriteTokens != 1 || corrected.EstimatedCost != 15 || corrected.UpstreamCost != 42 || corrected.UsageSource != "upstream" {
+		t.Fatalf("corrected request = %+v", corrected)
+	}
+	var stat TokenDailyStat
+	if err := store.db.First(&stat, "date = ? AND token_id = ?", now.Format(time.DateOnly), 7).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stat.RequestCount != 1 || stat.InputTokens != 10 || stat.OutputTokens != 5 || stat.EstimatedCost != 15 || stat.UpstreamCost != 42 || stat.AttemptCount != 2 {
+		t.Fatalf("rebuilt token statistics = %+v", stat)
+	}
+	if err := store.backfillRequestStatisticsFromFinalAttempts(); err != nil {
+		t.Fatal(err)
 	}
 }
 
 func TestDashboardFiltersSelectedDayRange(t *testing.T) {
 	store := newTestStore(t)
 	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
-	now := time.Now()
-	yesterday := now.AddDate(0, 0, -1)
+	today := eastEightStartOfDay(time.Now())
+	now := today.Add(12 * time.Hour).UTC()
+	yesterday := today.AddDate(0, 0, -1).Add(12 * time.Hour).UTC()
 	stats := []TokenDailyStat{
-		{Date: now.Format(time.DateOnly), TokenID: 1, RequestCount: 3, SuccessCount: 3},
-		{Date: yesterday.Format(time.DateOnly), TokenID: 1, RequestCount: 2, SuccessCount: 1},
+		{Date: eastEightDate(now), TokenID: 1, RequestCount: 3, SuccessCount: 3},
+		{Date: eastEightDate(yesterday), TokenID: 1, RequestCount: 2, SuccessCount: 1},
 	}
 	if err := store.db.Create(&stats).Error; err != nil {
 		t.Fatal(err)
@@ -741,6 +844,67 @@ func TestDashboardFiltersSelectedDayRange(t *testing.T) {
 	}
 	if _, err := NewManagementService(store).Dashboard(context.Background(), 4); err == nil {
 		t.Fatal("expected unsupported dashboard range to fail")
+	}
+}
+
+func TestEastEightDayQueriesStayAlignedAcrossViews(t *testing.T) {
+	store := newTestStore(t)
+	token, model, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	today := eastEightStartOfDay(time.Now())
+	startUTC := today.UTC()
+	endUTC := today.AddDate(0, 0, 1).UTC()
+	logs := []RelayRequestLog{
+		{ID: "before-east-eight-day", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "before", StatusCode: http.StatusOK, CreatedAt: startUTC.Add(-time.Second)},
+		{ID: "east-eight-day-start", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "start", StatusCode: http.StatusOK, CreatedAt: startUTC},
+		{ID: "east-eight-day-end", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "end", StatusCode: http.StatusOK, CreatedAt: endUTC.Add(-time.Microsecond)},
+		{ID: "after-east-eight-day", TokenID: token.ID, Endpoint: "responses", RequestedModel: model.Name, CodexSessionID: "after", StatusCode: http.StatusOK, CreatedAt: endUTC},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	management := NewManagementService(store)
+	dashboard, err := management.Dashboard(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queryFrom := today
+	queryTo := today.AddDate(0, 0, 1).Add(-time.Millisecond)
+	logPage, err := management.Logs(context.Background(), LogQuery{From: queryFrom, To: queryTo, Page: 1, PageSize: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionPage, err := management.SessionLogs(context.Background(), SessionLogQuery{From: queryFrom, To: queryTo, Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dashboard.Requests != 2 || logPage.Summary.RequestCount != 2 || sessionPage.Summary.RequestCount != 2 {
+		t.Fatalf("east-eight request counts: dashboard=%d logs=%d sessions=%d", dashboard.Requests, logPage.Summary.RequestCount, sessionPage.Summary.RequestCount)
+	}
+	if len(dashboard.Daily) != 1 || dashboard.Daily[0].Date != today.Format(time.DateOnly) || dashboard.Daily[0].Requests != 2 {
+		t.Fatalf("east-eight dashboard daily = %+v", dashboard.Daily)
+	}
+}
+
+func TestRebuildTokenDailyStatsGroupsByEastEightDate(t *testing.T) {
+	store := newTestStore(t)
+	logs := []RelayRequestLog{
+		{ID: "before-east-eight-midnight", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, CreatedAt: time.Date(2026, 7, 27, 15, 59, 59, 0, time.UTC)},
+		{ID: "after-east-eight-midnight", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, CreatedAt: time.Date(2026, 7, 27, 16, 0, 0, 0, time.UTC)},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := rebuildTokenDailyStats(store.db); err != nil {
+		t.Fatal(err)
+	}
+	var stats []TokenDailyStat
+	if err := store.db.Order("date ASC").Find(&stats).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(stats) != 2 || stats[0].Date != "2026-07-27" || stats[0].RequestCount != 1 || stats[1].Date != "2026-07-28" || stats[1].RequestCount != 1 {
+		t.Fatalf("east-eight daily stats = %+v", stats)
 	}
 }
 
@@ -1185,8 +1349,8 @@ func TestRouterPlanLoadsRecentModelSuccessRates(t *testing.T) {
 func TestRouterExpectationProbabilityIncludesEveryRoutingSignal(t *testing.T) {
 	router := &Router{random: func(int) int { return 0 }}
 	candidates := []RouteCandidate{
-		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 50, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentLatencyMS: 40, RecentCacheRate: 0.8, MetricsLoaded: true},
-		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 10, Weight: 100}, Cost: 100, RecentSuccessRate: 0.8, RecentAttemptCount: 10, RecentLatencyMS: 80, RecentCacheRate: 0.2, RecentRouteCount: 40, ConsecutiveRoutes: 8, MetricsLoaded: true},
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 50, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentLatencyMS: 40, RecentCacheHitRate: 0.8, RecentCacheSamples: 10, RecentCacheRate: 0.6, RecentCacheTokens: 1000, RecentRouteCount: 20, RecentRouteShare: 0.2, RouteSampleSize: 100, MetricsLoaded: true},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 10, Weight: 100}, Cost: 100, RecentSuccessRate: 0.8, RecentAttemptCount: 10, RecentLatencyMS: 80, RecentCacheHitRate: 0.2, RecentCacheSamples: 10, RecentCacheRate: 0.1, RecentCacheTokens: 1000, RecentRouteCount: 80, RecentRouteShare: 0.8, RouteSampleSize: 100, MetricsLoaded: true},
 	}
 	decision := router.orderCandidates(RoutingPriorityWeighted, candidates)
 	if decision == nil || decision.Mode != "probability" || len(decision.Candidates) != 2 {
@@ -1199,8 +1363,95 @@ func TestRouterExpectationProbabilityIncludesEveryRoutingSignal(t *testing.T) {
 	if math.Abs(first.Probability+second.Probability-1) > 0.000001 {
 		t.Fatalf("probability sum = %f", first.Probability+second.Probability)
 	}
-	if second.ConsecutiveRoutes != 8 || second.RecentRouteCount != 40 || second.CacheHitRate != 0.2 || second.SuccessRate != 0.8 {
+	if second.RecentRouteCount != 80 || second.RecentRouteShare != 0.8 || second.RouteSampleSize != 100 || second.CacheHitRate != 0.2 || second.CacheSampleCount != 10 || second.CacheRate != 0.1 || second.CacheTokenCount != 1000 || second.SuccessRate != 0.8 {
 		t.Fatalf("decision inputs = %+v", second)
+	}
+}
+
+func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now()
+	attempts := []RelayAttemptLog{
+		{RequestID: "target-a-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 100, CachedTokens: 50, LatencyMS: 20, CreatedAt: now.Add(-time.Minute)},
+		{RequestID: "target-b-cache-miss", ChannelID: 2, ChannelModelID: 22, InputTokens: 200, CachedTokens: 0, LatencyMS: 40, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "other-model", ChannelID: 3, ChannelModelID: 33, InputTokens: 100, CachedTokens: 100, LatencyMS: 10, CreatedAt: now.Add(-3 * time.Minute)},
+		{RequestID: "target-a-expired-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 300, CachedTokens: 300, LatencyMS: 90, CreatedAt: now.Add(-31 * time.Minute)},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	metrics, err := loadRecentRoutingMetrics(context.Background(), store.db, []uint64{11, 22, 44}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := metrics[11]
+	if first.RouteCount != 2 || first.RouteSampleSize != 4 || first.RouteShare != 0.5 || first.CacheHitRate != 1 || first.CacheSampleCount != 1 || first.CacheRate != 0.5 || first.CacheTokenCount != 100 || first.LatencyMS != 20 {
+		t.Fatalf("first routing metric = %+v", first)
+	}
+	second := metrics[22]
+	if second.RouteCount != 1 || second.RouteSampleSize != 4 || second.RouteShare != 0.25 || second.CacheHitRate != 0 || second.CacheSampleCount != 1 || second.CacheRate != 0 || second.CacheTokenCount != 200 || second.LatencyMS != 40 {
+		t.Fatalf("second routing metric = %+v", second)
+	}
+	empty := metrics[44]
+	if empty.RouteCount != 0 || empty.RouteSampleSize != 4 || empty.RouteShare != 0 {
+		t.Fatalf("empty routing metric = %+v", empty)
+	}
+}
+
+func TestRouterRecentRouteShareAndCacheHitOutweighPrice(t *testing.T) {
+	router := &Router{random: func(int) int { return 999_999 }}
+	candidates := []RouteCandidate{
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 10, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentCacheHitRate: 0.1, RecentCacheSamples: 10, RecentCacheRate: 0.1, RecentCacheTokens: 1000, RecentRouteShare: 0.9, RouteSampleSize: 100, MetricsLoaded: true},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 10, Weight: 100}, Cost: 1_000, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentCacheHitRate: 0.9, RecentCacheSamples: 10, RecentCacheRate: 0.9, RecentCacheTokens: 1000, RecentRouteShare: 0.1, RouteSampleSize: 100, MetricsLoaded: true},
+	}
+
+	decision := router.orderCandidates(RoutingPriorityWeighted, candidates)
+	probabilityByMapping := make(map[uint64]float64, len(decision.Candidates))
+	for _, candidate := range decision.Candidates {
+		probabilityByMapping[candidate.ChannelModelID] = candidate.Probability
+	}
+	if probabilityByMapping[2] <= probabilityByMapping[1] || candidates[0].Mapping.ID != 2 {
+		t.Fatalf("routing priorities were not applied: candidates = %+v, decision = %+v", candidates, decision.Candidates)
+	}
+}
+
+func TestRouterReservesExplorationProbabilityForColdStartCandidates(t *testing.T) {
+	router := &Router{random: func(int) int { return 999_999 }}
+	candidates := []RouteCandidate{
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 10, RecentSuccessRate: 1, RecentAttemptCount: 100, RecentLatencyMS: 10, RecentCacheHitRate: 1, RecentCacheSamples: 100, RecentCacheRate: 1, RecentCacheTokens: 10_000, RouteSampleSize: 100, MetricsLoaded: true},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 10, Weight: 1}, Cost: 10, RouteSampleSize: 100, MetricsLoaded: true},
+		{Channel: Channel{ID: 3}, Mapping: ChannelModel{ID: 3, Priority: 10, Weight: 1}, Cost: 10, RouteSampleSize: 100, MetricsLoaded: true},
+	}
+
+	decision := router.orderCandidates(RoutingPriorityWeighted, candidates)
+	probabilityByMapping := make(map[uint64]float64, len(decision.Candidates))
+	for _, candidate := range decision.Candidates {
+		probabilityByMapping[candidate.ChannelModelID] = candidate.Probability
+	}
+	if probabilityByMapping[2] < 0.10 || probabilityByMapping[3] < 0.10 {
+		t.Fatalf("cold-start probabilities = %+v", probabilityByMapping)
+	}
+	if math.Abs(probabilityByMapping[1]+probabilityByMapping[2]+probabilityByMapping[3]-1) > 0.000001 {
+		t.Fatalf("probability sum = %+v", probabilityByMapping)
+	}
+	if candidates[0].Mapping.ID != 3 {
+		t.Fatalf("cold-start exploration probability was not used for selection: %+v", candidates)
+	}
+}
+
+func TestRouterDoesNotExploreLowerPriorityColdStartCandidates(t *testing.T) {
+	router := &Router{random: func(int) int { return 0 }}
+	candidates := []RouteCandidate{
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 10, RecentSuccessRate: 1, RecentAttemptCount: 10, MetricsLoaded: true},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 9, Weight: 100}, Cost: 10, MetricsLoaded: true},
+	}
+
+	decision := router.orderCandidates(RoutingPriorityWeighted, candidates)
+	for _, candidate := range decision.Candidates {
+		if candidate.ChannelModelID == 2 && candidate.Probability != 0 {
+			t.Fatalf("lower-priority cold-start candidate received probability: %+v", decision.Candidates)
+		}
 	}
 }
 
@@ -1330,6 +1581,226 @@ func TestRelayLogMetadata(t *testing.T) {
 	}
 	if effort := requestReasoningEffort(map[string]any{"reasoning_effort": "medium"}); effort != "medium" {
 		t.Fatalf("top-level reasoning effort = %q", effort)
+	}
+}
+
+func TestCodexAuxiliaryRequestsMergeIntoMainSession(t *testing.T) {
+	store := newTestStore(t)
+	token := ClientToken{Name: "codex", KeyHash: hashSecret("sk-codex"), KeyPrefix: "sk-codex", Enabled: true, AllowAllModels: true, RPM: 60, MaxConcurrency: 10}
+	if err := store.db.Create(&token).Error; err != nil {
+		t.Fatal(err)
+	}
+	relay := newTestRelay(store)
+	requestStart := time.Now().Add(-12 * time.Second)
+	titleBody := []byte(`{
+		"model":"title-model","prompt_cache_key":"title-session","stream":true,
+		"text":{"format":{"type":"json_schema","name":"codex_output_schema","schema":{"type":"object","properties":{"title":{"type":"string"},"description":{"type":"string"}}}}},
+		"input":[{"role":"user","type":"message","content":[{"type":"input_text","text":"Generate a title. User prompt: investigate session grouping"}]}]
+	}`)
+	titlePayload, err := ParseRelayPayload(titleBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	titleResponse := []byte("data: {\"type\":\"response.output_text.done\",\"text\":\"{\\\"title\\\":\\\"Investigate session grouping\\\",\\\"description\\\":\\\"Merge Codex helper calls\\\"}\"}\n\n")
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "title-request", token: &token, endpoint: "responses", payload: titlePayload,
+		rawBody: titleBody, responseBody: titleResponse, startedAt: requestStart,
+	}, http.StatusOK, "")
+
+	mainBody := []byte(`{"model":"main-model","prompt_cache_key":"main-session","stream":true,"input":[{"role":"user","type":"message","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\ninvestigate session grouping"},{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/screenshot.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":"</image>"}]}]}`)
+	mainPayload, err := ParseRelayPayload(mainBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "main-request", token: &token, endpoint: "responses", payload: mainPayload,
+		rawBody: mainBody, startedAt: requestStart.Add(time.Second),
+	}, http.StatusOK, "")
+
+	guardianBody := []byte(`{"model":"guard-model","prompt_cache_key":"guardian:main-session","input":"authorize action"}`)
+	guardianPayload, err := ParseRelayPayload(guardianBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "guardian-request", token: &token, endpoint: "responses", payload: guardianPayload,
+		rawBody: guardianBody, startedAt: time.Now(),
+	}, http.StatusOK, "")
+
+	var logs []RelayRequestLog
+	if err := store.db.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 3 {
+		t.Fatalf("logs = %+v", logs)
+	}
+	for _, log := range logs {
+		if log.CodexSessionID != "main-session" {
+			t.Fatalf("log session identity = %+v", log)
+		}
+	}
+	if logs[0].CodexSessionSource != codexTitleSessionSource || logs[0].SessionName != "Investigate session grouping" {
+		t.Fatalf("title log = %+v", logs[0])
+	}
+	if logs[2].CodexSessionSource != codexGuardianSessionSource {
+		t.Fatalf("guardian log = %+v", logs[2])
+	}
+
+	var mainState RelaySessionState
+	if err := store.db.Where("token_id = ? AND session_id = ?", token.ID, "main-session").First(&mainState).Error; err != nil {
+		t.Fatal(err)
+	}
+	if mainState.Title != "Investigate session grouping" {
+		t.Fatalf("main state = %+v", mainState)
+	}
+	var oldStateCount int64
+	if err := store.db.Model(&RelaySessionState{}).Where("token_id = ? AND session_id = ?", token.ID, "title-session").Count(&oldStateCount).Error; err != nil || oldStateCount != 0 {
+		t.Fatalf("title state count = %d, %v", oldStateCount, err)
+	}
+	var guardianStateCount int64
+	if err := store.db.Model(&RelaySessionState{}).Where("token_id = ? AND session_id = ?", token.ID, "guardian:main-session").Count(&guardianStateCount).Error; err != nil || guardianStateCount != 0 {
+		t.Fatalf("guardian state count = %d, %v", guardianStateCount, err)
+	}
+
+	page, err := NewManagementService(store).SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].SessionID != "main-session" || page.Items[0].SessionName != "Investigate session grouping" || page.Items[0].RequestCount != 3 || page.Items[0].LatestModel != "main-model" {
+		t.Fatalf("merged session page = %+v", page)
+	}
+}
+
+func TestCodexTitleRequestDoesNotMergeWithDifferentPrompt(t *testing.T) {
+	store := newTestStore(t)
+	token := ClientToken{Name: "codex", KeyHash: hashSecret("sk-codex-negative"), KeyPrefix: "sk-codex", Enabled: true, AllowAllModels: true, RPM: 60, MaxConcurrency: 10}
+	if err := store.db.Create(&token).Error; err != nil {
+		t.Fatal(err)
+	}
+	relay := newTestRelay(store)
+	titleBody := []byte(`{
+		"model":"title-model","prompt_cache_key":"title-session","stream":true,
+		"text":{"format":{"type":"json_schema","name":"codex_output_schema","schema":{"properties":{"title":{},"description":{}}}}},
+		"input":[{"role":"user","content":"Generate a title. User prompt: first user request"}]
+	}`)
+	titlePayload, err := ParseRelayPayload(titleBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "different-title-request", token: &token, endpoint: "responses", payload: titlePayload,
+		rawBody: titleBody, responseBody: []byte(`{"output_text":"{\"title\":\"First title\"}"}`), startedAt: time.Now().Add(-time.Second),
+	}, http.StatusOK, "")
+
+	mainBody := []byte(`{"model":"main-model","prompt_cache_key":"main-session","input":[{"role":"user","content":"second user request"}]}`)
+	mainPayload, err := ParseRelayPayload(mainBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "different-main-request", token: &token, endpoint: "responses", payload: mainPayload,
+		rawBody: mainBody, startedAt: time.Now(),
+	}, http.StatusOK, "")
+
+	page, err := NewManagementService(store).SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 2 || len(page.Items) != 2 {
+		t.Fatalf("different prompts must remain separate: %+v", page)
+	}
+}
+
+func TestCodexTitleRequestMergesAfterAttachedMainRequestCompletes(t *testing.T) {
+	store := newTestStore(t)
+	token := ClientToken{Name: "codex", KeyHash: hashSecret("sk-codex-attached"), KeyPrefix: "sk-codex", Enabled: true, AllowAllModels: true, RPM: 60, MaxConcurrency: 10}
+	if err := store.db.Create(&token).Error; err != nil {
+		t.Fatal(err)
+	}
+	relay := newTestRelay(store)
+	startedAt := time.Now().Add(-2 * time.Second)
+	mainBody := []byte(`{
+		"model":"main-model","prompt_cache_key":"main-session","input":[{"role":"user","content":[
+			{"type":"input_text","text":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\nfix duplicate sessions"},
+			{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/screenshot.png\">"},
+			{"type":"input_image","image_url":"data:image/png;base64,AA=="},
+			{"type":"input_text","text":"</image>"}
+		]}]}`)
+	mainPayload, err := ParseRelayPayload(mainBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "attached-main-request", token: &token, endpoint: "responses", payload: mainPayload,
+		rawBody: mainBody, startedAt: startedAt,
+	}, http.StatusOK, "")
+
+	titleBody := []byte(`{
+		"model":"title-model","prompt_cache_key":"title-session","stream":true,
+		"text":{"format":{"type":"json_schema","name":"codex_output_schema","schema":{"properties":{"title":{},"description":{}}}}},
+		"input":[{"role":"user","content":"Generate a title. User prompt:\nfix duplicate sessions"}]
+	}`)
+	titlePayload, err := ParseRelayPayload(titleBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	relay.recordRequest(context.Background(), &relayExecution{
+		requestID: "following-title-request", token: &token, endpoint: "responses", payload: titlePayload,
+		rawBody: titleBody, responseBody: []byte(`{"output_text":"{\"title\":\"Fix duplicate sessions\"}"}`), startedAt: startedAt,
+	}, http.StatusOK, "")
+
+	page, err := NewManagementService(store).SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].SessionID != "main-session" || page.Items[0].SessionName != "Fix duplicate sessions" || page.Items[0].RequestCount != 2 {
+		t.Fatalf("merged attached session page = %+v", page)
+	}
+	var titleLog RelayRequestLog
+	if err := store.db.First(&titleLog, "id = ?", "following-title-request").Error; err != nil {
+		t.Fatal(err)
+	}
+	if titleLog.CodexSessionID != "main-session" || titleLog.CodexSessionSource != codexTitleSessionSource {
+		t.Fatalf("following title log = %+v", titleLog)
+	}
+}
+
+func TestBackfillCodexAuxiliarySessions(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	titleBody := []byte(`{"model":"title-model","prompt_cache_key":"old-title-session","text":{"format":{"type":"json_schema","name":"codex_output_schema","schema":{"properties":{"title":{},"description":{}}}}},"input":[{"role":"user","content":"User prompt: historical prompt"}]}`)
+	titleResponse := []byte("data: {\"type\":\"response.output_text.done\",\"text\":\"{\\\"title\\\":\\\"Historical generated title\\\"}\"}\n\n")
+	mainBody := []byte(`{"model":"main-model","prompt_cache_key":"old-main-session","input":[{"role":"user","content":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\nhistorical prompt <image name=[Image #1] path=\"/tmp/screenshot.png\"> </image>"}]}`)
+	logs := []RelayRequestLog{
+		{ID: "old-title-request", TokenID: 7, Endpoint: "responses", RequestedModel: "title-model", CodexSessionID: "old-title-session", CodexSessionSource: "prompt_cache_key", SessionName: "Generate a", RequestParametersJSON: `{"text_format":"json_schema"}`, RequestBody: compressStoredPayload(titleBody), ResponseBody: compressStoredPayload(titleResponse), StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, CreatedAt: now},
+		{ID: "old-main-request", TokenID: 7, Endpoint: "responses", RequestedModel: "main-model", CodexSessionID: "old-main-session", CodexSessionSource: "prompt_cache_key", SessionName: "historical", RequestBody: compressStoredPayload(mainBody), StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, DurationMS: 1000, CreatedAt: now.Add(10 * time.Second)},
+		{ID: "old-guardian-request", TokenID: 7, Endpoint: "responses", RequestedModel: "guard-model", CodexSessionID: "guardian:old-main-session", CodexSessionSource: "prompt_cache_key", StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, CreatedAt: now.Add(20 * time.Second)},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	states := []RelaySessionState{
+		{TokenID: 7, SessionID: "old-title-session", Title: "Generate a", CreatedAt: now, UpdatedAt: now},
+		{TokenID: 7, SessionID: "old-main-session", Title: "historical", CreatedAt: now, UpdatedAt: now},
+	}
+	if err := store.db.Create(&states).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&GatewayMigration{Name: "codex_auxiliary_sessions_v1", AppliedAt: now.Add(-time.Hour)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCodexAuxiliarySessions(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCodexAuxiliarySessions(); err != nil {
+		t.Fatal(err)
+	}
+	page, err := NewManagementService(store).SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 1 || len(page.Items) != 1 || page.Items[0].SessionID != "old-main-session" || page.Items[0].SessionName != "Historical generated title" || page.Items[0].RequestCount != 3 || page.Items[0].LatestModel != "main-model" {
+		t.Fatalf("backfilled sessions = %+v", page)
 	}
 }
 
@@ -1706,7 +2177,7 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if err := store.db.First(&requestLog).Error; err != nil {
 		t.Fatal(err)
 	}
-	if requestLog.AttemptCount != 2 || requestLog.InputTokens != 110 || requestLog.NormalInputTokens != 107 || requestLog.OutputTokens != 25 || requestLog.CachedTokens != 2 || requestLog.CacheWriteTokens != 1 || requestLog.SentTokens <= 0 || requestLog.EstimatedCost != 15 || requestLog.UpstreamCost != 42 || requestLog.CostSource != CostSourceUpstream {
+	if requestLog.AttemptCount != 2 || requestLog.InputTokens != 10 || requestLog.NormalInputTokens != 7 || requestLog.OutputTokens != 5 || requestLog.CachedTokens != 2 || requestLog.CacheWriteTokens != 1 || requestLog.SentTokens <= 0 || requestLog.EstimatedCost != 15 || requestLog.UpstreamCost != 42 || requestLog.CostSource != CostSourceUpstream {
 		t.Fatalf("request log = %+v", requestLog)
 	}
 	if requestLog.CodexSessionID != "codex-session-log" || requestLog.CodexSessionSource != "prompt_cache_key" || requestLog.TokenName != token.Name || requestLog.TokenKeyPrefix != token.KeyPrefix {
@@ -1725,6 +2196,9 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if len(attemptLogs) != 2 || attemptLogs[0].ChannelName == "" || attemptLogs[0].ChannelBaseURL == "" || attemptLogs[1].ChannelName == "" || attemptLogs[1].NormalInputTokens != 7 || attemptLogs[1].CacheWriteTokens != 1 || attemptLogs[0].SentTokens <= 0 || attemptLogs[1].SentTokens <= 0 || attemptLogs[0].EstimatedCost != 0 || attemptLogs[0].UpstreamCost != 0 || attemptLogs[0].CostSource != CostSourceFailedZero || attemptLogs[1].UpstreamCost != 42 || requestLog.SentTokens != attemptLogs[0].SentTokens+attemptLogs[1].SentTokens {
 		t.Fatalf("attempt channel snapshots = %+v", attemptLogs)
 	}
+	if attemptLogs[0].InputTokens != 100 || attemptLogs[0].OutputTokens != 20 || requestLog.InputTokens != attemptLogs[1].InputTokens || requestLog.OutputTokens != attemptLogs[1].OutputTokens {
+		t.Fatalf("request statistics must use final attempt only: request = %+v, attempts = %+v", requestLog, attemptLogs)
+	}
 	if attemptLogs[0].SelectionReason != SelectionReasonInitialRoute || attemptLogs[1].SelectionReason != SelectionReasonRetryableStatus || attemptLogs[1].SelectionDetail != "HTTP 500" || attemptLogs[1].PreviousChannelID != attemptLogs[0].ChannelID || attemptLogs[1].PreviousChannelName != attemptLogs[0].ChannelName {
 		t.Fatalf("attempt selection metadata = %+v", attemptLogs)
 	}
@@ -1736,7 +2210,7 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if err != nil || len(page.Items) != 1 || page.Items[0].RequestBody != "" || page.Items[0].ResponseBody != "" || page.Items[0].Attempts[0].RequestBody != "" {
 		t.Fatalf("lightweight log page = %+v, %v", page, err)
 	}
-	if page.Summary.RequestCount != 1 || page.Summary.SuccessCount != 1 || page.Summary.AttemptCount != 2 || page.Summary.InputTokens != 110 || page.Summary.OutputTokens != 25 || page.Summary.UpstreamCost != 42 {
+	if page.Summary.RequestCount != 1 || page.Summary.SuccessCount != 1 || page.Summary.AttemptCount != 2 || page.Summary.InputTokens != 10 || page.Summary.OutputTokens != 5 || page.Summary.UpstreamCost != 42 {
 		t.Fatalf("log page summary = %+v", page.Summary)
 	}
 	detail, err := management.LogDetail(context.Background(), requestLog.ID)
@@ -1747,7 +2221,7 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if err := store.db.First(&stat).Error; err != nil {
 		t.Fatal(err)
 	}
-	if stat.RequestCount != 1 || stat.SuccessCount != 1 || stat.InputTokens != 110 || stat.NormalInputTokens != 107 || stat.OutputTokens != 25 || stat.CachedTokens != 2 || stat.CacheWriteTokens != 1 || stat.SentTokens != requestLog.SentTokens || stat.EstimatedCost != 15 || stat.UpstreamCost != 42 || stat.AttemptCount != 2 {
+	if stat.RequestCount != 1 || stat.SuccessCount != 1 || stat.InputTokens != 10 || stat.NormalInputTokens != 7 || stat.OutputTokens != 5 || stat.CachedTokens != 2 || stat.CacheWriteTokens != 1 || stat.SentTokens != requestLog.SentTokens || stat.EstimatedCost != 15 || stat.UpstreamCost != 42 || stat.AttemptCount != 2 {
 		t.Fatalf("daily stat = %+v", stat)
 	}
 }

@@ -81,7 +81,7 @@ func (s *Store) backfillApplicationOutcomes() error {
 					if err := removeHistoricalSessionAffinity(db, row); err != nil {
 						return err
 					}
-					key := dailyOutcomeKey{date: row.CreatedAt.UTC().Format(time.DateOnly), tokenID: row.TokenID}
+					key := dailyOutcomeKey{date: eastEightDate(row.CreatedAt), tokenID: row.TokenID}
 					adjustment := adjustments[key]
 					adjustment.successes++
 					adjustment.estimatedCost += row.EstimatedCost

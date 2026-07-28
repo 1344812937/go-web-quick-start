@@ -1050,9 +1050,9 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	if days != 1 && days != 2 && days != 3 && days != 5 {
 		return nil, errors.New("统计时间范围仅支持 1、2、3 或 5 天")
 	}
-	now := time.Now()
-	startTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(days - 1))
-	endTime := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, 1)
+	today := eastEightStartOfDay(time.Now())
+	startTime := today.AddDate(0, 0, -(days - 1)).UTC()
+	endTime := today.AddDate(0, 0, 1).UTC()
 	summary := &DashboardSummary{Daily: []DashboardDaily{}, Channels: []DashboardBreakdown{}, Models: []DashboardBreakdown{}}
 	type totals struct {
 		Requests              int64
@@ -1101,7 +1101,7 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		summary.AverageDurationMS = float64(total.DurationMS) / float64(total.Requests)
 	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
-		Select("date(created_at) AS date, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
+		Select(sqliteEastEightCreatedDate+" AS date, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
 			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, "+
 			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, "+
 			"COALESCE(1.0 * SUM(first_token_ms) / NULLIF(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END),0),0) AS average_first_token_ms, "+
@@ -1109,7 +1109,7 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 			"COALESCE(1.0 * SUM(latency_ms) / NULLIF(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0),0) AS average_latency_ms, "+
 			"COALESCE(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0) AS latency_sample_count, "+
 			"COALESCE(1.0 * SUM(duration_ms) / NULLIF(COUNT(*),0),0) AS average_duration_ms, COUNT(*) AS duration_sample_count").
-		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("date(created_at)").Order("date asc").Scan(&summary.Daily).Error; err != nil {
+		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group(sqliteEastEightCreatedDate).Order("date asc").Scan(&summary.Daily).Error; err != nil {
 		return nil, err
 	}
 	dailyByDate := make(map[string]DashboardDaily, len(summary.Daily))
@@ -1118,17 +1118,19 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	}
 	summary.Daily = make([]DashboardDaily, 0, days)
 	for offset := days - 1; offset >= 0; offset-- {
-		date := now.AddDate(0, 0, -offset).Format(time.DateOnly)
+		date := today.AddDate(0, 0, -offset).Format(time.DateOnly)
 		daily, ok := dailyByDate[date]
 		if !ok {
 			daily = DashboardDaily{Date: date}
 		}
 		summary.Daily = append(summary.Daily, daily)
 	}
-	if err := s.store.db.WithContext(ctx).Table("relay_attempt_logs AS a").
-		Select("c.name AS name, COUNT(*) AS requests, COALESCE(SUM(a.estimated_cost),0) AS estimated_cost, COALESCE(SUM(a.upstream_cost),0) AS upstream_cost").
-		Joins("JOIN channels AS c ON c.id = a.channel_id").Where("a.created_at >= ? AND a.created_at < ?", startTime, endTime).
-		Group("c.name").Order("upstream_cost desc").Scan(&summary.Channels).Error; err != nil {
+	if err := s.store.db.WithContext(ctx).Table("relay_request_logs AS request").
+		Select("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道') AS name, COUNT(*) AS requests, COALESCE(SUM(request.estimated_cost),0) AS estimated_cost, COALESCE(SUM(request.upstream_cost),0) AS upstream_cost").
+		Joins("LEFT JOIN relay_attempt_logs AS final_attempt ON final_attempt.id = (SELECT a.id FROM relay_attempt_logs AS a WHERE a.request_id = request.id ORDER BY a.id DESC LIMIT 1)").
+		Joins("LEFT JOIN channels AS c ON c.id = final_attempt.channel_id").
+		Where("request.created_at >= ? AND request.created_at < ?", startTime, endTime).
+		Group("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道')").Order("upstream_cost desc").Scan(&summary.Channels).Error; err != nil {
 		return nil, err
 	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
@@ -1146,7 +1148,7 @@ func (s *ManagementService) Logs(ctx context.Context, query LogQuery) (*LogPage,
 	if query.PageSize < 1 || query.PageSize > 200 {
 		query.PageSize = 50
 	}
-	detailCutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	detailCutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	filteredLogs := func() *gorm.DB {
 		return applyLogFilters(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}), query, detailCutoff)
 	}
@@ -1189,13 +1191,13 @@ func applyLogFilters(db *gorm.DB, query LogQuery, detailCutoff time.Time) *gorm.
 		db = db.Where("token_id = ?", query.TokenID)
 	}
 	if query.ChannelID > 0 {
-		db = db.Where("EXISTS (SELECT 1 FROM relay_attempt_logs a WHERE a.request_id = relay_request_logs.id AND a.channel_id = ?)", query.ChannelID)
+		db = db.Where("(SELECT a.channel_id FROM relay_attempt_logs a WHERE a.request_id = relay_request_logs.id ORDER BY a.id DESC LIMIT 1) = ?", query.ChannelID)
 	}
 	if !query.From.IsZero() {
-		db = db.Where("created_at >= ?", query.From)
+		db = db.Where("created_at >= ?", utcQueryTime(query.From))
 	}
 	if !query.To.IsZero() {
-		db = db.Where("created_at <= ?", query.To)
+		db = db.Where("created_at <= ?", utcInclusiveMillisecondEnd(query.To))
 	}
 	return db
 }
@@ -1272,7 +1274,7 @@ func (s *ManagementService) LogDetail(ctx context.Context, requestID string) (*R
 	if requestID == "" {
 		return nil, errors.New("request id is required")
 	}
-	cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	cutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	var log RelayRequestLog
 	if err := s.store.db.WithContext(ctx).Where("id = ? AND created_at >= ?", requestID, cutoff).First(&log).Error; err != nil {
 		return nil, err

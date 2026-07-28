@@ -28,9 +28,13 @@ type RouteCandidate struct {
 	RecentSuccessCount int64
 	RecentAttemptCount int64
 	RecentLatencyMS    float64
+	RecentCacheHitRate float64
+	RecentCacheSamples int64
 	RecentCacheRate    float64
+	RecentCacheTokens  int64
 	RecentRouteCount   int64
-	ConsecutiveRoutes  int64
+	RecentRouteShare   float64
+	RouteSampleSize    int64
 	MetricsLoaded      bool
 }
 
@@ -45,8 +49,12 @@ type RouteDecisionCandidate struct {
 	SuccessRate        float64 `json:"successRate"`
 	LatencyMS          float64 `json:"latencyMs"`
 	CacheHitRate       float64 `json:"cacheHitRate"`
+	CacheSampleCount   int64   `json:"cacheSampleCount"`
+	CacheRate          float64 `json:"cacheRate"`
+	CacheTokenCount    int64   `json:"cacheTokenCount"`
 	RecentRouteCount   int64   `json:"recentRouteCount"`
-	ConsecutiveRoutes  int64   `json:"consecutiveRoutes"`
+	RecentRouteShare   float64 `json:"recentRouteShare"`
+	RouteSampleSize    int64   `json:"routeSampleSize"`
 	Expectation        float64 `json:"expectation"`
 	Probability        float64 `json:"probability"`
 	Selected           bool    `json:"selected"`
@@ -216,7 +224,7 @@ func (r *Router) sessionAffinity(ctx context.Context, tokenID uint64, modelID ui
 	var affinity SessionAffinity
 	err := r.store.db.WithContext(ctx).Where(
 		"token_id = ? AND model_id = ? AND session_hash = ? AND expires_at > ?",
-		tokenID, modelID, hashSecret(sessionKey), time.Now(),
+			tokenID, modelID, hashSecret(sessionKey), time.Now(),
 	).First(&affinity).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -298,9 +306,13 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 			RecentSuccessCount: metric.Successes,
 			RecentAttemptCount: metric.Attempts,
 			RecentLatencyMS:    routingMetric.LatencyMS,
+			RecentCacheHitRate: routingMetric.CacheHitRate,
+			RecentCacheSamples: routingMetric.CacheSampleCount,
 			RecentCacheRate:    routingMetric.CacheRate,
+			RecentCacheTokens:  routingMetric.CacheTokenCount,
 			RecentRouteCount:   routingMetric.RouteCount,
-			ConsecutiveRoutes:  routingMetric.ConsecutiveRoutes,
+			RecentRouteShare:   routingMetric.RouteShare,
+			RouteSampleSize:    routingMetric.RouteSampleSize,
 			MetricsLoaded:      true,
 		})
 	}

@@ -7,6 +7,21 @@ export interface LogDateRangeShortcut {
   value: () => LogDateRange
 }
 
+const eastEightOffsetMilliseconds = 8 * 60 * 60 * 1000
+
+function eastEightWallClock(value: Date): Date {
+  const shifted = new Date(value.getTime() + eastEightOffsetMilliseconds)
+  return new Date(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth(),
+    shifted.getUTCDate(),
+    shifted.getUTCHours(),
+    shifted.getUTCMinutes(),
+    shifted.getUTCSeconds(),
+    shifted.getUTCMilliseconds(),
+  )
+}
+
 function startOfDay(value: Date): Date {
   const result = new Date(value)
   result.setHours(0, 0, 0, 0)
@@ -20,7 +35,7 @@ function endOfDay(value: Date): Date {
 }
 
 function calendarRange(startDaysAgo: number, endDaysAgo = 0): LogDateRange {
-  const now = new Date()
+  const now = eastEightWallClock(new Date())
   const start = new Date(now)
   const end = new Date(now)
   start.setDate(start.getDate() - startDaysAgo)
@@ -29,18 +44,31 @@ function calendarRange(startDaysAgo: number, endDaysAgo = 0): LogDateRange {
 }
 
 function currentWeekRange(): LogDateRange {
-  const now = new Date()
+  const now = eastEightWallClock(new Date())
   const daysSinceMonday = (now.getDay() + 6) % 7
   return calendarRange(daysSinceMonday)
 }
 
 function currentMonthRange(): LogDateRange {
-  const now = new Date()
+  const now = eastEightWallClock(new Date())
   return [new Date(now.getFullYear(), now.getMonth(), 1), endOfDay(now)]
 }
 
 export function todayLogRange(): LogDateRange {
   return calendarRange(0)
+}
+
+export function toEastEightISOString(value: Date): string {
+  const utcMilliseconds = Date.UTC(
+    value.getFullYear(),
+    value.getMonth(),
+    value.getDate(),
+    value.getHours(),
+    value.getMinutes(),
+    value.getSeconds(),
+    value.getMilliseconds(),
+  ) - eastEightOffsetMilliseconds
+  return new Date(utcMilliseconds).toISOString()
 }
 
 export const logDateDefaultTimes: LogDateRange = [

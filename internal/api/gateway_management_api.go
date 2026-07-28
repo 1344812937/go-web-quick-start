@@ -35,6 +35,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 
 	admin.GET("/dashboard", a.dashboard)
 	admin.GET("/logs", a.logs)
+	admin.POST("/logs/clear-payloads", a.clearLogPayloads)
 	admin.GET("/logs/:requestId", a.logDetail)
 	admin.GET("/sessions", a.sessions)
 	admin.GET("/sessions/detail", a.sessionDetail)
@@ -342,9 +343,11 @@ func (a *GatewayManagementApi) logs(c *gin.Context) {
 	query.PageSize, _ = strconv.Atoi(c.Query("pageSize"))
 	if value := c.Query("from"); value != "" {
 		query.From, _ = time.Parse(time.RFC3339, value)
+		query.From = query.From.UTC()
 	}
 	if value := c.Query("to"); value != "" {
 		query.To, _ = time.Parse(time.RFC3339, value)
+		query.To = query.To.UTC()
 	}
 	item, err := a.management.Logs(c.Request.Context(), query)
 	if err != nil {
@@ -352,6 +355,15 @@ func (a *GatewayManagementApi) logs(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, common.S(item))
+}
+
+func (a *GatewayManagementApi) clearLogPayloads(c *gin.Context) {
+	result, err := a.management.ClearHistoricalLogPayloads(c.Request.Context())
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(result))
 }
 
 func (a *GatewayManagementApi) logDetail(c *gin.Context) {
@@ -374,9 +386,11 @@ func (a *GatewayManagementApi) sessions(c *gin.Context) {
 	query.PageSize, _ = strconv.Atoi(c.Query("pageSize"))
 	if value := c.Query("from"); value != "" {
 		query.From, _ = time.Parse(time.RFC3339, value)
+		query.From = query.From.UTC()
 	}
 	if value := c.Query("to"); value != "" {
 		query.To, _ = time.Parse(time.RFC3339, value)
+		query.To = query.To.UTC()
 	}
 	item, err := a.management.SessionLogs(c.Request.Context(), query)
 	if err != nil {

@@ -135,7 +135,7 @@ async function revokeToken(token: ClientToken) {
 }
 
 function formatDate(value: string | null): string {
-  return value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)) : '从未使用'
+  return value ? new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'short', timeZone: 'Asia/Shanghai' }).format(new Date(value)) : '从未使用'
 }
 
 function formatUSD(micros: number): string {

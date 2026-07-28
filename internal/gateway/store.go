@@ -85,7 +85,13 @@ func (s *Store) migrate() error {
 	if err := s.backfillApplicationOutcomes(); err != nil {
 		return err
 	}
+	if err := s.backfillRequestStatisticsFromFinalAttempts(); err != nil {
+		return err
+	}
 	if err := s.compressDetailedPayloads(); err != nil {
+		return err
+	}
+	if err := s.backfillCodexAuxiliarySessions(); err != nil {
 		return err
 	}
 	return s.reclaimSQLiteSpaceOnce()
@@ -228,7 +234,7 @@ func (s *Store) backfillRelayOutcomes() error {
 			Count   int64
 		}
 		var rows []canceledDaily
-		if err := db.Model(&RelayRequestLog{}).Select("date(created_at) AS date, token_id, COUNT(*) AS count").Where("outcome = ?", RelayOutcomeCanceled).Group("date(created_at), token_id").Scan(&rows).Error; err != nil {
+		if err := db.Model(&RelayRequestLog{}).Select(sqliteEastEightCreatedDate+" AS date, token_id, COUNT(*) AS count").Where("outcome = ?", RelayOutcomeCanceled).Group(sqliteEastEightCreatedDate + ", token_id").Scan(&rows).Error; err != nil {
 			return err
 		}
 		for _, row := range rows {
@@ -253,7 +259,7 @@ func (s *Store) backfillTokenDailyStats() error {
 		}
 		var stats []TokenDailyStat
 		if err := db.Model(&RelayRequestLog{}).Select(
-			"date(created_at) AS date, token_id, COUNT(*) AS request_count, " +
+			sqliteEastEightCreatedDate + " AS date, token_id, COUNT(*) AS request_count, " +
 				"SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
 				"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
 				"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, " +
@@ -264,7 +270,7 @@ func (s *Store) backfillTokenDailyStats() error {
 				"COALESCE(SUM(first_token_ms),0) AS first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_samples, " +
 				"COALESCE(SUM(latency_ms),0) AS latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_samples, " +
 				"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
-		).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
+		).Group(sqliteEastEightCreatedDate + ", token_id").Scan(&stats).Error; err != nil {
 			return err
 		}
 		if len(stats) > 0 {
@@ -294,28 +300,29 @@ func (s *Store) backfillCostFields() error {
 			return err
 		}
 
-		cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
-		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND outcome = ?", cutoff, RelayOutcomeFailed).Updates(map[string]any{
+		requestCutoff := time.Now().UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+		attemptCutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND outcome = ?", requestCutoff, RelayOutcomeFailed).Updates(map[string]any{
 			"estimated_cost": 0,
 			"upstream_cost":  0,
 			"cost_source":    CostSourceFailedZero,
 		}).Error; err != nil {
 			return err
 		}
-		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", cutoff).Updates(map[string]any{
+		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", requestCutoff).Updates(map[string]any{
 			"upstream_cost": gorm.Expr("estimated_cost"),
 			"cost_source":   CostSourceFallback,
 		}).Error; err != nil {
 			return err
 		}
-		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND outcome = ?", cutoff, RelayOutcomeFailed).Updates(map[string]any{
+		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND outcome = ?", attemptCutoff, RelayOutcomeFailed).Updates(map[string]any{
 			"estimated_cost": 0,
 			"upstream_cost":  0,
 			"cost_source":    CostSourceFailedZero,
 		}).Error; err != nil {
 			return err
 		}
-		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND success = ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", cutoff, true).Updates(map[string]any{
+		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND success = ? AND status_code BETWEEN 200 AND 299 AND cost_source = ''", attemptCutoff, true).Updates(map[string]any{
 			"upstream_cost": gorm.Expr("estimated_cost"),
 			"cost_source":   CostSourceFallback,
 		}).Error; err != nil {
@@ -323,7 +330,7 @@ func (s *Store) backfillCostFields() error {
 		}
 
 		var dates []string
-		if err := db.Model(&RelayRequestLog{}).Distinct("date(created_at)").Where("created_at >= ?", cutoff).Pluck("date(created_at)", &dates).Error; err != nil {
+		if err := db.Model(&RelayRequestLog{}).Distinct(sqliteEastEightCreatedDate).Where("created_at >= ?", requestCutoff).Pluck(sqliteEastEightCreatedDate, &dates).Error; err != nil {
 			return err
 		}
 		if len(dates) > 0 {
@@ -332,7 +339,7 @@ func (s *Store) backfillCostFields() error {
 			}
 			var stats []TokenDailyStat
 			if err := db.Model(&RelayRequestLog{}).Select(
-				"date(created_at) AS date, token_id, COUNT(*) AS request_count, "+
+				sqliteEastEightCreatedDate+" AS date, token_id, COUNT(*) AS request_count, "+
 					"SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, "+
 					"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, "+
 					"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, "+
@@ -342,7 +349,7 @@ func (s *Store) backfillCostFields() error {
 					"COALESCE(SUM(first_token_ms),0) AS first_token_ms, SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END) AS first_token_samples, "+
 					"COALESCE(SUM(latency_ms),0) AS latency_ms, SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END) AS latency_samples, "+
 					"COALESCE(SUM(duration_ms),0) AS duration_ms, COALESCE(SUM(attempt_count),0) AS attempt_count",
-			).Where("date(created_at) IN ?", dates).Group("date(created_at), token_id").Scan(&stats).Error; err != nil {
+			).Where(sqliteEastEightCreatedDate+" IN ?", dates).Group(sqliteEastEightCreatedDate + ", token_id").Scan(&stats).Error; err != nil {
 				return err
 			}
 			if len(stats) > 0 {
@@ -415,10 +422,11 @@ func (s *Store) cleanupExpired() {
 	_ = s.db.Where("expires_at < ?", now).Delete(&AdminSession{}).Error
 	_ = s.db.Where("expires_at < ?", now).Delete(&ResponseAffinity{}).Error
 	_ = s.db.Where("expires_at < ?", now).Delete(&SessionAffinity{}).Error
-	cutoff := now.Add(-DetailedLogRetentionDays * 24 * time.Hour)
-	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayAttemptLog{}).Error
-	_ = s.db.Where("created_at < ?", cutoff).Delete(&RelayRequestLog{}).Error
-	_ = s.db.Where("updated_at < ?", cutoff).Delete(&RelaySessionState{}).Error
+	detailCutoff := now.Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	requestCutoff := now.UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
+	_ = s.db.Where("created_at < ?", detailCutoff).Delete(&RelayAttemptLog{}).Error
+	_ = s.db.Where("created_at < ?", requestCutoff).Delete(&RelayRequestLog{}).Error
+	_ = s.db.Where("updated_at < ?", detailCutoff).Delete(&RelaySessionState{}).Error
 	s.checkpointSQLiteWAL()
 }
 

@@ -7,7 +7,7 @@ import SessionLogDrawer from '@/components/SessionLogDrawer.vue'
 import type { Channel, ClientToken, CodexSessionPage, CodexSessionSummary, GatewayModel, LogAggregateSummary } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
-import { logDateDefaultTimes, logDateRangeShortcuts, todayLogRange } from '@/utils/logDateRanges'
+import { logDateDefaultTimes, logDateRangeShortcuts, toEastEightISOString, todayLogRange } from '@/utils/logDateRanges'
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -23,7 +23,7 @@ const drawerOpen = ref(false)
 const selectedSession = ref<CodexSessionSummary | null>(null)
 
 function formatDate(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
+  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'Asia/Shanghai' }).format(new Date(value))
 }
 
 function formatPercent(value: number): string {
@@ -81,8 +81,8 @@ async function loadSessions() {
   if (filters.channelId) query.set('channelId', filters.channelId)
   if (filters.tokenId) query.set('tokenId', filters.tokenId)
   if (filters.range?.length === 2) {
-    query.set('from', filters.range[0].toISOString())
-    query.set('to', filters.range[1].toISOString())
+    query.set('from', toEastEightISOString(filters.range[0]))
+    query.set('to', toEastEightISOString(filters.range[1]))
   }
   try {
     const page = await request<CodexSessionPage>(`/admin/gateway/sessions?${query}`)
@@ -161,9 +161,9 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="page-stack">
+  <div class="page-stack log-page">
     <header class="page-heading">
-      <div><h1>会话日志</h1><p>默认显示今天，可查询 5 天内的会话、渠道、模型、令牌与用量</p></div>
+      <div><h1>会话日志</h1><p>默认按东八区显示今天，可查询 5 天内的会话、渠道、模型、令牌与用量</p></div>
       <div class="page-actions"><el-tooltip content="刷新会话日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新会话日志" @click="loadSessions" /></el-tooltip></div>
     </header>
 
@@ -211,7 +211,7 @@ onMounted(async () => {
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="sessions" :row-key="sessionRowKey" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
+      <el-table v-loading="loading" :data="sessions" :row-key="sessionRowKey" max-height="var(--log-table-max-height)" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
         <el-table-column label="会话" min-width="240">
           <template #default="scope">
             <div class="session-identity">
@@ -252,6 +252,7 @@ onMounted(async () => {
 </template>
 
 <style scoped>
+.log-page { --log-table-max-height: max(240px, calc(100dvh - 520px)); }
 .session-identity { display: grid; min-width: 0; gap: 5px; }
 .session-identity > div, .channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .session-identity strong, .channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -265,4 +266,23 @@ onMounted(async () => {
 .session-tokens small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
 .session-tokens strong { color: var(--rose-text); font-size: 12px; }
 .session-sent { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
+@media (min-width: 961px) {
+  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; }
+  .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .log-page .metric-cell { min-height: 80px; padding-block: 10px; border-right: 1px solid var(--rose-border); border-bottom: 0; }
+  .log-page .metric-cell:nth-child(3) { border-right: 1px solid var(--rose-border); }
+  .log-page .metric-cell:nth-child(-n + 3) { border-bottom: 0; }
+  .log-page .metric-cell:last-child { border-right: 0; }
+  .log-page .metric-cell strong { margin-top: 5px; font-size: 17px; }
+  .log-page .metric-cell small { margin-top: 3px; }
+  .table-panel { display: flex; flex-direction: column; min-height: 0; }
+  .table-panel > .el-table { flex: 1; min-height: 0; }
+  .table-pagination { flex: none; }
+}
+@media (min-width: 961px) and (max-width: 1360px) {
+  .log-page .filter-bar { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .log-page .filter-bar .el-date-editor { grid-column: span 3; }
+}
+@media (max-width: 1360px) { .log-page { --log-table-max-height: max(240px, calc(100dvh - 680px)); } }
+@media (max-width: 720px) { .log-page { --log-table-max-height: 420px; } }
 </style>

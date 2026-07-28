@@ -3,7 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { Check, Link, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import projectMeta from '@/config/project.generated.js'
-import type { ApplicationSettings } from '@/types/gateway'
+import type { ApplicationSettings, PayloadLogDetail } from '@/types/gateway'
 import { request } from '@/utils/api'
 
 const repositoryUrl = 'https://github.com/1344812937/go-web-quick-start'
@@ -11,6 +11,16 @@ const buildBranch = __BUILD_BRANCH__
 const loading = ref(true)
 const saving = ref(false)
 const errorMessage = ref('')
+const payloadLogDetailOptions: Array<{ label: string; value: PayloadLogDetail }> = [
+  { label: '默认', value: 'default' },
+  { label: '摘要', value: 'summary' },
+  { label: '无', value: 'none' },
+]
+const payloadLogDetailDescriptions: Record<PayloadLogDetail, string> = {
+  default: '沿用当前记录规则，正文按会话去重并以单段 4 MiB 为上限。',
+  summary: '保留 JSON 结构、短文本预览及首尾数组项，单段不超过 64 KiB。',
+  none: '不保存请求参数和响应正文，仅保留状态、用量、耗时与路由结果。',
+}
 const form = reactive<ApplicationSettings>({
   webConfig: { host: '', port: '' },
   nodeConfig: { sharedToken: '' },
@@ -21,6 +31,7 @@ const form = reactive<ApplicationSettings>({
     streamIdleTimeoutSeconds: 300,
     sessionTTLHours: 12,
     secureCookie: false,
+    payloadLogDetail: 'default',
   },
 })
 
@@ -90,6 +101,12 @@ onMounted(loadSettings)
         <div class="settings-fields settings-grid">
           <el-form-item label="管理会话时长（小时）"><el-input-number v-model="form.gatewayConfig.sessionTTLHours" :min="1" :max="168" controls-position="right" /></el-form-item>
           <el-form-item label="Cookie 安全属性"><el-switch v-model="form.gatewayConfig.secureCookie" active-text="仅 HTTPS 发送" inactive-text="允许本地 HTTP" /></el-form-item>
+          <el-form-item label="调用日志参数 / 返回记录细节" class="payload-detail-field">
+            <div class="payload-detail-control">
+              <el-segmented v-model="form.gatewayConfig.payloadLogDetail" :options="payloadLogDetailOptions" aria-label="调用日志参数和返回记录细节" />
+              <small>{{ payloadLogDetailDescriptions[form.gatewayConfig.payloadLogDetail] }} 保存后立即作用于新进入的调用。</small>
+            </div>
+          </el-form-item>
         </div>
       </section>
 
@@ -119,6 +136,9 @@ onMounted(loadSettings)
 .settings-fields { padding: 20px 22px 8px; }
 .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 18px; }
 .settings-actions { display: flex; justify-content: flex-end; position: sticky; bottom: 12px; padding: 10px; border: 1px solid var(--rose-border); background: var(--rose-surface); }
+.payload-detail-field { grid-column: 1 / -1; }
+.payload-detail-control { display: grid; justify-items: start; gap: 8px; }
+.payload-detail-control small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
 .project-section { margin-top: 16px; }
 .project-metadata { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 0; padding: 20px 22px; }
 .project-metadata > div { min-width: 0; }

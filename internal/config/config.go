@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/1344812937/go-web-quick-start/internal/projectmeta"
@@ -21,8 +22,11 @@ var log = until.Log
 var configPath = filepath.Join("./", "config", "config.toml")
 
 const (
-	DefaultWebHost = "0.0.0.0"
-	DefaultWebPort = "8888"
+	DefaultWebHost          = "0.0.0.0"
+	DefaultWebPort          = "8888"
+	PayloadLogDetailDefault = "default"
+	PayloadLogDetailSummary = "summary"
+	PayloadLogDetailNone    = "none"
 )
 
 type ApplicationConfigManager struct {
@@ -63,6 +67,11 @@ func (acm *ApplicationConfigManager) Load() {
 	if err := toml.Unmarshal(content, &cfg); err != nil {
 		panic("解析配置文件失败")
 	}
+	payloadLogDetail, err := normalizePayloadLogDetail(cfg.GatewayConfig.PayloadLogDetail)
+	if err != nil {
+		panic(err)
+	}
+	cfg.GatewayConfig.PayloadLogDetail = payloadLogDetail
 
 	guidePlan, err := buildStartupGuidePlan(firstRun, presence, &cfg)
 	if err != nil {
@@ -114,26 +123,56 @@ type NodeConfig struct {
 }
 
 type GatewayConfig struct {
-	MaxAttempts                  int  `toml:"max_attempts" json:"maxAttempts" default:"3"`
-	RequestBodyLimitMB           int  `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
-	ResponseHeaderTimeoutSeconds int  `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
-	StreamIdleTimeoutSeconds     int  `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
-	SessionTTLHours              int  `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
-	SecureCookie                 bool `toml:"secure_cookie" json:"secureCookie" default:"false"`
+	MaxAttempts                  int    `toml:"max_attempts" json:"maxAttempts" default:"3"`
+	RequestBodyLimitMB           int    `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
+	ResponseHeaderTimeoutSeconds int    `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
+	StreamIdleTimeoutSeconds     int    `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
+	SessionTTLHours              int    `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
+	SecureCookie                 bool   `toml:"secure_cookie" json:"secureCookie" default:"false"`
+	PayloadLogDetail             string `toml:"payload_log_detail" json:"payloadLogDetail" default:"default"`
 }
 
 func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 	if cfg == nil {
 		return errors.New("配置不能为空")
 	}
-	if err := writeConfigFile(configPath, cfg); err != nil {
+	configCopy := *cfg
+	payloadLogDetail, err := normalizePayloadLogDetail(configCopy.GatewayConfig.PayloadLogDetail)
+	if err != nil {
 		return err
 	}
-	configCopy := *cfg
+	configCopy.GatewayConfig.PayloadLogDetail = payloadLogDetail
+	if err := writeConfigFile(configPath, &configCopy); err != nil {
+		return err
+	}
 	acm.mu.Lock()
 	acm.config = &configCopy
 	acm.mu.Unlock()
 	return nil
+}
+
+func normalizePayloadLogDetail(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return PayloadLogDetailDefault, nil
+	}
+	switch value {
+	case PayloadLogDetailDefault, PayloadLogDetailSummary, PayloadLogDetailNone:
+		return value, nil
+	default:
+		return "", fmt.Errorf("调用日志记录细节无效: %s", value)
+	}
+}
+
+func EffectivePayloadLogDetail(cfg *ApplicationConfig) string {
+	if cfg == nil {
+		return PayloadLogDetailDefault
+	}
+	value, err := normalizePayloadLogDetail(cfg.GatewayConfig.PayloadLogDetail)
+	if err != nil {
+		return PayloadLogDetailDefault
+	}
+	return value
 }
 
 func generateSharedToken() (string, error) {

@@ -127,7 +127,11 @@ type RelayRequestLog struct {
 	CodexSessionID        string    `gorm:"size:512;index" json:"codexSessionId"`
 	CodexSessionSource    string    `gorm:"size:48;index" json:"codexSessionSource"`
 	SessionName           string    `gorm:"size:80;index" json:"sessionName"`
+	CodexPromptHash       string    `gorm:"size:64;index" json:"-"`
+	CodexTitleRequest     bool      `gorm:"not null;default:false" json:"-"`
+	CodexGeneratedTitle   string    `gorm:"size:80" json:"-"`
 	RequestParametersJSON string    `gorm:"type:text" json:"-"`
+	PayloadLogDetail      string    `gorm:"size:16;not null;default:default" json:"payloadLogDetail"`
 	RequestBody           string    `gorm:"type:text" json:"requestBody"`
 	RequestBodyTruncated  bool      `gorm:"not null;default:false" json:"requestBodyTruncated"`
 	ResponseBody          string    `gorm:"type:text" json:"responseBody"`
@@ -154,8 +158,16 @@ type RelayRequestLog struct {
 }
 
 func (log *RelayRequestLog) BeforeCreate(_ *gorm.DB) error {
+	if log.CreatedAt.IsZero() {
+		log.CreatedAt = time.Now().UTC()
+	} else {
+		log.CreatedAt = log.CreatedAt.UTC()
+	}
 	if log.Outcome == "" {
 		log.Outcome = relayRequestOutcome(log.StatusCode, log.ErrorCode)
+	}
+	if log.PayloadLogDetail == "" {
+		log.PayloadLogDetail = "default"
 	}
 	return nil
 }
@@ -193,6 +205,7 @@ type RelayAttemptLog struct {
 	// RouteDecisionJSON preserves the candidate scores and probabilities used for the initial route.
 	RouteDecisionJSON     string         `gorm:"type:text" json:"-"`
 	RouteDecision         *RouteDecision `gorm:"-" json:"routeDecision,omitempty"`
+	PayloadLogDetail      string         `gorm:"size:16;not null;default:default" json:"payloadLogDetail"`
 	RequestBody           string         `gorm:"type:text" json:"requestBody"`
 	RequestBodyTruncated  bool           `gorm:"not null;default:false" json:"requestBodyTruncated"`
 	ResponseBody          string         `gorm:"type:text" json:"responseBody"`
@@ -218,6 +231,9 @@ type RelayAttemptLog struct {
 }
 
 func (log *RelayAttemptLog) BeforeCreate(_ *gorm.DB) error {
+	if log.PayloadLogDetail == "" {
+		log.PayloadLogDetail = "default"
+	}
 	if log.Outcome == "" || log.Outcome == RelayOutcomeFailed && log.Success {
 		if log.Success {
 			log.Outcome = RelayOutcomeSuccess
