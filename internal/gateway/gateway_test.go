@@ -500,6 +500,75 @@ func TestBackfillCostFieldsZerosRecentFailuresAndPreservesOlderAggregates(t *tes
 	}
 }
 
+func TestBackfillRelayOutcomesSeparatesCanceledRequests(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	requests := []RelayRequestLog{
+		{ID: "outcome-success", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK, CreatedAt: now},
+		{ID: "outcome-canceled", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", StatusCode: statusClientClosedRequest, ErrorCode: "request_canceled", CreatedAt: now},
+		{ID: "outcome-failed", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusBadGateway, CreatedAt: now},
+	}
+	if err := store.db.Create(&requests).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempts := []RelayAttemptLog{
+		{RequestID: requests[0].ID, ChannelID: 1, ChannelModelID: 1, UpstreamModel: "model-a", StatusCode: http.StatusOK, Success: true, CreatedAt: now},
+		{RequestID: requests[1].ID, ChannelID: 1, ChannelModelID: 1, UpstreamModel: "model-a", StatusCode: http.StatusOK, Success: false, CreatedAt: now},
+		{RequestID: requests[2].ID, ChannelID: 1, ChannelModelID: 1, UpstreamModel: "model-a", StatusCode: http.StatusBadGateway, Success: false, CreatedAt: now},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Model(&RelayRequestLog{}).Where("id IN ?", []string{requests[0].ID, requests[1].ID}).Update("outcome", RelayOutcomeFailed).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Model(&RelayAttemptLog{}).Where("request_id IN ?", []string{requests[0].ID, requests[1].ID}).Updates(map[string]any{"outcome": RelayOutcomeFailed}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&TokenDailyStat{Date: now.Format(time.DateOnly), TokenID: 1, RequestCount: 3, SuccessCount: 1}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Delete(&GatewayMigration{}, "name = ?", "relay_outcomes_v1").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillRelayOutcomes(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs []RelayRequestLog
+	if err := store.db.Order("id").Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	outcomes := make(map[string]string, len(logs))
+	for _, log := range logs {
+		outcomes[log.ID] = log.Outcome
+	}
+	if outcomes["outcome-success"] != RelayOutcomeSuccess || outcomes["outcome-canceled"] != RelayOutcomeCanceled || outcomes["outcome-failed"] != RelayOutcomeFailed {
+		t.Fatalf("request outcomes = %+v", outcomes)
+	}
+	var canceledAttempt RelayAttemptLog
+	if err := store.db.Where("request_id = ?", "outcome-canceled").First(&canceledAttempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if canceledAttempt.Outcome != RelayOutcomeCanceled || canceledAttempt.Success {
+		t.Fatalf("canceled attempt = %+v", canceledAttempt)
+	}
+	var stat TokenDailyStat
+	if err := store.db.Where("date = ? AND token_id = ?", now.Format(time.DateOnly), 1).First(&stat).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stat.CanceledCount != 1 {
+		t.Fatalf("canceled daily count = %d", stat.CanceledCount)
+	}
+	summary, err := aggregateLogSummary(store.db.Model(&RelayRequestLog{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.RequestCount != 3 || summary.SuccessCount != 1 || summary.CanceledCount != 1 || summary.SuccessRate != 0.5 {
+		t.Fatalf("outcome summary = %+v", summary)
+	}
+}
+
 func TestCleanupExpiredKeepsOnlyFiveDaysOfDetails(t *testing.T) {
 	store := newTestStore(t)
 	oldCreatedAt := time.Now().Add(-(DetailedLogRetentionDays*24*time.Hour + time.Hour))
@@ -540,8 +609,9 @@ func TestCleanupExpiredKeepsOnlyFiveDaysOfDetails(t *testing.T) {
 func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	store := newTestStore(t)
 	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	now := time.Now()
 	stat := TokenDailyStat{
-		Date: "2026-07-20", TokenID: 1, RequestCount: 8, SuccessCount: 6,
+		Date: now.Format(time.DateOnly), TokenID: 1, RequestCount: 8, SuccessCount: 6,
 		InputTokens: 100, OutputTokens: 40, EstimatedCost: 900, UpstreamCost: 700,
 		FirstTokenMS: 300, FirstTokenSamples: 3, LatencyMS: 400, LatencySamples: 4, DurationMS: 1600,
 	}
@@ -550,19 +620,19 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	}
 	requestLog := RelayRequestLog{
 		ID: "detail-request", TokenID: 1, Endpoint: "responses", RequestedModel: "public-model",
-		StatusCode: http.StatusOK, InputTokens: 10, OutputTokens: 2, EstimatedCost: 50, UpstreamCost: 30, CreatedAt: time.Now(),
+		StatusCode: http.StatusOK, InputTokens: 10, OutputTokens: 2, EstimatedCost: 50, UpstreamCost: 30, CreatedAt: now,
 	}
 	if err := store.db.Create(&requestLog).Error; err != nil {
 		t.Fatal(err)
 	}
 	attemptLog := RelayAttemptLog{
 		RequestID: requestLog.ID, ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID,
-		UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusOK, EstimatedCost: 50, UpstreamCost: 30, Success: true, CreatedAt: time.Now(),
+		UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusOK, EstimatedCost: 50, UpstreamCost: 30, Success: true, CreatedAt: now,
 	}
 	if err := store.db.Create(&attemptLog).Error; err != nil {
 		t.Fatal(err)
 	}
-	summary, err := NewManagementService(store).Dashboard(context.Background())
+	summary, err := NewManagementService(store).Dashboard(context.Background(), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,6 +641,55 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	}
 	if len(summary.Channels) != 1 || summary.Channels[0].Requests != 1 || summary.Channels[0].UpstreamCost != 30 || len(summary.Models) != 1 || summary.Models[0].Requests != 1 || summary.Models[0].UpstreamCost != 30 {
 		t.Fatalf("dashboard breakdowns = channels %+v models %+v", summary.Channels, summary.Models)
+	}
+	if len(summary.Daily) != 1 || summary.Daily[0].Date != now.Format(time.DateOnly) || summary.Daily[0].Requests != 8 {
+		t.Fatalf("dashboard daily = %+v", summary.Daily)
+	}
+}
+
+func TestDashboardFiltersSelectedDayRange(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	now := time.Now()
+	yesterday := now.AddDate(0, 0, -1)
+	stats := []TokenDailyStat{
+		{Date: now.Format(time.DateOnly), TokenID: 1, RequestCount: 3, SuccessCount: 3},
+		{Date: yesterday.Format(time.DateOnly), TokenID: 1, RequestCount: 2, SuccessCount: 1},
+	}
+	if err := store.db.Create(&stats).Error; err != nil {
+		t.Fatal(err)
+	}
+	requests := []RelayRequestLog{
+		{ID: "today", TokenID: 1, Endpoint: "responses", RequestedModel: "public-model", StatusCode: http.StatusOK, CreatedAt: now},
+		{ID: "yesterday", TokenID: 1, Endpoint: "responses", RequestedModel: "public-model", StatusCode: http.StatusOK, CreatedAt: yesterday},
+	}
+	if err := store.db.Create(&requests).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempts := []RelayAttemptLog{
+		{RequestID: requests[0].ID, ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusOK, Success: true, CreatedAt: now},
+		{RequestID: requests[1].ID, ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel, StatusCode: http.StatusOK, Success: true, CreatedAt: yesterday},
+	}
+	if err := store.db.Create(&attempts).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	current, err := NewManagementService(store).Dashboard(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Requests != 3 || len(current.Daily) != 1 || len(current.Channels) != 1 || current.Channels[0].Requests != 1 || len(current.Models) != 1 || current.Models[0].Requests != 1 {
+		t.Fatalf("current dashboard = %+v", current)
+	}
+	recent, err := NewManagementService(store).Dashboard(context.Background(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recent.Requests != 5 || recent.SuccessRate != 0.8 || len(recent.Daily) != 2 || len(recent.Channels) != 1 || recent.Channels[0].Requests != 2 || len(recent.Models) != 1 || recent.Models[0].Requests != 2 {
+		t.Fatalf("two-day dashboard = %+v", recent)
+	}
+	if _, err := NewManagementService(store).Dashboard(context.Background(), 4); err == nil {
+		t.Fatal("expected unsupported dashboard range to fail")
 	}
 }
 
@@ -1119,6 +1238,21 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	}
 }
 
+func TestRelayLogMetadata(t *testing.T) {
+	if path := relayAPIPath("https://provider.example/api/v1", "responses"); path != "/v1/responses" {
+		t.Fatalf("responses API path = %q", path)
+	}
+	if path := relayAPIPath("", "chat"); path != "/v1/chat/completions" {
+		t.Fatalf("chat API path = %q", path)
+	}
+	if effort := requestReasoningEffort(map[string]any{"reasoning": map[string]any{"effort": "high"}}); effort != "high" {
+		t.Fatalf("nested reasoning effort = %q", effort)
+	}
+	if effort := requestReasoningEffort(map[string]any{"reasoning_effort": "medium"}); effort != "medium" {
+		t.Fatalf("top-level reasoning effort = %q", effort)
+	}
+}
+
 func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	store := newTestStore(t)
 	token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
@@ -1198,6 +1332,9 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	reasoning, ok := detail.Requests[0].RequestParameters["reasoning"].(map[string]any)
 	if !ok || reasoning["effort"] != "high" {
 		t.Fatalf("detail parameters = %#v", detail.Requests[0].RequestParameters)
+	}
+	if detail.Requests[0].ReasoningEffort != "high" || detail.Requests[0].APIPath != "/v1/responses" || detail.Requests[0].Attempts[0].APIPath != "/v1/responses" {
+		t.Fatalf("detail request metadata = %+v", detail.Requests[0])
 	}
 	successDetail, err := management.SessionLogDetail(context.Background(), SessionDetailQuery{SessionID: "codex-session", TokenID: token.ID, Status: "success", Page: 1, PageSize: 25})
 	if err != nil || successDetail.RequestTotal != 1 || len(successDetail.Requests) != 1 || successDetail.Requests[0].ID != "session-request-1" || successDetail.Summary.RequestCount != 2 {
@@ -1404,6 +1541,33 @@ func TestCircuitOpensAfterThreeFailuresAndRecovers(t *testing.T) {
 	}
 	if channel.ConsecutiveFailures != 0 || channel.CircuitOpenUntil != nil || channel.LatencyEWMA != 42 {
 		t.Fatalf("recovered channel = %+v", channel)
+	}
+}
+
+func TestResetChannelCircuitClearsFailureState(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	openUntil := time.Now().Add(time.Minute)
+	if err := store.db.Model(&Channel{}).Where("id = ?", channels[0].ID).Updates(map[string]any{
+		"consecutive_failures": 4,
+		"circuit_open_until":   openUntil,
+		"last_error":           "insufficient balance",
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	management := NewManagementService(store)
+	if err := management.ResetChannelCircuit(context.Background(), channels[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	var channel Channel
+	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConsecutiveFailures != 0 || channel.CircuitOpenUntil != nil || channel.LastError != "" {
+		t.Fatalf("reset channel = %+v", channel)
+	}
+	if err := management.ResetChannelCircuit(context.Background(), channel.ID+1000); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("missing channel error = %v", err)
 	}
 }
 
@@ -2151,6 +2315,80 @@ func TestSSEClientDisconnectDoesNotOpenCircuit(t *testing.T) {
 	if requestLog.StatusCode != statusClientClosedRequest || requestLog.ErrorCode != "request_canceled" {
 		t.Fatalf("request log = %+v", requestLog)
 	}
+	if requestLog.Outcome != RelayOutcomeCanceled || requestLog.CostSource == CostSourceFailedZero {
+		t.Fatalf("canceled request outcome/cost = %+v", requestLog)
+	}
+	var attemptLog RelayAttemptLog
+	if err := store.db.First(&attemptLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attemptLog.Outcome != RelayOutcomeCanceled || attemptLog.Success || attemptLog.CostSource == CostSourceFailedZero {
+		t.Fatalf("canceled attempt = %+v", attemptLog)
+	}
+}
+
+func TestSSEResponseCompletedRemainsSuccessfulWhenUpstreamKeepsConnectionOpen(t *testing.T) {
+	store := newTestStore(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_completed\",\"status\":\"completed\",\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n"))
+		writer.(http.Flusher).Flush()
+		<-request.Context().Done()
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, http.Header{}, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if !strings.Contains(recorder.Body.String(), "response.completed") {
+		t.Fatalf("response body = %s", recorder.Body.String())
+	}
+	var requestLog RelayRequestLog
+	if err := store.db.First(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestLog.StatusCode != http.StatusOK || requestLog.Outcome != RelayOutcomeSuccess || requestLog.ErrorCode != "" {
+		t.Fatalf("completed request = %+v", requestLog)
+	}
+	var attemptLog RelayAttemptLog
+	if err := store.db.First(&attemptLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !attemptLog.Success || attemptLog.Outcome != RelayOutcomeSuccess {
+		t.Fatalf("completed attempt = %+v", attemptLog)
+	}
+}
+
+func TestSSEEOFBeforeTerminalEventIsInterrupted(t *testing.T) {
+	store := newTestStore(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n"))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicErr := newTestRelay(store).Relay(context.Background(), httptest.NewRecorder(), http.Header{}, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	var requestLog RelayRequestLog
+	if err := store.db.First(&requestLog).Error; err != nil {
+		t.Fatal(err)
+	}
+	if requestLog.StatusCode != upstreamApplicationErrorStatus || requestLog.Outcome != RelayOutcomeFailed || requestLog.ErrorCode != "stream_interrupted" {
+		t.Fatalf("interrupted request = %+v", requestLog)
+	}
 }
 
 func TestRelayRetriesBeforeFirstSSEEvent(t *testing.T) {
@@ -2222,6 +2460,149 @@ func TestRelayRetriesHTTP200ApplicationError(t *testing.T) {
 	}
 	if requestLog.StatusCode != http.StatusOK || requestLog.AttemptCount != 2 || !strings.Contains(requestLog.ResponseBody, `"status":"completed"`) {
 		t.Fatalf("request log = %+v", requestLog)
+	}
+}
+
+func TestRelayCircuitsBalanceFailureAndSwitchesChannel(t *testing.T) {
+	store := newTestStore(t)
+	var firstCalls atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		firstCalls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"error":{"message":"预扣费额度失败, 用户剩余额度: ¥0.033256, 需要预扣费额度: ¥0.042656"}}`))
+	}))
+	defer first.Close()
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		secondCalls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"resp_switched","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`))
+	}))
+	defer second.Close()
+	token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	body := []byte(`{"model":"public-model","input":"switch depleted channel"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if firstCalls.Load() != 1 || secondCalls.Load() != 1 || recorder.Code != http.StatusOK || !strings.Contains(recorder.Body.String(), "resp_switched") {
+		t.Fatalf("first calls=%d second calls=%d status=%d body=%s", firstCalls.Load(), secondCalls.Load(), recorder.Code, recorder.Body.String())
+	}
+	attempts := relayAttempts(t, store)
+	if len(attempts) != 2 || attempts[0].Success || !strings.Contains(attempts[0].ErrorMessage, "预扣费额度失败") || attempts[1].SelectionReason != SelectionReasonCircuitOpened || !attempts[1].Success {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+	var failedChannel Channel
+	if err := store.db.First(&failedChannel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failedChannel.ConsecutiveFailures != 1 || failedChannel.CircuitOpenUntil == nil || !failedChannel.CircuitOpenUntil.After(time.Now()) || !strings.Contains(failedChannel.LastError, "预扣费额度失败") {
+		t.Fatalf("failed channel = %+v", failedChannel)
+	}
+}
+
+func TestRelayDoesNotSwitchForOrdinaryForbiddenResponse(t *testing.T) {
+	store := newTestStore(t)
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"error":{"code":"model_not_allowed","message":"This model is not permitted."}}`))
+	}))
+	defer first.Close()
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		secondCalls.Add(1)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+	token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	body := []byte(`{"model":"public-model","input":"forbidden"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	if publicErr := newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body); publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	if recorder.Code != http.StatusForbidden || secondCalls.Load() != 0 || !strings.Contains(recorder.Body.String(), "model_not_allowed") {
+		t.Fatalf("status=%d second calls=%d body=%s", recorder.Code, secondCalls.Load(), recorder.Body.String())
+	}
+	var channel Channel
+	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConsecutiveFailures != 0 || channel.CircuitOpenUntil != nil {
+		t.Fatalf("ordinary forbidden channel = %+v", channel)
+	}
+	if attempts := relayAttempts(t, store); len(attempts) != 1 || attempts[0].StatusCode != http.StatusForbidden {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+}
+
+func TestRelayCircuitsAuthenticationFailureAndSwitchesChannel(t *testing.T) {
+	store := newTestStore(t)
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusUnauthorized)
+		_, _ = writer.Write([]byte(`{"error":{"message":"Invalid authentication credentials"}}`))
+	}))
+	defer first.Close()
+	second := successfulResponseServer()
+	defer second.Close()
+	token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	relayTestRequest(t, newTestRelay(store), token)
+	var channel Channel
+	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.ConsecutiveFailures != 1 || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
+		t.Fatalf("authentication failure channel = %+v", channel)
+	}
+	if attempts := relayAttempts(t, store); len(attempts) != 2 || attempts[0].StatusCode != http.StatusUnauthorized || !attempts[1].Success {
+		t.Fatalf("attempts = %+v", attempts)
+	}
+}
+
+func TestResponseAffinityBalanceFailureCircuitsWithoutCrossChannelRetry(t *testing.T) {
+	store := newTestStore(t)
+	var firstCalls atomic.Int32
+	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		firstCalls.Add(1)
+		writer.Header().Set("Content-Type", "application/json")
+		writer.WriteHeader(http.StatusForbidden)
+		_, _ = writer.Write([]byte(`{"error":{"message":"insufficient balance"}}`))
+	}))
+	defer first.Close()
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		secondCalls.Add(1)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer second.Close()
+	token, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
+	relay := newTestRelay(store)
+	relay.router.RecordAffinity(context.Background(), "resp_original", mappings[0].ID)
+	body := []byte(`{"model":"public-model","previous_response_id":"resp_original","input":"continue"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicErr := relay.Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body)
+	if publicErr == nil || publicErr.Code != "response_affinity_unavailable" || firstCalls.Load() != 1 || secondCalls.Load() != 0 {
+		t.Fatalf("error=%+v first calls=%d second calls=%d", publicErr, firstCalls.Load(), secondCalls.Load())
+	}
+	var channel Channel
+	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
+		t.Fatalf("affinity channel = %+v", channel)
 	}
 }
 

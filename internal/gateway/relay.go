@@ -86,6 +86,7 @@ type attemptResult struct {
 	latencyMS        int64
 	durationMS       int64
 	streamError      error
+	outcome          string
 	retryReason      string
 	retryDetail      string
 	circuitOpenUntil *time.Time
@@ -151,7 +152,7 @@ func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, he
 		execution.attempts++
 		result, attemptErr := s.performAttempt(ctx, writer, headers, rawQuery, execution, candidate, selection, index == maxAttempts-1, plan.Affinity)
 		if result != nil {
-			s.addUsage(execution, result.usage, result.estimatedCost, result.upstreamCost, result.costSource, false)
+			s.addUsage(execution, result.usage, result.estimatedCost, result.upstreamCost, result.costSource, result.outcome == RelayOutcomeCanceled)
 		}
 		if attemptErr == nil {
 			return nil
@@ -240,6 +241,13 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 			retryReason: SelectionReasonTransportError,
 			retryDetail: "upstream_request",
 		}
+		if ctx.Err() != nil || errors.Is(requestErr, context.Canceled) {
+			result.outcome = RelayOutcomeCanceled
+			result.usage = Usage{InputTokens: execution.inputTokens, Source: "estimated_tiktoken"}
+			result.estimatedCost = CalculateCostMicros(candidate.Mapping, result.usage)
+			result.upstreamCost = result.estimatedCost
+			result.costSource = CostSourceFallback
+		}
 		if ctx.Err() == nil && !errors.Is(requestErr, context.Canceled) {
 			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, requestErr.Error())
 		}
@@ -249,23 +257,42 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	execution.latencyMS = elapsedMilliseconds(execution.startedAt, responseReceivedAt)
 
 	response.Body = s.withIdleTimeout(response.Body)
-	if shouldRetryStatus(response.StatusCode) {
-		responseBody, readErr := io.ReadAll(response.Body)
-		responseFinishedAt := time.Now()
-		_ = response.Body.Close()
-		execution.durationMS = elapsedMilliseconds(execution.startedAt, responseFinishedAt)
-		usage, _ := ParseUsage(responseBody)
+	if execution.payload.Stream && isEventStream(response.Header) && response.StatusCode >= 200 && response.StatusCode < 300 {
+		return s.streamResponse(ctx, writer, execution, candidate, selection, response, started, latency, sentTokens, body)
+	}
+
+	responseBody, readErr := io.ReadAll(response.Body)
+	responseFinishedAt := time.Now()
+	_ = response.Body.Close()
+	execution.durationMS = elapsedMilliseconds(execution.startedAt, responseFinishedAt)
+	usage, hasUsage := ParseUsage(responseBody)
+	channelFailure, channelFailureDetail := upstreamChannelFailure(response.StatusCode, responseBody)
+	if shouldRetryStatus(response.StatusCode) || channelFailure {
 		result := &attemptResult{
 			response: response, body: responseBody, requestBody: body, usage: usage, sentTokens: sentTokens,
 			costSource: CostSourceFailedZero, latencyMS: latency, durationMS: elapsedMilliseconds(started, responseFinishedAt),
 			retryReason: SelectionReasonRetryableStatus, retryDetail: fmt.Sprintf("HTTP %d", response.StatusCode),
 		}
+		attemptErr := readErr
+		failureMessage := fmt.Sprintf("HTTP %d", response.StatusCode)
+		if attemptErr == nil {
+			attemptErr = fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
+		}
+		if channelFailure {
+			failureMessage = channelFailureDetail
+			result.retryDetail = truncateRunes(channelFailureDetail, 512)
+			attemptErr = errors.New(channelFailureDetail)
+		}
 		if readErr != nil {
 			result.retryReason = SelectionReasonResponseError
 			result.retryDetail = "response_body_read"
 		}
-		result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, fmt.Sprintf("HTTP %d", response.StatusCode))
-		s.recordAttempt(logCtx, execution, candidate, selection, *result, response.StatusCode, false, readErr)
+		if channelFailure {
+			result.circuitOpenUntil = s.recordChannelUnavailable(logCtx, candidate.Channel.ID, failureMessage)
+		} else {
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, failureMessage)
+		}
+		s.recordAttempt(logCtx, execution, candidate, selection, *result, response.StatusCode, false, attemptErr)
 		if readErr != nil {
 			return result, readErr
 		}
@@ -276,18 +303,9 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 			writeBufferedResponse(writer, response, responseBody)
 			return nil, nil
 		}
-		return result, fmt.Errorf("upstream returned HTTP %d", response.StatusCode)
+		return result, attemptErr
 	}
 
-	if execution.payload.Stream && isEventStream(response.Header) && response.StatusCode >= 200 && response.StatusCode < 300 {
-		return s.streamResponse(ctx, writer, execution, candidate, selection, response, started, latency, sentTokens, body)
-	}
-
-	responseBody, readErr := io.ReadAll(response.Body)
-	responseFinishedAt := time.Now()
-	_ = response.Body.Close()
-	execution.durationMS = elapsedMilliseconds(execution.startedAt, responseFinishedAt)
-	usage, hasUsage := ParseUsage(responseBody)
 	if appErr, failed := upstreamApplicationError(responseBody); failed && response.StatusCode >= 200 && response.StatusCode < 300 && readErr == nil {
 		result := &attemptResult{
 			response: response, body: responseBody, requestBody: body, usage: usage, sentTokens: sentTokens,
@@ -338,6 +356,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	upstreamCost := upstreamCostSnapshot{}
 	outputEstimate := int64(0)
 	responseID := ""
+	terminalSuccess := false
 	result := attemptResult{response: response, requestBody: requestBody, sentTokens: sentTokens, latencyMS: latency}
 	capture := payloadCapture{}
 	pending := bytes.Buffer{}
@@ -372,6 +391,9 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			consumeSSEEvent(event, s.estimator, &usage, &upstreamCost, &outputEstimate, &responseID)
 			hasOutput := sseEventHasOutputToken(event)
 			appErr, hasApplicationError := sseApplicationError(event)
+			if sseEventIsTerminalSuccess(event) {
+				terminalSuccess = true
+			}
 
 			if !committed {
 				_, _ = pending.Write(event)
@@ -423,6 +445,9 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 					break
 				}
 			}
+			if terminalSuccess {
+				break
+			}
 		}
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) {
@@ -437,6 +462,9 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	execution.durationMS = elapsedMilliseconds(execution.startedAt, finishedAt)
 	result.durationMS = elapsedMilliseconds(started, finishedAt)
 	result.body, result.bodyTruncated = capture.Snapshot()
+	if !terminalSuccess && streamErr == nil && receivedEvent {
+		streamErr = io.ErrUnexpectedEOF
+	}
 	if !committed && streamErr != nil {
 		if !receivedEvent {
 			result.retryDetail = "stream_first_event"
@@ -444,7 +472,22 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			result.retryDetail = "stream_before_first_token"
 		}
 		result.usage = usage
-		result.costSource = CostSourceFailedZero
+		clientCanceled := ctx.Err() != nil || errors.Is(streamErr, context.Canceled) || downstreamError
+		if clientCanceled {
+			result.outcome = RelayOutcomeCanceled
+			if result.usage.Source == "" {
+				result.usage = Usage{InputTokens: execution.inputTokens, OutputTokens: outputEstimate, Source: "estimated_tiktoken"}
+			}
+			result.estimatedCost = CalculateCostMicros(candidate.Mapping, result.usage)
+			result.upstreamCost = result.estimatedCost
+			result.costSource = CostSourceFallback
+			if upstreamCost.valid {
+				result.upstreamCost = upstreamCost.micros
+				result.costSource = CostSourceUpstream
+			}
+		} else {
+			result.costSource = CostSourceFailedZero
+		}
 		result.retryReason = SelectionReasonResponseError
 		logCtx := context.WithoutCancel(ctx)
 		if ctx.Err() == nil && !errors.Is(streamErr, context.Canceled) {
@@ -468,21 +511,32 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			downstreamError = true
 		}
 	}
-	s.finishStream(ctx, execution, candidate, selection, result, usage, upstreamCost, outputEstimate, responseID, streamErr, downstreamError)
+	s.finishStream(ctx, execution, candidate, selection, result, usage, upstreamCost, outputEstimate, responseID, streamErr, downstreamError, terminalSuccess)
 	return nil, nil
 }
 
-func (s *RelayService) finishStream(ctx context.Context, execution *relayExecution, candidate RouteCandidate, selection RouteSelection, result attemptResult, usage Usage, upstreamSnapshot upstreamCostSnapshot, outputEstimate int64, responseID string, streamErr error, downstreamError bool) {
+func (s *RelayService) finishStream(ctx context.Context, execution *relayExecution, candidate RouteCandidate, selection RouteSelection, result attemptResult, usage Usage, upstreamSnapshot upstreamCostSnapshot, outputEstimate int64, responseID string, streamErr error, downstreamError bool, terminalSuccess bool) {
 	if usage.Source == "" {
 		usage = Usage{InputTokens: execution.inputTokens, OutputTokens: outputEstimate, Source: "estimated_tiktoken"}
 	}
 	logCtx := context.WithoutCancel(ctx)
-	clientCanceled := downstreamError || ctx.Err() != nil || errors.Is(streamErr, context.Canceled)
-	success := streamErr == nil && !clientCanceled
+	if terminalSuccess {
+		streamErr = nil
+		downstreamError = false
+	}
+	clientCanceled := !terminalSuccess && (downstreamError || ctx.Err() != nil || errors.Is(streamErr, context.Canceled))
+	success := terminalSuccess || (streamErr == nil && !clientCanceled)
+	if clientCanceled {
+		result.outcome = RelayOutcomeCanceled
+	} else if success {
+		result.outcome = RelayOutcomeSuccess
+	} else {
+		result.outcome = RelayOutcomeFailed
+	}
 	estimatedCost := int64(0)
 	upstreamCost := int64(0)
 	costSource := CostSourceFailedZero
-	if success {
+	if success || clientCanceled {
 		estimatedCost = CalculateCostMicros(candidate.Mapping, usage)
 		upstreamCost = estimatedCost
 		costSource = CostSourceFallback
@@ -502,7 +556,7 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 		s.recordChannelFailure(logCtx, candidate.Channel.ID, streamErr.Error())
 	}
 	s.recordAttempt(logCtx, execution, candidate, selection, result, result.response.StatusCode, success, streamErr)
-	s.addUsage(execution, usage, estimatedCost, upstreamCost, costSource, success)
+	s.addUsage(execution, usage, estimatedCost, upstreamCost, costSource, success || clientCanceled)
 	requestStatus := result.response.StatusCode
 	errorCode := ""
 	if clientCanceled {
@@ -552,6 +606,46 @@ func endpointPath(endpoint string) string {
 
 func shouldRetryStatus(status int) bool {
 	return status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= 500
+}
+
+func upstreamChannelFailure(status int, body []byte) (bool, string) {
+	category := ""
+	switch status {
+	case http.StatusUnauthorized:
+		category = "upstream authentication failed"
+	case http.StatusPaymentRequired:
+		category = "upstream account balance unavailable"
+	case http.StatusBadRequest, http.StatusForbidden:
+		normalized := strings.ToLower(string(body))
+		markers := []string{
+			"预扣费额度失败", "余额不足", "余额额度", "需要预扣费额度", "账户余额",
+			"insufficient_quota", "insufficient quota", "insufficient balance", "insufficient credit",
+			"credit balance", "credits exhausted", "out of credits", "billing hard limit",
+			"billing_hard_limit", "payment required", "quota exceeded", "quota_exceeded",
+			"invalid api key", "invalid_api_key", "api key is invalid", "api key disabled",
+			"authentication failed", "account disabled", "key disabled", "账号已停用",
+		}
+		for _, marker := range markers {
+			if strings.Contains(normalized, marker) {
+				category = "upstream account or credential unavailable"
+				break
+			}
+		}
+	}
+	if category == "" {
+		return false, ""
+	}
+	message := ""
+	if appErr, failed := upstreamApplicationError(body); failed {
+		message = strings.TrimSpace(appErr.Message)
+	}
+	if message == "" {
+		message = strings.Join(strings.Fields(string(body)), " ")
+	}
+	if message == "" {
+		return true, fmt.Sprintf("%s (HTTP %d)", category, status)
+	}
+	return true, fmt.Sprintf("%s (HTTP %d): %s", category, status, truncateRunes(message, 512))
 }
 
 func retrySelection(candidate RouteCandidate, result *attemptResult) RouteSelection {
@@ -688,6 +782,24 @@ func sseApplicationError(event []byte) (*upstreamApplicationFailure, bool) {
 		}
 	}
 	return nil, false
+}
+
+func sseEventIsTerminalSuccess(event []byte) bool {
+	for _, line := range bytes.Split(event, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if bytes.Equal(data, []byte("[DONE]")) {
+			return true
+		}
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) == nil && payload["type"] == "response.completed" {
+			return true
+		}
+	}
+	return false
 }
 
 type payloadCapture struct {
@@ -1046,7 +1158,15 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 	if attemptErr != nil {
 		message = truncateRunes(attemptErr.Error(), 2000)
 	}
-	if !success {
+	outcome := result.outcome
+	if outcome == "" {
+		if success {
+			outcome = RelayOutcomeSuccess
+		} else {
+			outcome = RelayOutcomeFailed
+		}
+	}
+	if outcome == RelayOutcomeFailed {
 		result.estimatedCost = 0
 		result.upstreamCost = 0
 		result.costSource = CostSourceFailedZero
@@ -1070,6 +1190,7 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		ResponseBody:          responseBody,
 		ResponseBodyTruncated: responseBodyTruncated,
 		StatusCode:            status,
+		Outcome:               outcome,
 		InputTokens:           result.usage.InputTokens,
 		NormalInputTokens:     normalInputTokens(result.usage),
 		OutputTokens:          result.usage.OutputTokens,
@@ -1090,6 +1211,7 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 }
 
 func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecution, status int, errorCode string) {
+	outcome := relayRequestOutcome(status, errorCode)
 	usageSource := ""
 	if len(execution.usageSources) == 1 {
 		for source := range execution.usageSources {
@@ -1108,7 +1230,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	}
 	estimatedCost := execution.estimatedCost
 	upstreamCost := execution.upstreamCost
-	if status < 200 || status >= 300 {
+	if outcome == RelayOutcomeFailed {
 		estimatedCost = 0
 		upstreamCost = 0
 		costSource = CostSourceFailedZero
@@ -1134,6 +1256,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		ResponseBody:          responseBody,
 		ResponseBodyTruncated: responseBodyTruncated,
 		StatusCode:            status,
+		Outcome:               outcome,
 		InputTokens:           execution.usage.InputTokens,
 		NormalInputTokens:     execution.normalInputTokens,
 		OutputTokens:          execution.usage.OutputTokens,
@@ -1153,8 +1276,12 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		CreatedAt:             now,
 	}
 	successCount := int64(0)
-	if status >= 200 && status < 300 {
+	if outcome == RelayOutcomeSuccess {
 		successCount = 1
+	}
+	canceledCount := int64(0)
+	if outcome == RelayOutcomeCanceled {
+		canceledCount = 1
 	}
 	firstTokenSamples := int64(0)
 	if log.FirstTokenMS > 0 {
@@ -1169,6 +1296,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		TokenID:           execution.token.ID,
 		RequestCount:      1,
 		SuccessCount:      successCount,
+		CanceledCount:     canceledCount,
 		InputTokens:       log.InputTokens,
 		NormalInputTokens: log.NormalInputTokens,
 		OutputTokens:      log.OutputTokens,
@@ -1187,7 +1315,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		UpdatedAt:         now,
 	}
 	var responseForManifest []byte
-	if status >= 200 && status < 300 {
+	if outcome == RelayOutcomeSuccess {
 		responseForManifest = execution.responseBody
 	}
 	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
@@ -1210,6 +1338,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 			DoUpdates: clause.Assignments(map[string]any{
 				"request_count":       gorm.Expr("request_count + excluded.request_count"),
 				"success_count":       gorm.Expr("success_count + excluded.success_count"),
+				"canceled_count":      gorm.Expr("canceled_count + excluded.canceled_count"),
 				"input_tokens":        gorm.Expr("input_tokens + excluded.input_tokens"),
 				"normal_input_tokens": gorm.Expr("normal_input_tokens + excluded.normal_input_tokens"),
 				"output_tokens":       gorm.Expr("output_tokens + excluded.output_tokens"),
@@ -1230,7 +1359,25 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	})
 }
 
+func relayRequestOutcome(status int, errorCode string) string {
+	if errorCode == "request_canceled" || status == statusClientClosedRequest {
+		return RelayOutcomeCanceled
+	}
+	if status >= 200 && status < 300 && errorCode == "" {
+		return RelayOutcomeSuccess
+	}
+	return RelayOutcomeFailed
+}
+
 func (s *RelayService) recordChannelFailure(ctx context.Context, channelID uint64, message string) *time.Time {
+	return s.recordChannelFailureState(ctx, channelID, message, false)
+}
+
+func (s *RelayService) recordChannelUnavailable(ctx context.Context, channelID uint64, message string) *time.Time {
+	return s.recordChannelFailureState(ctx, channelID, message, true)
+}
+
+func (s *RelayService) recordChannelFailureState(ctx context.Context, channelID uint64, message string, immediate bool) *time.Time {
 	message = truncateRunes(message, 2000)
 	now := time.Now()
 	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
@@ -1239,7 +1386,11 @@ func (s *RelayService) recordChannelFailure(ctx context.Context, channelID uint6
 		"last_health_at":       now,
 	}).Error
 	openUntil := now.Add(60 * time.Second)
-	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ? AND consecutive_failures >= 3", channelID).Update("circuit_open_until", openUntil).Error
+	query := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID)
+	if !immediate {
+		query = query.Where("consecutive_failures >= 3")
+	}
+	_ = query.Update("circuit_open_until", openUntil).Error
 	var channel Channel
 	if err := s.store.db.WithContext(ctx).Select("circuit_open_until").First(&channel, channelID).Error; err != nil || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(now) {
 		return nil

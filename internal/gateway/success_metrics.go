@@ -49,8 +49,8 @@ func loadRecentSuccessMetrics(ctx context.Context, db *gorm.DB, channelIDs []uin
 	}
 	var rows []aggregateRow
 	query := db.WithContext(ctx).Model(&RelayAttemptLog{}).
-		Select("channel_id, channel_model_id, SUM(CASE WHEN success THEN 1 ELSE 0 END) AS successes, COUNT(*) AS attempts").
-		Where("created_at >= ?", now.Add(-recentSuccessWindow))
+		Select("channel_id, channel_model_id, SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS successes, COUNT(*) AS attempts").
+		Where("created_at >= ? AND outcome <> ?", now.Add(-recentSuccessWindow), RelayOutcomeCanceled)
 	if len(channelIDs) > 0 {
 		query = query.Where("channel_id IN ?", channelIDs)
 	} else {

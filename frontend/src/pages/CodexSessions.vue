@@ -1,16 +1,13 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
+import type { CSSProperties } from 'vue'
 import { Coin, Connection, DataLine, EditPen, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import SessionLogDrawer from '@/components/SessionLogDrawer.vue'
 import type { Channel, ClientToken, CodexSessionPage, CodexSessionSummary, GatewayModel, LogAggregateSummary } from '@/types/gateway'
 import { request } from '@/utils/api'
-import { formatDuration } from '@/utils/formatters'
-
-function defaultLogRange(): [Date, Date] {
-  const to = new Date()
-  return [new Date(to.getTime() - 24 * 60 * 60 * 1000), to]
-}
+import { formatCompactNumber, formatDuration } from '@/utils/formatters'
+import { logDateDefaultTimes, logDateRangeShortcuts, todayLogRange } from '@/utils/logDateRanges'
 
 const loading = ref(true)
 const errorMessage = ref('')
@@ -20,17 +17,13 @@ const total = ref(0)
 const models = ref<GatewayModel[]>([])
 const channels = ref<Channel[]>([])
 const tokens = ref<ClientToken[]>([])
-const filters = reactive({ session: '', model: '', channelId: '', tokenId: '', range: defaultLogRange() as Date[] })
+const filters = reactive({ session: '', model: '', channelId: '', tokenId: '', range: todayLogRange() as Date[] | null })
 const pagination = reactive({ page: 1, pageSize: 25 })
 const drawerOpen = ref(false)
 const selectedSession = ref<CodexSessionSummary | null>(null)
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
-}
-
-function formatTokens(value: number): string {
-  return new Intl.NumberFormat('zh-CN').format(value)
 }
 
 function formatPercent(value: number): string {
@@ -43,6 +36,17 @@ function formatUSD(micros: number): string {
 
 function formatTiming(value: number, samples: number): string {
   return samples > 0 ? formatDuration(value) : '--'
+}
+
+function requestCountStyle(count: number): CSSProperties {
+  const normalizedCount = Math.max(1, count)
+  const logCount = Math.log10(normalizedCount)
+  const lowToMedium = Math.min(1, Math.max(0, logCount - 1))
+  const mediumToHigh = Math.min(1, Math.max(0, (normalizedCount - 100) / 200))
+  const color = normalizedCount <= 100
+    ? `color-mix(in srgb, var(--supos-success) ${(1 - lowToMedium) * 100}%, var(--supos-warning))`
+    : `color-mix(in srgb, var(--supos-warning) ${(1 - mediumToHigh) * 100}%, var(--supos-danger))`
+  return { '--request-count-color': color } as CSSProperties
 }
 
 function sessionSourceLabel(value: string): string {
@@ -76,7 +80,7 @@ async function loadSessions() {
   if (filters.model) query.set('model', filters.model)
   if (filters.channelId) query.set('channelId', filters.channelId)
   if (filters.tokenId) query.set('tokenId', filters.tokenId)
-  if (filters.range.length === 2) {
+  if (filters.range?.length === 2) {
     query.set('from', filters.range[0].toISOString())
     query.set('to', filters.range[1].toISOString())
   }
@@ -98,7 +102,7 @@ function searchSessions() {
 }
 
 function resetSessions() {
-  Object.assign(filters, { session: '', model: '', channelId: '', tokenId: '', range: defaultLogRange() })
+  Object.assign(filters, { session: '', model: '', channelId: '', tokenId: '', range: todayLogRange() })
   pagination.page = 1
   void loadSessions()
 }
@@ -159,7 +163,7 @@ onMounted(async () => {
 <template>
   <div class="page-stack">
     <header class="page-heading">
-      <div><h1>会话日志</h1><p>默认显示最近 24 小时，可查询 5 天内的会话、渠道、模型、令牌与用量</p></div>
+      <div><h1>会话日志</h1><p>默认显示今天，可查询 5 天内的会话、渠道、模型、令牌与用量</p></div>
       <div class="page-actions"><el-tooltip content="刷新会话日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新会话日志" @click="loadSessions" /></el-tooltip></div>
     </header>
 
@@ -168,30 +172,30 @@ onMounted(async () => {
       <el-select v-model="filters.model" clearable placeholder="全部模型"><el-option v-for="model in models" :key="model.id" :label="model.name" :value="model.name" /></el-select>
       <el-select v-model="filters.channelId" clearable placeholder="全部渠道"><el-option v-for="channel in channels" :key="channel.id" :label="channel.name" :value="String(channel.id)" /></el-select>
       <el-select v-model="filters.tokenId" clearable placeholder="全部令牌"><el-option v-for="token in tokens" :key="token.id" :label="token.name" :value="String(token.id)" /></el-select>
-      <el-date-picker v-model="filters.range" type="datetimerange" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
+      <el-date-picker v-model="filters.range" type="datetimerange" format="YYYY-MM-DD HH:mm:ss" :default-time="logDateDefaultTimes" :shortcuts="logDateRangeShortcuts" range-separator="至" start-placeholder="开始时间" end-placeholder="结束时间" />
       <div class="filter-actions"><el-button :icon="RefreshLeft" :disabled="loading" @click="resetSessions">重置</el-button><el-button type="primary" :icon="Search" :loading="loading" @click="searchSessions">查询</el-button></div>
     </section>
 
     <section v-if="!errorMessage" class="metric-strip" aria-label="会话日志汇总">
       <article class="metric-cell">
         <span><Tickets />会话数</span>
-        <strong v-if="!loading">{{ formatTokens(total) }}</strong><el-skeleton v-else :rows="1" animated />
+        <strong v-if="!loading">{{ formatCompactNumber(total) }}</strong><el-skeleton v-else :rows="1" animated />
         <small>当前筛选范围</small>
       </article>
       <article class="metric-cell">
         <span><Connection />请求量</span>
-        <strong v-if="!loading">{{ formatTokens(summary?.requestCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
-        <small>{{ formatTokens(summary?.attemptCount ?? 0) }} 次上游尝试</small>
+        <strong v-if="!loading">{{ formatCompactNumber(summary?.requestCount ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>{{ formatCompactNumber(summary?.attemptCount ?? 0) }} 次上游尝试</small>
       </article>
       <article class="metric-cell">
         <span><DataLine />成功率</span>
         <strong v-if="!loading">{{ formatPercent(summary?.successRate ?? 0) }}</strong><el-skeleton v-else :rows="1" animated />
-        <small>成功 {{ formatTokens(summary?.successCount ?? 0) }} · 失败 {{ formatTokens((summary?.requestCount ?? 0) - (summary?.successCount ?? 0)) }}</small>
+        <small>成功 {{ formatCompactNumber(summary?.successCount ?? 0) }} · 取消 {{ formatCompactNumber(summary?.canceledCount ?? 0) }} · 失败 {{ formatCompactNumber((summary?.requestCount ?? 0) - (summary?.successCount ?? 0) - (summary?.canceledCount ?? 0)) }}</small>
       </article>
       <article class="metric-cell">
         <span><Coin />Token</span>
-        <strong v-if="!loading">{{ formatTokens((summary?.inputTokens ?? 0) + (summary?.outputTokens ?? 0)) }}</strong><el-skeleton v-else :rows="1" animated />
-        <small>输入 {{ formatTokens(summary?.inputTokens ?? 0) }} · 输出 {{ formatTokens(summary?.outputTokens ?? 0) }}</small>
+        <strong v-if="!loading">{{ formatCompactNumber((summary?.inputTokens ?? 0) + (summary?.outputTokens ?? 0)) }}</strong><el-skeleton v-else :rows="1" animated />
+        <small>输入 {{ formatCompactNumber(summary?.inputTokens ?? 0) }} · 输出 {{ formatCompactNumber(summary?.outputTokens ?? 0) }}</small>
       </article>
       <article class="metric-cell">
         <span><Coin />上游费用</span>
@@ -223,15 +227,15 @@ onMounted(async () => {
           </template>
         </el-table-column>
         <el-table-column label="模型 / 调用令牌" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.latestModel }}</strong><small>{{ scope.row.tokenName || `令牌 #${scope.row.tokenId}` }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
-        <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ scope.row.requestCount }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ scope.row.attemptCount }} 次尝试</small></div></template></el-table-column>
+        <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong class="request-count" :style="requestCountStyle(scope.row.requestCount)">{{ formatCompactNumber(scope.row.requestCount) }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ formatCompactNumber(scope.row.attemptCount) }} 次尝试</small></div></template></el-table-column>
         <el-table-column label="Token 明细" min-width="280">
           <template #default="scope">
             <div class="session-tokens">
-              <span><small>普通输入</small><strong>{{ formatTokens(scope.row.normalInputTokens) }}</strong></span>
-              <span><small>输出</small><strong>{{ formatTokens(scope.row.outputTokens) }}</strong></span>
-              <span><small>缓存读</small><strong>{{ formatTokens(scope.row.cachedTokens) }}</strong></span>
-              <span><small>缓存写</small><strong>{{ formatTokens(scope.row.cacheWriteTokens) }}</strong></span>
-              <span class="session-sent"><small>真实发送（本地分词）</small><strong>{{ formatTokens(scope.row.sentTokens) }}</strong></span>
+              <span><small>普通输入</small><strong>{{ formatCompactNumber(scope.row.normalInputTokens) }}</strong></span>
+              <span><small>输出</small><strong>{{ formatCompactNumber(scope.row.outputTokens) }}</strong></span>
+              <span><small>缓存读</small><strong>{{ formatCompactNumber(scope.row.cachedTokens) }}</strong></span>
+              <span><small>缓存写</small><strong>{{ formatCompactNumber(scope.row.cacheWriteTokens) }}</strong></span>
+              <span class="session-sent"><small>真实发送（本地分词）</small><strong>{{ formatCompactNumber(scope.row.sentTokens) }}</strong></span>
             </div>
           </template>
         </el-table-column>
@@ -255,6 +259,7 @@ onMounted(async () => {
 .numeric-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
 .numeric-cell strong { color: var(--rose-text); }
 .numeric-cell small { color: var(--rose-text-muted); font-size: 11px; }
+.numeric-cell .request-count { color: var(--request-count-color); }
 .session-tokens { display: grid; grid-template-columns: repeat(4, minmax(52px, 1fr)); gap: 4px 9px; font-variant-numeric: tabular-nums; }
 .session-tokens > span { display: grid; gap: 1px; }
 .session-tokens small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }

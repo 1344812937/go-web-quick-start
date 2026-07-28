@@ -3,9 +3,10 @@ import { computed, ref, watch } from 'vue'
 import { EditPen, Right, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
+import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
 import type { CodexSessionDetail, CodexSessionSummary, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
-import { formatDuration } from '@/utils/formatters'
+import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 
 interface SessionLogDrawerProps {
   /** Session aggregate selected from the session log table. */
@@ -19,7 +20,7 @@ interface ChannelSwitch {
   detail: string
 }
 
-type SessionDetailStatus = 'all' | 'success' | 'failure'
+type SessionDetailStatus = 'all' | 'success' | 'canceled' | 'failure'
 
 const { summary } = defineProps<SessionLogDrawerProps>()
 const open = defineModel<boolean>({ required: true })
@@ -34,6 +35,7 @@ const detailStatus = ref<SessionDetailStatus>('all')
 const detailStatusOptions: Array<{ label: string; value: SessionDetailStatus }> = [
   { label: '全部', value: 'all' },
   { label: '成功', value: 'success' },
+  { label: '取消', value: 'canceled' },
   { label: '失败', value: 'failure' },
 ]
 
@@ -83,10 +85,6 @@ function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
 }
 
-function formatTokens(value: number): string {
-  return new Intl.NumberFormat('zh-CN').format(value)
-}
-
 function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(micros / 1_000_000)
 }
@@ -99,17 +97,18 @@ function formatTiming(value: number): string {
   return value > 0 ? formatDuration(value) : '--'
 }
 
-function statusType(status: number): 'success' | 'warning' | 'danger' | 'info' {
-  if (status >= 200 && status < 300) return 'success'
-  if (status === 408 || status === 429) return 'warning'
-  if (status >= 500 || status === 0) return 'danger'
+function statusType(requestItem: RelayRequestLog): 'success' | 'warning' | 'danger' | 'info' {
+  if (requestItem.outcome === 'success' || (!requestItem.outcome && requestItem.statusCode >= 200 && requestItem.statusCode < 300)) return 'success'
+  if (requestItem.outcome === 'canceled' || requestItem.statusCode === 499 || requestItem.statusCode === 408 || requestItem.statusCode === 429) return 'warning'
+  if (requestItem.outcome === 'failed' || requestItem.statusCode >= 500 || requestItem.statusCode === 0) return 'danger'
   return 'info'
 }
 
-function statusLabel(status: number, errorMessage = ''): string {
-  if (status >= 200 && status < 300 && errorMessage) return `业务中断 · HTTP ${status}`
-  if (status > 0) return String(status)
-  if (errorMessage.startsWith('gateway preparation failed:')) return '准备失败'
+function statusLabel(requestItem: RelayRequestLog): string {
+  if (requestItem.outcome === 'success' || (!requestItem.outcome && requestItem.statusCode >= 200 && requestItem.statusCode < 300)) return `成功 · HTTP ${requestItem.statusCode}`
+  if (requestItem.outcome === 'canceled' || requestItem.statusCode === 499) return '客户端取消'
+  if (requestItem.statusCode > 0) return `HTTP ${requestItem.statusCode}`
+  if (requestItem.errorCode === 'gateway_preparation_error') return '准备失败'
   return '网络错误'
 }
 
@@ -204,19 +203,6 @@ function assignmentLabel(value: string): string {
   return '最近尝试渠道'
 }
 
-function costSourceLabel(value: RelayRequestLog['costSource']): string {
-  if (value === 'upstream') return '上游返回'
-  if (value === 'estimated_fallback') return '估算回退'
-  if (value === 'mixed') return '混合'
-  return '失败为零'
-}
-
-function costSourceType(value: RelayRequestLog['costSource']): 'success' | 'warning' | 'info' {
-  if (value === 'upstream') return 'success'
-  if (value === 'estimated_fallback' || value === 'mixed') return 'warning'
-  return 'info'
-}
-
 function currentChannelState(): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
   const channel = detail.value?.summary.currentChannel
   if (!channel) return { label: '未分配', type: 'info' }
@@ -293,16 +279,17 @@ watch(
     </div>
     <div v-else-if="detail" v-loading="loading" class="session-detail">
       <section class="session-summary-strip" aria-label="会话统计">
-        <div><span>请求</span><strong>{{ detail.summary.requestCount }}</strong></div>
+        <div><span>请求</span><strong>{{ formatCompactNumber(detail.summary.requestCount) }}</strong></div>
         <div><span>成功率</span><strong>{{ formatPercent(detail.summary.successRate) }}</strong></div>
+        <div><span>取消</span><strong>{{ formatCompactNumber(detail.summary.canceledCount) }}</strong></div>
         <div><span>平均首 Token</span><strong>{{ detail.summary.firstTokenSampleCount ? formatTiming(detail.summary.averageFirstTokenMs) : '--' }}</strong></div>
         <div><span>平均请求延迟</span><strong>{{ detail.summary.latencySampleCount ? formatTiming(detail.summary.averageLatencyMs) : '--' }}</strong></div>
         <div><span>平均请求耗时</span><strong>{{ formatTiming(detail.summary.averageDurationMs) }}</strong></div>
-        <div><span>普通输入 Token</span><strong>{{ formatTokens(detail.summary.normalInputTokens) }}</strong></div>
-        <div><span>输出 Token</span><strong>{{ formatTokens(detail.summary.outputTokens) }}</strong></div>
-        <div><span>缓存读 Token</span><strong>{{ formatTokens(detail.summary.cachedTokens) }}</strong></div>
-        <div><span>缓存写 Token</span><strong>{{ formatTokens(detail.summary.cacheWriteTokens) }}</strong></div>
-        <div><span>真实发送（本地分词）</span><strong>{{ formatTokens(detail.summary.sentTokens) }}</strong></div>
+        <div><span>普通输入 Token</span><strong>{{ formatCompactNumber(detail.summary.normalInputTokens) }}</strong></div>
+        <div><span>输出 Token</span><strong>{{ formatCompactNumber(detail.summary.outputTokens) }}</strong></div>
+        <div><span>缓存读 Token</span><strong>{{ formatCompactNumber(detail.summary.cachedTokens) }}</strong></div>
+        <div><span>缓存写 Token</span><strong>{{ formatCompactNumber(detail.summary.cacheWriteTokens) }}</strong></div>
+        <div><span>真实发送（本地分词）</span><strong>{{ formatCompactNumber(detail.summary.sentTokens) }}</strong></div>
         <div><span>上游金额</span><strong>{{ formatUSD(detail.summary.upstreamCostMicros) }}</strong></div>
         <div><span>自行估算</span><strong>{{ formatUSD(detail.summary.estimatedCostMicros) }}</strong></div>
       </section>
@@ -324,7 +311,7 @@ watch(
           <div><h3>调用时间线</h3><p>按调用发生时间从新到旧排列</p></div>
           <div class="timeline-heading-actions">
             <el-segmented v-model="detailStatus" :options="detailStatusOptions" size="small" aria-label="筛选调用状态" @change="filterDetailByStatus" />
-            <span>{{ detail.requestTotal }} 个匹配请求 · 会话共 {{ detail.summary.attemptCount }} 次上游尝试</span>
+            <span>{{ formatCompactNumber(detail.requestTotal) }} 个匹配请求 · 会话共 {{ formatCompactNumber(detail.summary.attemptCount) }} 次上游尝试</span>
           </div>
         </header>
         <div v-if="timelineRequests.length === 0" class="timeline-empty">当前页没有调用记录</div>
@@ -336,10 +323,12 @@ watch(
                 <div class="request-title">
                   <time :datetime="entry.request.createdAt">{{ formatDate(entry.request.createdAt) }}</time>
                   <span>{{ entry.request.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</span>
+                  <code>{{ entry.request.apiPath }}</code>
                   <code>{{ entry.request.requestedModel }}</code>
+                  <span>思考等级 {{ entry.request.reasoningEffort || '默认' }}</span>
                 </div>
                 <div class="request-actions">
-                  <el-tag :type="statusType(entry.request.statusCode)" effect="plain">{{ statusLabel(entry.request.statusCode) }}</el-tag>
+                  <el-tag :type="statusType(entry.request)" effect="plain">{{ statusLabel(entry.request) }}</el-tag>
                   <span>{{ entry.request.attemptCount }} 次尝试</span>
                   <el-tooltip content="查看完整请求与响应" placement="top">
                     <el-button class="icon-action" text :icon="View" :loading="payloadLoadingId === entry.request.id" aria-label="查看完整请求与响应" @click="showParameters(entry.request)" />
@@ -371,29 +360,12 @@ watch(
                   </div>
                 </div>
 
-                <article class="attempt-event">
-                  <div class="attempt-index">尝试 {{ attemptIndex + 1 }}</div>
-                  <div class="attempt-channel">
-                    <strong>{{ channelLabel(attemptEntry.attempt) }}</strong>
-                    <small><code>{{ attemptEntry.attempt.upstreamModel }}</code></small>
-                    <small v-if="attemptEntry.attempt.channelBaseUrl"><code>{{ attemptEntry.attempt.channelBaseUrl }}</code></small>
-                  </div>
-                  <el-tag :type="attemptEntry.attempt.success ? statusType(attemptEntry.attempt.statusCode) : 'danger'" effect="plain">{{ statusLabel(attemptEntry.attempt.statusCode, attemptEntry.attempt.errorMessage) }}</el-tag>
-                  <dl class="attempt-metrics">
-                    <div><dt>首 Token</dt><dd>{{ formatTiming(attemptEntry.attempt.firstTokenMs) }}</dd></div>
-                    <div><dt>请求延迟</dt><dd>{{ formatTiming(attemptEntry.attempt.latencyMs) }}</dd></div>
-                    <div><dt>请求耗时</dt><dd>{{ formatTiming(attemptEntry.attempt.durationMs) }}</dd></div>
-                    <div><dt>普通输入</dt><dd>{{ formatTokens(attemptEntry.attempt.normalInputTokens) }}</dd></div>
-                    <div><dt>输出</dt><dd>{{ formatTokens(attemptEntry.attempt.outputTokens) }}</dd></div>
-                    <div><dt>缓存读</dt><dd>{{ formatTokens(attemptEntry.attempt.cachedTokens) }}</dd></div>
-                    <div><dt>缓存写</dt><dd>{{ formatTokens(attemptEntry.attempt.cacheWriteTokens) }}</dd></div>
-                    <div><dt>真实发送</dt><dd>{{ formatTokens(attemptEntry.attempt.sentTokens) }}</dd></div>
-                    <div><dt>上游金额</dt><dd>{{ formatUSD(attemptEntry.attempt.upstreamCostMicros) }}</dd></div>
-                    <div><dt>自行估算</dt><dd>{{ formatUSD(attemptEntry.attempt.estimatedCostMicros) }}</dd></div>
-                  </dl>
-                  <div class="attempt-source"><el-tag :type="costSourceType(attemptEntry.attempt.costSource)" effect="plain" size="small">{{ costSourceLabel(attemptEntry.attempt.costSource) }}</el-tag></div>
-                  <p v-if="attemptEntry.attempt.errorMessage" class="attempt-error">{{ attemptEntry.attempt.errorMessage }}</p>
-                </article>
+                <SessionAttemptCard
+                  :attempt="attemptEntry.attempt"
+                  :attempt-number="attemptIndex + 1"
+                  :api-path="attemptEntry.attempt.apiPath || entry.request.apiPath"
+                  :reasoning-effort="entry.request.reasoningEffort"
+                />
               </div>
             </article>
           </li>
@@ -455,18 +427,6 @@ watch(
 .switch-route .el-icon { flex: 0 0 auto; color: var(--rose-warning); }
 .switch-reason { flex-wrap: wrap; color: var(--rose-warning); font-size: 12px; }
 .switch-reason small { color: var(--rose-text-muted); }
-.attempt-event { display: grid; grid-template-columns: 66px minmax(150px, .9fr) 96px minmax(460px, 2.2fr) 104px; align-items: center; gap: 12px; min-width: 0; padding: 12px 14px; border: 1px solid var(--rose-border); background: var(--rose-surface); }
-.attempt-index { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-.attempt-channel { display: grid; gap: 2px; min-width: 0; }
-.attempt-channel strong { overflow: hidden; color: var(--rose-text); text-overflow: ellipsis; white-space: nowrap; }
-.attempt-channel small { overflow: hidden; color: var(--rose-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
-.attempt-metrics { display: grid; grid-template-columns: repeat(4, minmax(74px, 1fr)); gap: 8px 12px; margin: 0; font-variant-numeric: tabular-nums; }
-.attempt-metrics div { display: grid; gap: 1px; min-width: 0; }
-.attempt-metrics dt { color: var(--rose-text-muted); font-size: 10px; }
-.attempt-metrics dd { margin: 0; color: var(--rose-text); font-size: 12px; }
-.attempt-source { justify-self: end; }
-.attempt-error { grid-column: 2 / -1; margin: -2px 0 0; color: var(--rose-danger); font-size: 11px; overflow-wrap: anywhere; }
-@media (max-width: 1040px) { .attempt-event { grid-template-columns: 58px minmax(160px, 1fr) 92px; } .attempt-metrics { grid-column: 1 / -1; grid-row: 2; } .attempt-source { grid-column: 3; } .attempt-error { grid-column: 1 / -1; } }
 @media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
-@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .attempt-event { grid-template-columns: minmax(0, 1fr) auto; padding: 10px; } .attempt-index { grid-column: 1; } .attempt-channel { grid-column: 1 / -1; } .attempt-event > .el-tag { grid-column: 2; grid-row: 1; } .attempt-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); grid-column: 1 / -1; grid-row: auto; } .attempt-source { grid-column: 1 / -1; justify-self: start; } .attempt-error { grid-column: 1 / -1; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
 </style>

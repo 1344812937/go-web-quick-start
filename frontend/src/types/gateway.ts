@@ -1,5 +1,6 @@
 export type RoutingStrategy = 'priority_weighted' | 'lowest_cost' | 'lowest_latency'
 export type CostSource = 'upstream' | 'estimated_fallback' | 'mixed' | 'failed_zero'
+export type RelayOutcome = 'success' | 'canceled' | 'failed'
 
 export interface AdminSession {
   /** Persistent administrator identifier. */
@@ -264,12 +265,14 @@ export interface IssuedClientToken {
 }
 
 export interface DashboardDaily {
-  /** UTC calendar date in YYYY-MM-DD format. */
+  /** Server-local calendar date in YYYY-MM-DD format. */
   date: string
   /** Requests received on the date. */
   requests: number
-  /** Requests completed with a 2xx status. */
+  /** Requests that reached a protocol-level successful completion. */
   successes: number
+  /** Requests canceled by downstream clients on the date. */
+  canceledCount: number
   /** Input tokens reported or estimated on the date. */
   inputTokens: number
   /** Output tokens reported or estimated on the date. */
@@ -304,13 +307,15 @@ export interface DashboardBreakdown {
 }
 
 export interface DashboardSummary {
-  /** Total requests across long-term per-token statistics. */
+  /** Total requests in the selected natural-day range. */
   requests: number
-  /** Fraction from 0 to 1 completed with a 2xx status. */
+  /** Requests canceled by downstream clients in the selected range. */
+  canceledCount: number
+  /** Successful requests divided by completed success/failure requests; cancellations are excluded. */
   successRate: number
-  /** Total input tokens across retained logs. */
+  /** Total input tokens in the selected natural-day range. */
   inputTokens: number
-  /** Total output tokens across retained logs. */
+  /** Total output tokens in the selected natural-day range. */
   outputTokens: number
   /** Total estimated cost in micro-USD. */
   estimatedCostMicros: number
@@ -328,11 +333,11 @@ export interface DashboardSummary {
   averageDurationMs: number
   /** Requests included in the duration average. */
   durationSampleCount: number
-  /** Daily metrics for the most recent 14 days. */
+  /** Daily metrics for each date in the selected range, including zero-value dates. */
   daily: DashboardDaily[]
-  /** Highest-usage channel breakdown from five-day detailed logs. */
+  /** Highest-usage channel breakdown from detailed logs in the selected range. */
   channels: DashboardBreakdown[]
-  /** Highest-usage public model breakdown from five-day detailed logs. */
+  /** Highest-usage public model breakdown from detailed logs in the selected range. */
   models: DashboardBreakdown[]
 }
 
@@ -367,6 +372,8 @@ export interface RelayAttemptLog {
   channelModelId: number
   /** Model identifier sent upstream. */
   upstreamModel: string
+  /** Actual upstream API path, relative from and including /v1. */
+  apiPath: string
   /** Channel identifier used immediately before this selection, or zero for an initial route. */
   previousChannelId: number
   /** Historical name of the channel used immediately before this selection. */
@@ -385,6 +392,8 @@ export interface RelayAttemptLog {
   responseBodyTruncated: boolean
   /** Upstream HTTP status, or zero for a transport error. */
   statusCode: number
+  /** Business outcome independent of the upstream HTTP status. */
+  outcome: RelayOutcome
   /** Input tokens charged or estimated for this attempt. */
   inputTokens: number
   /** Non-cached input tokens charged or estimated for this attempt. */
@@ -399,9 +408,9 @@ export interface RelayAttemptLog {
   sentTokens: number
   /** Attempt estimated cost in micro-USD. */
   estimatedCostMicros: number
-  /** Attempt upstream cost in micro-USD, falling back to estimated cost only for successful attempts. */
+  /** Attempt upstream cost in micro-USD, falling back to an estimate for successful or canceled attempts. */
   upstreamCostMicros: number
-  /** Monetary origin; failed attempts are always failed_zero. */
+  /** Monetary origin; abnormal failed attempts are always failed_zero. */
   costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
@@ -411,7 +420,7 @@ export interface RelayAttemptLog {
   latencyMs: number
   /** Time from sending the upstream request until its response body ended. */
   durationMs: number
-  /** Whether the attempt completed successfully. */
+  /** Compatibility success flag; outcome carries the three-state result. */
   success: boolean
   /** Sanitized transport or status failure detail. */
   errorMessage: string
@@ -430,6 +439,10 @@ export interface RelayRequestLog {
   tokenKeyPrefix: string
   /** chat or responses public endpoint family. */
   endpoint: string
+  /** Public API path, relative from and including /v1. */
+  apiPath: string
+  /** Requested reasoning effort, or an empty string when the client used the default. */
+  reasoningEffort: string
   /** Public model requested by the client. */
   requestedModel: string
   /** Codex client session identifier when one could be extracted. */
@@ -450,6 +463,8 @@ export interface RelayRequestLog {
   responseBodyTruncated: boolean
   /** Final HTTP status returned to the client. */
   statusCode: number
+  /** Business outcome independent of the final HTTP status. */
+  outcome: RelayOutcome
   /** Total input tokens across known attempts. */
   inputTokens: number
   /** Total non-cached input tokens across known attempts. */
@@ -464,9 +479,9 @@ export interface RelayRequestLog {
   sentTokens: number
   /** Total estimated cost in micro-USD across known attempts. */
   estimatedCostMicros: number
-  /** Total upstream cost in micro-USD across successful attempts, with per-attempt estimate fallback. */
+  /** Total upstream cost in micro-USD across billable successful or canceled attempts, with estimate fallback. */
   upstreamCostMicros: number
-  /** Aggregate monetary origin across successful attempts, or failed_zero for a failed request. */
+  /** Aggregate monetary origin across billable attempts, or failed_zero for an abnormal failed request. */
   costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
@@ -491,9 +506,11 @@ export interface RelayRequestLog {
 export interface LogAggregateSummary {
   /** Matching request count across the full filtered time range. */
   requestCount: number
-  /** Matching requests completed with a final 2xx status. */
+  /** Matching requests that reached a protocol-level successful completion. */
   successCount: number
-  /** Successful matching requests divided by all matching requests. */
+  /** Matching requests canceled by the downstream client before protocol completion. */
+  canceledCount: number
+  /** Successful matching requests divided by success/failure requests; cancellations are excluded. */
   successRate: number
   /** Total upstream attempts made by matching requests. */
   attemptCount: number
@@ -586,9 +603,11 @@ export interface CodexSessionSummary {
   latestEndpoint: string
   /** Requests retained for this session within the five-day window. */
   requestCount: number
-  /** Requests completed with a 2xx status. */
+  /** Requests that reached a protocol-level successful completion. */
   successCount: number
-  /** Fraction from 0 to 1 of retained requests completed successfully. */
+  /** Requests canceled by downstream clients before protocol completion. */
+  canceledCount: number
+  /** Successful retained requests divided by success/failure requests; cancellations are excluded. */
   successRate: number
   /** Total upstream attempts made by retained requests. */
   attemptCount: number

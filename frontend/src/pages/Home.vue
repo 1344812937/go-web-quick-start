@@ -5,7 +5,7 @@ import { Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tic
 import { ElMessage } from 'element-plus'
 import type { Channel, ClientToken, DashboardSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
-import { formatDuration } from '@/utils/formatters'
+import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 
 const router = useRouter()
 const loading = ref(true)
@@ -19,7 +19,18 @@ const selectedModel = ref('')
 const serviceBaseUrl = ref(typeof window === 'undefined' ? '/v1' : `${window.location.origin}/v1`)
 const copyingConfig = ref(false)
 
+type DashboardRangeDays = 1 | 2 | 3 | 5
+
+const selectedRangeDays = ref<DashboardRangeDays>(1)
+const timeRangeOptions: Array<{ label: string; value: DashboardRangeDays }> = [
+  { label: '当前', value: 1 },
+  { label: '最近两天', value: 2 },
+  { label: '最近三天', value: 3 },
+  { label: '最近五天', value: 5 },
+]
+
 const totalTokens = computed(() => (dashboard.value?.inputTokens ?? 0) + (dashboard.value?.outputTokens ?? 0))
+const selectedRangeLabel = computed(() => timeRangeOptions.find((option) => option.value === selectedRangeDays.value)?.label ?? '当前')
 const availableChannels = computed(() => channels.value.filter((channel) => (
   channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())
 )).length)
@@ -43,10 +54,6 @@ wire_api = "responses"
 requires_openai_auth = true
 base_url = "${serviceBaseUrl.value.trim() || '/v1'}"`)
 
-function formatInteger(value: number): string {
-  return new Intl.NumberFormat('zh-CN', { notation: value >= 100000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
-}
-
 function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(micros / 1_000_000)
 }
@@ -65,7 +72,7 @@ async function loadDashboard() {
   errorMessage.value = ''
   try {
     const [summary, channelItems, modelItems, tokenItems] = await Promise.all([
-      request<DashboardSummary>('/admin/gateway/dashboard'),
+      request<DashboardSummary>(`/admin/gateway/dashboard?days=${selectedRangeDays.value}`),
       request<Channel[]>('/admin/gateway/channels'),
       request<GatewayModel[]>('/admin/gateway/models'),
       request<ClientToken[]>('/admin/gateway/tokens'),
@@ -85,6 +92,10 @@ async function loadDashboard() {
   } finally {
     loading.value = false
   }
+}
+
+function handleTimeRangeChange() {
+  void loadDashboard()
 }
 
 async function copyCodexConfig() {
@@ -107,9 +118,17 @@ onMounted(loadDashboard)
     <header class="page-heading">
       <div>
         <h1>运行总览</h1>
-        <p>累计令牌统计，以及最近 5 天的渠道和模型明细</p>
+        <p>按所选自然日范围汇总请求、Token、费用与运行质量</p>
       </div>
       <div class="page-actions">
+        <el-segmented
+          v-model="selectedRangeDays"
+          :options="timeRangeOptions"
+          :disabled="loading"
+          size="small"
+          aria-label="统计时间范围"
+          @change="handleTimeRangeChange"
+        />
         <el-tooltip content="刷新运行总览" placement="bottom">
           <el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新运行总览" @click="loadDashboard" />
         </el-tooltip>
@@ -126,9 +145,9 @@ onMounted(loadDashboard)
       <section class="metric-strip" aria-label="网关指标">
         <article class="metric-cell">
           <span><Tickets />请求量</span>
-          <strong v-if="!loading">{{ formatInteger(dashboard?.requests ?? 0) }}</strong>
+          <strong v-if="!loading">{{ formatCompactNumber(dashboard?.requests ?? 0) }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>令牌聚合统计</small>
+          <small>{{ selectedRangeLabel }}聚合统计</small>
         </article>
         <article class="metric-cell">
           <span><DataLine />成功率</span>
@@ -138,7 +157,7 @@ onMounted(loadDashboard)
         </article>
         <article class="metric-cell">
           <span><Coin />Token</span>
-          <strong v-if="!loading">{{ formatInteger(totalTokens) }}</strong>
+          <strong v-if="!loading">{{ formatCompactNumber(totalTokens) }}</strong>
           <el-skeleton v-else :rows="1" animated />
           <small>输入与输出合计</small>
         </article>
@@ -152,19 +171,19 @@ onMounted(loadDashboard)
           <span><Timer />平均首 Token</span>
           <strong v-if="!loading">{{ dashboard?.firstTokenSampleCount ? formatDuration(dashboard.averageFirstTokenMs) : '--' }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>{{ dashboard?.firstTokenSampleCount ?? 0 }} 个流式样本</small>
+          <small>{{ formatCompactNumber(dashboard?.firstTokenSampleCount ?? 0) }} 个流式样本</small>
         </article>
         <article class="metric-cell">
           <span><Odometer />平均请求延迟</span>
           <strong v-if="!loading">{{ dashboard?.latencySampleCount ? formatDuration(dashboard.averageLatencyMs) : '--' }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>{{ dashboard?.latencySampleCount ?? 0 }} 个响应头样本</small>
+          <small>{{ formatCompactNumber(dashboard?.latencySampleCount ?? 0) }} 个响应头样本</small>
         </article>
         <article class="metric-cell">
           <span><Clock />平均请求耗时</span>
           <strong v-if="!loading">{{ formatDuration(dashboard?.averageDurationMs ?? 0) }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>{{ dashboard?.durationSampleCount ?? 0 }} 个完整请求</small>
+          <small>{{ formatCompactNumber(dashboard?.durationSampleCount ?? 0) }} 个完整请求</small>
         </article>
         <article class="metric-cell">
           <span><Connection />可用渠道</span>
@@ -173,7 +192,7 @@ onMounted(loadDashboard)
           <small>{{ availableChannels ? '至少一个渠道可调度' : '当前无可用渠道' }}</small>
         </article>
       </section>
-      <p class="historical-cost-note">5 天前的历史聚合费用沿用原有估算口径；最近 5 天已按成功状态重建。</p>
+      <p class="historical-cost-note">{{ selectedRangeLabel }}按服务器本地自然日统计，费用优先采用上游返回值。</p>
 
       <section class="surface-panel quick-start-panel">
         <header class="panel-heading">
@@ -206,15 +225,20 @@ onMounted(loadDashboard)
         <section class="surface-panel usage-panel">
           <header class="panel-heading">
             <div>
-              <h2>近 14 日请求</h2>
+              <h2>{{ selectedRangeLabel }}请求</h2>
               <p>每日请求量与成功量</p>
             </div>
           </header>
           <div v-if="loading" class="chart-skeleton"><el-skeleton :rows="5" animated /></div>
-          <div v-else class="bar-chart" aria-label="近 14 日请求柱状图">
+          <div
+            v-else
+            class="bar-chart"
+            :style="{ gridTemplateColumns: `repeat(${selectedRangeDays}, minmax(48px, 96px))` }"
+            :aria-label="`${selectedRangeLabel}请求柱状图`"
+          >
             <div v-for="day in dashboard?.daily" :key="day.date" class="bar-column">
               <div class="bar-track">
-                <span class="bar-total" :style="{ height: `${Math.max(3, day.requests / maxDailyRequests * 100)}%` }"></span>
+                <span class="bar-total" :style="{ height: `${day.requests ? Math.max(3, day.requests / maxDailyRequests * 100) : 0}%` }"></span>
                 <span class="bar-success" :style="{ height: `${Math.max(0, day.successes / maxDailyRequests * 100)}%` }"></span>
               </div>
               <small>{{ formatDate(day.date) }}</small>
@@ -225,20 +249,20 @@ onMounted(loadDashboard)
 
         <div class="dashboard-tables">
           <section class="surface-panel">
-            <header class="panel-heading"><div><h2>渠道分布</h2><p>最近 5 天，按尝试次数统计</p></div></header>
+            <header class="panel-heading"><div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，按尝试次数统计</p></div></header>
             <el-table :data="dashboard?.channels ?? []" empty-text="暂无渠道调用">
               <el-table-column prop="name" label="渠道" min-width="140" />
-              <el-table-column prop="requests" label="尝试" width="92" align="right" />
+              <el-table-column label="尝试" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
               <el-table-column label="费用" width="150" align="right">
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>
             </el-table>
           </section>
           <section class="surface-panel">
-            <header class="panel-heading"><div><h2>模型分布</h2><p>最近 5 天，按公开模型统计</p></div></header>
+            <header class="panel-heading"><div><h2>模型分布</h2><p>{{ selectedRangeLabel }}，按公开模型统计</p></div></header>
             <el-table :data="dashboard?.models ?? []" empty-text="暂无模型调用">
               <el-table-column prop="name" label="模型" min-width="140" />
-              <el-table-column prop="requests" label="请求" width="92" align="right" />
+              <el-table-column label="请求" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
               <el-table-column label="费用" width="150" align="right">
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>
@@ -275,7 +299,7 @@ onMounted(loadDashboard)
 .cost-cell strong { color: var(--rose-text); font-weight: 650; }
 .cost-cell small { color: var(--rose-text-muted); font-size: 10px; }
 .chart-skeleton { padding: 24px; }
-.bar-chart { display: grid; grid-template-columns: repeat(14, minmax(24px, 1fr)); align-items: end; gap: 8px; height: 210px; padding: 20px 22px 12px; overflow-x: auto; }
+.bar-chart { display: grid; align-items: end; justify-content: space-around; gap: 8px; height: 210px; padding: 20px 22px 12px; overflow-x: auto; }
 .bar-column { display: grid; grid-template-rows: 160px 22px; align-items: end; gap: 8px; min-width: 24px; text-align: center; }
 .bar-track { position: relative; height: 160px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
 .bar-track span { position: absolute; inset: auto 0 0; min-height: 0; transition: height 180ms ease; }
@@ -290,7 +314,6 @@ onMounted(loadDashboard)
 .dashboard-tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 @media (max-width: 860px) {
   .dashboard-tables { grid-template-columns: 1fr; }
-  .bar-chart { grid-template-columns: repeat(14, minmax(30px, 1fr)); }
   .quick-start-body { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) { .readiness-strip { grid-template-columns: 1fr; } .readiness-strip > div { border-right: 0; border-bottom: 1px solid var(--rose-border); } .readiness-strip > div:last-child { border-bottom: 0; } .quick-start-body { padding: 12px; } }

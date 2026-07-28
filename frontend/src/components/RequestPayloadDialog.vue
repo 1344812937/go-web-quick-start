@@ -27,6 +27,12 @@ function attemptMessages(attempt: RelayAttemptLog) {
   return conversation(request?.requestBody ?? '', attempt.responseBody)
 }
 
+function outcomeLabel(outcome: RelayRequestLog['outcome'] | RelayAttemptLog['outcome']): string {
+  if (outcome === 'success') return '成功'
+  if (outcome === 'canceled') return '客户端取消'
+  return '失败'
+}
+
 function formattedPayload(value: string): string {
   const trimmed = value.trim()
   if (!trimmed) return ''
@@ -53,8 +59,11 @@ watch(
       <div class="payload-toolbar">
         <div class="payload-meta">
           <span><strong>端点</strong>{{ request.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</span>
+          <span><strong>接口路径</strong><code>{{ request.apiPath }}</code></span>
           <span><strong>模型</strong><code>{{ request.requestedModel }}</code></span>
-          <span><strong>状态</strong>{{ request.statusCode }}</span>
+          <span><strong>思考等级</strong><code>{{ request.reasoningEffort || '默认' }}</code></span>
+          <span><strong>结果</strong>{{ outcomeLabel(request.outcome) }}</span>
+          <span><strong>HTTP</strong>{{ request.statusCode }}</span>
           <span><strong>尝试</strong>{{ request.attemptCount }}</span>
         </div>
         <el-segmented v-model="detailMode" :options="detailModeOptions" size="small" aria-label="详情展示方式" />
@@ -72,9 +81,10 @@ watch(
         <el-tab-pane v-for="(attempt, index) in request.attempts" :key="attempt.id" :label="`尝试 ${index + 1}`" :name="`attempt-${attempt.id}`">
           <div class="attempt-meta">
             <span><strong>渠道</strong>{{ attempt.channelName || `渠道 #${attempt.channelId}` }}</span>
+            <span><strong>接口路径</strong><code>{{ attempt.apiPath || request.apiPath }}</code></span>
             <span><strong>上游模型</strong><code>{{ attempt.upstreamModel }}</code></span>
             <span><strong>HTTP</strong>{{ attempt.statusCode || '网络错误' }}</span>
-            <span><strong>结果</strong>{{ attempt.success ? '成功' : '失败' }}</span>
+            <span><strong>结果</strong>{{ outcomeLabel(attempt.outcome) }}</span>
           </div>
           <template v-if="detailMode === 'chat'">
             <el-alert v-if="deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />

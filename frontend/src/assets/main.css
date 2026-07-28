@@ -49,7 +49,7 @@ code { font-family: var(--rose-font-mono); font-size: 0.94em; font-variant-numer
 .filter-bar { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)) minmax(320px, 1.6fr) minmax(184px, auto); gap: 8px; padding: 12px; border: 1px solid var(--rose-border); border-radius: var(--rose-radius-panel); background: var(--rose-surface); }
 .filter-bar > * { min-width: 0; }
 .filter-bar .el-date-editor { width: 100%; min-width: 0; box-sizing: border-box; }
-.filter-bar .el-range-input { width: 0; min-width: 0; }
+.filter-bar .el-range-input { flex: 1 1 0; width: 0; min-width: 0; }
 .filter-actions { display: flex; justify-content: flex-end; gap: 8px; min-width: 184px; }
 .filter-actions .el-button { flex: 1 1 88px; min-width: 88px; margin-left: 0; }
 .form-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import type { CSSProperties } from 'vue'
-import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight } from '@element-plus/icons-vue'
+import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight, Unlock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ChannelLatencySparkline from '@/components/ChannelLatencySparkline.vue'
 import type {
@@ -13,7 +13,7 @@ import type {
   UpstreamModel,
 } from '@/types/gateway'
 import { request } from '@/utils/api'
-import { formatDuration } from '@/utils/formatters'
+import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 
 interface MappingDraft {
   clientKey: string
@@ -28,6 +28,7 @@ interface MappingDraft {
   cacheWritePrice: number | null
   adjustmentMultiplier: number
   enabled: boolean
+  recentAttemptCount: number
 }
 
 interface MappingGroup {
@@ -54,10 +55,12 @@ const discoverySummary = ref<ChannelModelDiscovery | null>(null)
 const priceMultiplier = ref(1)
 const testingChannelId = ref<number | null>(null)
 const deletingChannelId = ref<number | null>(null)
+const resettingCircuitChannelId = ref<number | null>(null)
+const currentTime = ref(Date.now())
 const drawerTitle = computed(() => editingId.value ? '编辑渠道' : '新增渠道')
 const createdPublicModelCount = computed(() => discoveredModels.value.filter((model) => model.publicModelCreated).length)
-const sortedPublicModels = computed(() => [...models.value].sort((left, right) => compareModelNamesDescending(left.name, right.name)))
-const sortedDiscoveredModels = computed(() => [...discoveredModels.value].sort((left, right) => compareModelNamesDescending(left.id, right.id)))
+const sortedPublicModels = computed(() => [...models.value].sort((left, right) => compareModelsByUsage(left.id, left.name, right.id, right.name)))
+const sortedDiscoveredModels = computed(() => [...discoveredModels.value].sort((left, right) => compareModelsByUsage(left.publicModelId, left.id, right.publicModelId, right.id)))
 const mappingGroups = computed<MappingGroup[]>(() => [
   { key: 'enabled', label: '已启用', emptyText: '暂无已启用映射', items: sortedMappings(true) },
   { key: 'disabled', label: '未启用', emptyText: '暂无未启用映射', items: sortedMappings(false) },
@@ -76,9 +79,20 @@ const modelHueByName = computed(() => {
 })
 let mappingDraftSequence = 0
 let discoveryRequestVersion = 0
+let clockTimer: ReturnType<typeof setInterval> | undefined
 
 function compareModelNamesDescending(left: string, right: string): number {
   return right.localeCompare(left, undefined, { numeric: true, sensitivity: 'base' })
+}
+
+function modelUsageCount(modelId: number): number {
+  return channels.value.reduce((total, channel) => total + channel.models
+    .filter((mapping) => mapping.modelId === modelId)
+    .reduce((modelTotal, mapping) => modelTotal + mapping.recentAttemptCount, 0), 0)
+}
+
+function compareModelsByUsage(leftId: number, leftName: string, rightId: number, rightName: string): number {
+  return modelUsageCount(rightId) - modelUsageCount(leftId) || compareModelNamesDescending(leftName, rightName)
 }
 
 function hashModelName(value: string): number {
@@ -112,6 +126,7 @@ function mappingDraft(mapping: ChannelModel): MappingDraft {
     cacheWritePrice: fromMicros(mapping.cacheWritePriceMicros),
     adjustmentMultiplier: Number.isFinite(mapping.priceMultiplierBasisPoints) ? mapping.priceMultiplierBasisPoints / 10_000 : 1,
     enabled: mapping.enabled,
+    recentAttemptCount: mapping.recentAttemptCount,
   }
 }
 
@@ -129,6 +144,7 @@ function discoveredMappingDraft(model: UpstreamModel): MappingDraft {
     cacheWritePrice: fromMicros(price?.cacheWritePriceMicros ?? null),
     adjustmentMultiplier: 1,
     enabled: false,
+    recentAttemptCount: 0,
   }
 }
 
@@ -331,12 +347,14 @@ function modelName(modelId: number): string {
 function sortedMappings(enabled: boolean): MappingDraft[] {
   return mappings.value
     .filter((mapping) => mapping.enabled === enabled)
-    .sort((left, right) => compareModelNamesDescending(modelName(left.modelId ?? 0), modelName(right.modelId ?? 0))
+    .sort((left, right) => right.recentAttemptCount - left.recentAttemptCount
+      || compareModelNamesDescending(modelName(left.modelId ?? 0), modelName(right.modelId ?? 0))
       || compareModelNamesDescending(left.upstreamModel, right.upstreamModel))
 }
 
 function sortedChannelModels(channel: Channel): ChannelModel[] {
-  return [...channel.models].sort((left, right) => compareModelNamesDescending(modelName(left.modelId), modelName(right.modelId)))
+  return [...channel.models].sort((left, right) => right.recentAttemptCount - left.recentAttemptCount
+    || compareModelNamesDescending(modelName(left.modelId), modelName(right.modelId)))
 }
 
 function visibleChannelModels(channel: Channel): ChannelModel[] {
@@ -366,8 +384,9 @@ function formatPercent(value: number): string {
   return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
 }
 
-function formatTokens(value: number): string {
-  return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
+function formatPriceMultiplier(value: number): string {
+  const multiplier = Number.isFinite(value) ? value / 10_000 : 1
+  return `${new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(multiplier)}x`
 }
 
 function formatTiming(value: number, samples: number): string {
@@ -375,14 +394,28 @@ function formatTiming(value: number, samples: number): string {
 }
 
 function timingSampleLabel(channel: Channel): string {
-  return `样本 首 Token ${channel.metrics.firstTokenSampleCount} · 延迟 ${channel.metrics.latencySampleCount} · 耗时 ${channel.metrics.durationSampleCount}`
+  return `样本 首 Token ${formatCompactNumber(channel.metrics.firstTokenSampleCount)} · 延迟 ${formatCompactNumber(channel.metrics.latencySampleCount)} · 耗时 ${formatCompactNumber(channel.metrics.durationSampleCount)}`
+}
+
+function isCircuitOpen(channel: Channel): boolean {
+  return channel.circuitOpenUntil !== null && Date.parse(channel.circuitOpenUntil) > currentTime.value
 }
 
 function channelState(channel: Channel): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
+  if (isCircuitOpen(channel)) return { label: '熔断中', type: 'danger' }
   if (!channel.enabled) return { label: '已停用', type: 'info' }
-  if (channel.circuitOpenUntil && Date.parse(channel.circuitOpenUntil) > Date.now()) return { label: '熔断中', type: 'danger' }
   if (channel.consecutiveFailures > 0) return { label: `${channel.consecutiveFailures} 次失败`, type: 'warning' }
   return { label: '可调度', type: 'success' }
+}
+
+function circuitRemaining(channel: Channel): string {
+  if (!channel.circuitOpenUntil) return ''
+  const seconds = Math.max(0, Math.ceil((Date.parse(channel.circuitOpenUntil) - currentTime.value) / 1000))
+  return `${seconds} 秒后自动恢复`
+}
+
+function channelRowClassName({ row }: { row: Channel }): string {
+  return isCircuitOpen(row) ? 'channel-row--circuit-open' : ''
 }
 
 async function loadData() {
@@ -465,6 +498,28 @@ async function testChannel(channel: Channel) {
   }
 }
 
+async function resetChannelCircuit(channel: Channel) {
+  try {
+    await ElMessageBox.confirm(
+      `解除渠道“${channel.name}”的熔断？解除后该渠道会立即重新参与请求调度。`,
+      '解除渠道熔断',
+      { type: 'warning', confirmButtonText: '解除熔断', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  resettingCircuitChannelId.value = channel.id
+  try {
+    await request<null>(`/admin/gateway/channels/${channel.id}/reset-circuit`, { method: 'POST' })
+    ElMessage.success('渠道熔断已解除')
+    await loadData()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '解除熔断失败')
+  } finally {
+    resettingCircuitChannelId.value = null
+  }
+}
+
 async function deleteChannel(channel: Channel) {
   await ElMessageBox.confirm(`删除渠道“${channel.name}”及其全部模型映射？`, '删除渠道', { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' })
   deletingChannelId.value = channel.id
@@ -479,7 +534,16 @@ async function deleteChannel(channel: Channel) {
   }
 }
 
-onMounted(loadData)
+onMounted(() => {
+  void loadData()
+  clockTimer = setInterval(() => {
+    currentTime.value = Date.now()
+  }, 1000)
+})
+
+onUnmounted(() => {
+  if (clockTimer) clearInterval(clockTimer)
+})
 </script>
 
 <template>
@@ -496,16 +560,31 @@ onMounted(loadData)
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>渠道加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="channels" row-key="id" empty-text="还没有渠道">
+      <el-table v-loading="loading" :data="channels" row-key="id" empty-text="还没有渠道" :row-class-name="channelRowClassName">
         <el-table-column label="渠道" min-width="190">
           <template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.baseUrl }}</small></div></template>
         </el-table-column>
-        <el-table-column label="状态" width="116"><template #default="scope"><el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag></template></el-table-column>
+        <el-table-column label="状态" width="220">
+          <template #default="scope">
+            <div class="channel-state-cell" :class="{ 'is-circuit-open': isCircuitOpen(scope.row) }">
+              <div class="channel-state-heading">
+                <el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag>
+                <strong v-if="isCircuitOpen(scope.row)">{{ circuitRemaining(scope.row) }}</strong>
+              </div>
+              <el-tooltip v-if="isCircuitOpen(scope.row) && scope.row.lastError" :content="scope.row.lastError" placement="top" :show-after="250">
+                <small tabindex="0">{{ scope.row.lastError }}</small>
+              </el-tooltip>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="价格倍率" width="104" align="right">
+          <template #default="scope"><span class="price-multiplier">{{ formatPriceMultiplier(scope.row.priceMultiplierBasisPoints) }}</span></template>
+        </el-table-column>
         <el-table-column label="近 30 分钟成功率" width="170" align="right">
           <template #default="scope">
             <div class="metric-copy success-metric">
               <strong>{{ formatPercent(scope.row.metrics.recentSuccessRate) }}</strong>
-              <small v-if="scope.row.metrics.recentAttemptCount">{{ scope.row.metrics.recentSuccessCount }} / {{ scope.row.metrics.recentAttemptCount }} 次尝试</small>
+              <small v-if="scope.row.metrics.recentAttemptCount">{{ formatCompactNumber(scope.row.metrics.recentSuccessCount) }} / {{ formatCompactNumber(scope.row.metrics.recentAttemptCount) }} 次尝试</small>
               <small v-else>暂无调用，按 100%</small>
             </div>
           </template>
@@ -557,14 +636,15 @@ onMounted(loadData)
               <div class="cache-meter" role="meter" aria-label="缓存读取占比" aria-valuemin="0" aria-valuemax="1" :aria-valuenow="Math.min(Math.max(scope.row.metrics.cacheHitRate, 0), 1)">
                 <span :style="{ width: `${Math.min(Math.max(scope.row.metrics.cacheHitRate, 0), 1) * 100}%` }" />
               </div>
-              <small>{{ formatTokens(scope.row.metrics.cachedTokens) }} / {{ formatTokens(scope.row.metrics.inputTokens) }} Token</small>
+              <small>{{ formatCompactNumber(scope.row.metrics.cachedTokens) }} / {{ formatCompactNumber(scope.row.metrics.inputTokens) }} Token</small>
             </div>
             <span v-else class="muted-text">暂无 usage 数据</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="126" fixed="right" align="right">
+        <el-table-column label="操作" width="164" fixed="right" align="right">
           <template #default="scope">
             <div class="table-actions">
+              <el-tooltip v-if="isCircuitOpen(scope.row)" content="解除熔断并恢复调度" placement="top"><el-button class="table-action-button reset-circuit-button" text type="warning" :icon="Unlock" :loading="resettingCircuitChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id || testingChannelId === scope.row.id" aria-label="解除渠道熔断" @click="resetChannelCircuit(scope.row)" /></el-tooltip>
               <el-tooltip content="测试渠道连接" placement="top"><el-button class="table-action-button" text :icon="Connection" :loading="testingChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id" aria-label="测试渠道连接" @click="testChannel(scope.row)" /></el-tooltip>
               <el-tooltip content="编辑渠道" placement="top"><el-button class="table-action-button" text :icon="Edit" aria-label="编辑渠道" @click="resetForm(scope.row)" /></el-tooltip>
               <el-tooltip content="删除渠道" placement="top"><el-button class="table-action-button" text type="danger" :icon="Delete" :loading="deletingChannelId === scope.row.id" :disabled="testingChannelId === scope.row.id" aria-label="删除渠道" @click="deleteChannel(scope.row)" /></el-tooltip>
@@ -702,6 +782,15 @@ onMounted(loadData)
 </template>
 
 <style scoped>
+:deep(.el-table__body tr.channel-row--circuit-open > td.el-table__cell),
+:deep(.el-table__body tr.channel-row--circuit-open:hover > td.el-table__cell) { background: var(--rose-danger-soft); }
+:deep(.el-table__body tr.channel-row--circuit-open > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--rose-danger); }
+.channel-state-cell { display: grid; min-width: 0; gap: 5px; }
+.channel-state-heading { display: flex; align-items: center; gap: 8px; }
+.channel-state-heading strong { color: var(--rose-danger); font-family: var(--rose-font-mono); font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.channel-state-cell small { display: block; overflow: hidden; color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.channel-state-cell.is-circuit-open small { color: var(--rose-danger); cursor: help; }
+.reset-circuit-button { color: var(--rose-danger); }
 .model-discovery-heading { margin-top: 0; }
 .model-discovery-actions { display: flex; align-items: center; gap: 8px; }
 .model-discovery-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 0; }
@@ -718,6 +807,7 @@ onMounted(loadData)
 .channel-model-tag-label { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .channel-model-more-tag { flex-shrink: 0; cursor: help; font-variant-numeric: tabular-nums; }
 .channel-model-overflow-content { display: flex; flex-wrap: wrap; gap: 6px; max-width: 360px; max-height: 220px; overflow-y: auto; padding: 2px; }
+.price-multiplier { color: var(--rose-text); font-family: var(--rose-font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
 .latency-metric-cell { display: flex; align-items: center; gap: 12px; min-height: 48px; }
 .metric-copy { display: grid; min-width: 0; gap: 2px; font-variant-numeric: tabular-nums; }
 .metric-copy strong { color: var(--rose-text); font-size: 13px; font-weight: 650; }

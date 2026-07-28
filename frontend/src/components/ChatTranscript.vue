@@ -34,7 +34,13 @@ function roleIcon(role: ConversationMessage['role']) {
   <div v-if="renderedMessages.length" class="chat-transcript">
     <article v-for="(message, index) in renderedMessages" :key="`${message.id}-${index}`" class="chat-message" :class="`is-${message.role}`">
       <header><el-icon><component :is="roleIcon(message.role)" /></el-icon><strong>{{ message.label }}</strong></header>
-      <div class="markdown-body" v-html="message.html" />
+      <div
+        class="markdown-body"
+        role="region"
+        :aria-label="`${message.label}消息内容`"
+        tabindex="0"
+        v-html="message.html"
+      />
     </article>
   </div>
   <div v-else class="chat-empty">正文中没有可解析的对话消息，可切换到源码查看完整内容</div>
@@ -49,7 +55,8 @@ function roleIcon(role: ConversationMessage['role']) {
 .chat-message header { display: flex; align-items: center; align-self: start; gap: 7px; color: var(--rose-text-muted); font-size: 12px; }
 .chat-message header .el-icon { color: var(--rose-primary); font-size: 15px; }
 .chat-message.is-error header, .chat-message.is-error header .el-icon { color: var(--rose-danger); }
-.markdown-body { min-width: 0; color: var(--rose-text); font-size: 13px; line-height: 1.72; overflow-wrap: anywhere; }
+.markdown-body { min-width: 0; max-height: 360px; padding-right: 8px; overflow: auto; color: var(--rose-text); font-size: 13px; line-height: 1.72; overflow-wrap: anywhere; scrollbar-gutter: stable; }
+.markdown-body:focus-visible { outline: 2px solid var(--rose-primary); outline-offset: 2px; }
 .markdown-body :deep(> :first-child) { margin-top: 0; }
 .markdown-body :deep(> :last-child) { margin-bottom: 0; }
 .markdown-body :deep(p), .markdown-body :deep(ul), .markdown-body :deep(ol), .markdown-body :deep(blockquote), .markdown-body :deep(pre) { margin: 0 0 10px; }

@@ -44,6 +44,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.POST("/channels", a.createChannel)
 	admin.PUT("/channels/:id", a.updateChannel)
 	admin.DELETE("/channels/:id", a.deleteChannel)
+	admin.POST("/channels/:id/reset-circuit", a.resetChannelCircuit)
 	admin.PUT("/channels/:id/models", a.replaceChannelModels)
 	admin.POST("/channels/discover-models", a.discoverChannelModels)
 	admin.POST("/channels/:id/test", a.testChannel)
@@ -134,6 +135,18 @@ func (a *GatewayManagementApi) deleteChannel(c *gin.Context) {
 		return
 	}
 	if err := a.management.DeleteChannel(c.Request.Context(), id); err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S[any](nil))
+}
+
+func (a *GatewayManagementApi) resetChannelCircuit(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	if err := a.management.ResetChannelCircuit(c.Request.Context(), id); err != nil {
 		managementError(c, err)
 		return
 	}
@@ -300,7 +313,16 @@ func (a *GatewayManagementApi) deleteToken(c *gin.Context) {
 }
 
 func (a *GatewayManagementApi) dashboard(c *gin.Context) {
-	item, err := a.management.Dashboard(c.Request.Context())
+	days := 1
+	if value := c.Query("days"); value != "" {
+		parsed, err := strconv.Atoi(value)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, common.F[any](http.StatusBadRequest, "统计时间范围无效"))
+			return
+		}
+		days = parsed
+	}
+	item, err := a.management.Dashboard(c.Request.Context(), days)
 	if err != nil {
 		managementError(c, err)
 		return

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 	"time"
 
@@ -67,6 +68,7 @@ type SessionLogSummary struct {
 	LatestEndpoint        string              `json:"latestEndpoint"`
 	RequestCount          int64               `json:"requestCount"`
 	SuccessCount          int64               `json:"successCount"`
+	CanceledCount         int64               `json:"canceledCount"`
 	SuccessRate           float64             `json:"successRate"`
 	AttemptCount          int64               `json:"attemptCount"`
 	InputTokens           int64               `json:"inputTokens"`
@@ -135,7 +137,8 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		"CASE WHEN codex_session_id <> '' THEN codex_session_id ELSE '' END AS session_id, " +
 		"CASE WHEN codex_session_id <> '' THEN 1 ELSE 0 END AS identified, " +
 		"CASE WHEN codex_session_id = '' THEN id ELSE '' END AS fallback_request_id, token_id, " +
-		"COUNT(*) AS request_count, SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
+		"COUNT(*) AS request_count, SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
+		"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
 		"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
 		"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 		"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
@@ -210,8 +213,10 @@ func finishSessionSummary(summary *SessionLogSummary, totalFirstTokenMS int64, t
 	if summary.LatencySampleCount > 0 {
 		summary.AverageLatencyMS = float64(totalLatencyMS) / float64(summary.LatencySampleCount)
 	}
+	if completedRequests := summary.RequestCount - summary.CanceledCount; completedRequests > 0 {
+		summary.SuccessRate = float64(summary.SuccessCount) / float64(completedRequests)
+	}
 	if summary.RequestCount > 0 {
-		summary.SuccessRate = float64(summary.SuccessCount) / float64(summary.RequestCount)
 		summary.AverageDurationMS = float64(totalDurationMS) / float64(summary.RequestCount)
 		summary.DurationSampleCount = summary.RequestCount
 	}
@@ -244,6 +249,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	type detailAggregate struct {
 		RequestCount      int64
 		SuccessCount      int64
+		CanceledCount     int64
 		AttemptCount      int64
 		InputTokens       int64
 		NormalInputTokens int64
@@ -263,7 +269,8 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	}
 	var aggregate detailAggregate
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
-		Select("COUNT(*) AS request_count, SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
+		Select("COUNT(*) AS request_count, SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
+			"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
 			"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
 			"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 			"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
@@ -286,6 +293,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		TokenID:               query.TokenID,
 		RequestCount:          aggregate.RequestCount,
 		SuccessCount:          aggregate.SuccessCount,
+		CanceledCount:         aggregate.CanceledCount,
 		AttemptCount:          aggregate.AttemptCount,
 		InputTokens:           aggregate.InputTokens,
 		NormalInputTokens:     aggregate.NormalInputTokens,
@@ -334,9 +342,11 @@ func applySessionIdentity(db *gorm.DB, query SessionDetailQuery) *gorm.DB {
 func applySessionDetailStatus(db *gorm.DB, status string) *gorm.DB {
 	switch strings.TrimSpace(status) {
 	case "success":
-		return db.Where("status_code BETWEEN 200 AND 299")
+		return db.Where("outcome = ?", RelayOutcomeSuccess)
+	case "canceled":
+		return db.Where("outcome = ?", RelayOutcomeCanceled)
 	case "failure":
-		return db.Where("status_code < 200 OR status_code >= 300")
+		return db.Where("outcome = ?", RelayOutcomeFailed)
 	default:
 		return db
 	}
@@ -589,11 +599,47 @@ func (s *ManagementService) relayRequestView(ctx context.Context, log RelayReque
 			attempts[index].ChannelBaseURL = channel.BaseURL
 		}
 	}
+	for index := range attempts {
+		attempts[index].APIPath = relayAPIPath(attempts[index].ChannelBaseURL, log.Endpoint)
+	}
+	parameters := decodeRequestParameters(log.RequestParametersJSON)
+	apiPath := relayAPIPath("", log.Endpoint)
+	if len(attempts) > 0 {
+		apiPath = attempts[0].APIPath
+	}
 	return RelayRequestView{
 		RelayRequestLog:   log,
-		RequestParameters: decodeRequestParameters(log.RequestParametersJSON),
+		RequestParameters: parameters,
+		APIPath:           apiPath,
+		ReasoningEffort:   requestReasoningEffort(parameters),
 		Attempts:          attempts,
 	}, nil
+}
+
+func relayAPIPath(baseURL string, endpoint string) string {
+	suffix := endpointPath(endpoint)
+	if parsed, err := url.Parse(strings.TrimSpace(baseURL)); err == nil {
+		basePath := strings.TrimRight(parsed.Path, "/")
+		if index := strings.LastIndex(basePath, "/v1"); index >= 0 {
+			boundary := index + len("/v1")
+			if boundary == len(basePath) || basePath[boundary] == '/' {
+				return strings.TrimRight(basePath[index:], "/") + "/" + suffix
+			}
+		}
+	}
+	return "/v1/" + suffix
+}
+
+func requestReasoningEffort(parameters map[string]any) string {
+	if reasoning, ok := parameters["reasoning"].(map[string]any); ok {
+		if effort, ok := reasoning["effort"].(string); ok && strings.TrimSpace(effort) != "" {
+			return strings.TrimSpace(effort)
+		}
+	}
+	if effort, ok := parameters["reasoning_effort"].(string); ok {
+		return strings.TrimSpace(effort)
+	}
+	return ""
 }
 
 func decodeRequestParameters(value string) map[string]any {

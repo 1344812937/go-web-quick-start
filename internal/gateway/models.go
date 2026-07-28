@@ -1,6 +1,10 @@
 package gateway
 
-import "time"
+import (
+	"time"
+
+	"gorm.io/gorm"
+)
 
 const (
 	RoutingPriorityWeighted                       = "priority_weighted"
@@ -23,6 +27,9 @@ const (
 	CostSourceFallback                            = "estimated_fallback"
 	CostSourceMixed                               = "mixed"
 	CostSourceFailedZero                          = "failed_zero"
+	RelayOutcomeSuccess                           = "success"
+	RelayOutcomeCanceled                          = "canceled"
+	RelayOutcomeFailed                            = "failed"
 	DefaultPriceMultiplierBasisPoints       int64 = 10_000
 	MaxPriceMultiplierBasisPoints           int64 = 1_000_000
 )
@@ -126,6 +133,7 @@ type RelayRequestLog struct {
 	ResponseBody          string    `gorm:"type:text" json:"responseBody"`
 	ResponseBodyTruncated bool      `gorm:"not null;default:false" json:"responseBodyTruncated"`
 	StatusCode            int       `gorm:"index;not null" json:"statusCode"`
+	Outcome               string    `gorm:"size:16;index;not null;default:failed" json:"outcome"`
 	InputTokens           int64     `gorm:"not null;default:0" json:"inputTokens"`
 	NormalInputTokens     int64     `gorm:"not null;default:0" json:"normalInputTokens"`
 	OutputTokens          int64     `gorm:"not null;default:0" json:"outputTokens"`
@@ -143,6 +151,13 @@ type RelayRequestLog struct {
 	Stream                bool      `gorm:"not null;default:false" json:"stream"`
 	ErrorCode             string    `gorm:"size:80" json:"errorCode"`
 	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
+}
+
+func (log *RelayRequestLog) BeforeCreate(_ *gorm.DB) error {
+	if log.Outcome == "" || log.Outcome == RelayOutcomeFailed && ((log.StatusCode >= 200 && log.StatusCode < 300 && log.ErrorCode == "") || log.StatusCode == statusClientClosedRequest || log.ErrorCode == "request_canceled") {
+		log.Outcome = relayRequestOutcome(log.StatusCode, log.ErrorCode)
+	}
+	return nil
 }
 
 // RelaySessionState keeps the small amount of state needed to name a session
@@ -166,6 +181,7 @@ type RelayAttemptLog struct {
 	ChannelBaseURL string `gorm:"size:1024" json:"channelBaseUrl"`
 	ChannelModelID uint64 `gorm:"not null" json:"channelModelId"`
 	UpstreamModel  string `gorm:"size:200;not null" json:"upstreamModel"`
+	APIPath        string `gorm:"-" json:"apiPath"`
 	// PreviousChannelID identifies the channel used immediately before this selection, or zero for an initial route.
 	PreviousChannelID uint64 `gorm:"not null;default:0" json:"previousChannelId"`
 	// PreviousChannelName preserves the prior channel name even if that channel is later removed.
@@ -193,8 +209,20 @@ type RelayAttemptLog struct {
 	LatencyMS             int64     `gorm:"not null;default:0" json:"latencyMs"`
 	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
 	Success               bool      `gorm:"not null;default:false" json:"success"`
+	Outcome               string    `gorm:"size:16;index;not null;default:failed" json:"outcome"`
 	ErrorMessage          string    `gorm:"type:text" json:"errorMessage"`
 	CreatedAt             time.Time `gorm:"index" json:"createdAt"`
+}
+
+func (log *RelayAttemptLog) BeforeCreate(_ *gorm.DB) error {
+	if log.Outcome == "" || log.Outcome == RelayOutcomeFailed && log.Success {
+		if log.Success {
+			log.Outcome = RelayOutcomeSuccess
+		} else {
+			log.Outcome = RelayOutcomeFailed
+		}
+	}
+	return nil
 }
 
 type TokenDailyStat struct {
@@ -202,6 +230,7 @@ type TokenDailyStat struct {
 	TokenID           uint64 `gorm:"primaryKey;autoIncrement:false;index"`
 	RequestCount      int64  `gorm:"not null;default:0"`
 	SuccessCount      int64  `gorm:"not null;default:0"`
+	CanceledCount     int64  `gorm:"not null;default:0"`
 	InputTokens       int64  `gorm:"not null;default:0"`
 	NormalInputTokens int64  `gorm:"not null;default:0"`
 	OutputTokens      int64  `gorm:"not null;default:0"`

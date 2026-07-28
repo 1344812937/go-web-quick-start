@@ -76,7 +76,57 @@ func (s *Store) migrate() error {
 	if err := s.backfillTokenLogFields(); err != nil {
 		return err
 	}
+	if err := s.backfillRelayOutcomes(); err != nil {
+		return err
+	}
 	return s.backfillCostFields()
+}
+
+func (s *Store) backfillRelayOutcomes() error {
+	const migrationName = "relay_outcomes_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := db.Model(&RelayRequestLog{}).Where("status_code BETWEEN 200 AND 299 AND error_code = ''").Update("outcome", RelayOutcomeSuccess).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayRequestLog{}).Where("status_code = ? OR error_code = ?", statusClientClosedRequest, "request_canceled").Update("outcome", RelayOutcomeCanceled).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayRequestLog{}).Where("outcome NOT IN ?", []string{RelayOutcomeSuccess, RelayOutcomeCanceled}).Update("outcome", RelayOutcomeFailed).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayAttemptLog{}).Where("success = ?", true).Update("outcome", RelayOutcomeSuccess).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayAttemptLog{}).Where("success = ? AND request_id IN (?)", false, db.Model(&RelayRequestLog{}).Select("id").Where("outcome = ?", RelayOutcomeCanceled)).Update("outcome", RelayOutcomeCanceled).Error; err != nil {
+			return err
+		}
+		if err := db.Model(&RelayAttemptLog{}).Where("outcome NOT IN ?", []string{RelayOutcomeSuccess, RelayOutcomeCanceled}).Update("outcome", RelayOutcomeFailed).Error; err != nil {
+			return err
+		}
+		type canceledDaily struct {
+			Date    string
+			TokenID uint64
+			Count   int64
+		}
+		var rows []canceledDaily
+		if err := db.Model(&RelayRequestLog{}).Select("date(created_at) AS date, token_id, COUNT(*) AS count").Where("outcome = ?", RelayOutcomeCanceled).Group("date(created_at), token_id").Scan(&rows).Error; err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if err := db.Model(&TokenDailyStat{}).Where("date = ? AND token_id = ?", row.Date, row.TokenID).Update("canceled_count", row.Count).Error; err != nil {
+				return err
+			}
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+	})
 }
 
 func (s *Store) backfillTokenDailyStats() error {
@@ -93,7 +143,8 @@ func (s *Store) backfillTokenDailyStats() error {
 		var stats []TokenDailyStat
 		if err := db.Model(&RelayRequestLog{}).Select(
 			"date(created_at) AS date, token_id, COUNT(*) AS request_count, " +
-				"SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, " +
+				"SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
+				"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
 				"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, " +
 				"COALESCE(SUM(output_tokens),0) AS output_tokens, " +
 				"COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, " +
@@ -133,7 +184,7 @@ func (s *Store) backfillCostFields() error {
 		}
 
 		cutoff := time.Now().Add(-DetailedLogRetentionDays * 24 * time.Hour)
-		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND (status_code < 200 OR status_code >= 300)", cutoff).Updates(map[string]any{
+		if err := db.Model(&RelayRequestLog{}).Where("created_at >= ? AND outcome = ?", cutoff, RelayOutcomeFailed).Updates(map[string]any{
 			"estimated_cost": 0,
 			"upstream_cost":  0,
 			"cost_source":    CostSourceFailedZero,
@@ -146,7 +197,7 @@ func (s *Store) backfillCostFields() error {
 		}).Error; err != nil {
 			return err
 		}
-		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND (success = ? OR status_code < 200 OR status_code >= 300)", cutoff, false).Updates(map[string]any{
+		if err := db.Model(&RelayAttemptLog{}).Where("created_at >= ? AND outcome = ?", cutoff, RelayOutcomeFailed).Updates(map[string]any{
 			"estimated_cost": 0,
 			"upstream_cost":  0,
 			"cost_source":    CostSourceFailedZero,
@@ -171,7 +222,8 @@ func (s *Store) backfillCostFields() error {
 			var stats []TokenDailyStat
 			if err := db.Model(&RelayRequestLog{}).Select(
 				"date(created_at) AS date, token_id, COUNT(*) AS request_count, "+
-					"SUM(CASE WHEN status_code BETWEEN 200 AND 299 THEN 1 ELSE 0 END) AS success_count, "+
+					"SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, "+
+					"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, "+
 					"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, "+
 					"COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, "+
 					"COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, COALESCE(SUM(sent_tokens),0) AS sent_tokens, "+

@@ -4,7 +4,7 @@ import { Delete, Edit, Plus, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Channel, ChannelModel, GatewayModel, RoutingStrategy } from '@/types/gateway'
 import { request } from '@/utils/api'
-import { formatDuration } from '@/utils/formatters'
+import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 
 interface CandidateRow {
   channel: Channel
@@ -26,7 +26,8 @@ const editingId = ref<number | null>(null)
 const deletingModelId = ref<number | null>(null)
 const form = reactive<{ name: string; routingStrategy: RoutingStrategy; enabled: boolean }>({ name: '', routingStrategy: 'priority_weighted', enabled: true })
 const dialogTitle = computed(() => editingId.value ? '编辑公开模型' : '新增公开模型')
-const sortedModels = computed(() => [...models.value].sort((left, right) => right.name.localeCompare(left.name, undefined, { numeric: true, sensitivity: 'base' })))
+const sortedModels = computed(() => [...models.value].sort((left, right) => modelUsageCount(right.id) - modelUsageCount(left.id)
+  || right.name.localeCompare(left.name, undefined, { numeric: true, sensitivity: 'base' })))
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
   { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按配置权重和近 30 分钟成功率分配' },
   { value: 'lowest_cost', label: '最低成本', note: '按本次预计成本优势和近 30 分钟成功率动态分配' },
@@ -35,6 +36,12 @@ const strategies: Array<{ value: RoutingStrategy; label: string; note: string }>
 
 function strategyLabel(value: RoutingStrategy): string {
   return strategies.find((item) => item.value === value)?.label ?? value
+}
+
+function modelUsageCount(modelId: number): number {
+  return channels.value.reduce((total, channel) => total + channel.models
+    .filter((mapping) => mapping.modelId === modelId)
+    .reduce((modelTotal, mapping) => modelTotal + mapping.recentAttemptCount, 0), 0)
 }
 
 function candidates(modelId: number): CandidateRow[] {
@@ -168,7 +175,7 @@ onMounted(loadData)
                   <template #default="candidate">
                     <div class="success-rate-cell">
                       <strong>{{ formatPercent(candidate.row.mapping.recentSuccessRate) }}</strong>
-                      <small v-if="candidate.row.mapping.recentAttemptCount">{{ candidate.row.mapping.recentSuccessCount }} / {{ candidate.row.mapping.recentAttemptCount }} 次尝试</small>
+                      <small v-if="candidate.row.mapping.recentAttemptCount">{{ formatCompactNumber(candidate.row.mapping.recentSuccessCount) }} / {{ formatCompactNumber(candidate.row.mapping.recentAttemptCount) }} 次尝试</small>
                       <small v-else>暂无调用，按 100%</small>
                     </div>
                   </template>
