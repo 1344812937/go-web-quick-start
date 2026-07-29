@@ -8,6 +8,7 @@ import {
   Key,
   Setting,
   Tickets,
+  WarningFilled,
 } from '@element-plus/icons-vue'
 
 export interface NavigationItem {
@@ -53,6 +54,14 @@ export const navigationGroups: NavigationGroup[] = [
         label: '渠道管理',
         icon: Connection,
         component: () => import('@/pages/Channels.vue'),
+      },
+      {
+        key: 'circuit-records',
+        path: '/circuit-records',
+        routeName: 'circuit-records',
+        label: '熔断记录',
+        icon: WarningFilled,
+        component: () => import('@/pages/CircuitRecords.vue'),
       },
       {
         key: 'models',

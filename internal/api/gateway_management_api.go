@@ -37,6 +37,8 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.GET("/logs", a.logs)
 	admin.POST("/logs/clear-payloads", a.clearLogPayloads)
 	admin.GET("/logs/:requestId", a.logDetail)
+	admin.GET("/circuit-records", a.circuitRecords)
+	admin.POST("/circuit-records/:id/reopen-mapping", a.reopenCircuitMapping)
 	admin.GET("/sessions", a.sessions)
 	admin.GET("/sessions/detail", a.sessionDetail)
 	admin.PUT("/sessions/title", a.renameSession)
@@ -148,6 +150,32 @@ func (a *GatewayManagementApi) resetChannelCircuit(c *gin.Context) {
 		return
 	}
 	if err := a.management.ResetChannelCircuit(c.Request.Context(), id); err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S[any](nil))
+}
+
+func (a *GatewayManagementApi) circuitRecords(c *gin.Context) {
+	query := gateway.CircuitRecordQuery{Status: c.Query("status")}
+	query.ChannelID, _ = strconv.ParseUint(c.Query("channelId"), 10, 64)
+	query.Level, _ = strconv.Atoi(c.Query("level"))
+	query.Page, _ = strconv.Atoi(c.Query("page"))
+	query.PageSize, _ = strconv.Atoi(c.Query("pageSize"))
+	page, err := a.management.CircuitRecords(c.Request.Context(), query)
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(page))
+}
+
+func (a *GatewayManagementApi) reopenCircuitMapping(c *gin.Context) {
+	id, ok := parseID(c)
+	if !ok {
+		return
+	}
+	if err := a.management.ReopenCircuitMapping(c.Request.Context(), id); err != nil {
 		managementError(c, err)
 		return
 	}

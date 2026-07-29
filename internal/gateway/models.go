@@ -96,11 +96,30 @@ type ChannelModel struct {
 	CacheWritePriceMicros      *int64    `json:"cacheWritePriceMicros"`
 	PriceMultiplierBasisPoints int64     `gorm:"not null;default:10000" json:"priceMultiplierBasisPoints"`
 	Enabled                    bool      `gorm:"not null" json:"enabled"`
+	CircuitDisabled            bool      `gorm:"not null;default:false;index" json:"circuitDisabled"`
 	CreatedAt                  time.Time `json:"createdAt"`
 	UpdatedAt                  time.Time `json:"updatedAt"`
 	RecentSuccessRate          float64   `gorm:"-" json:"recentSuccessRate"`
 	RecentSuccessCount         int64     `gorm:"-" json:"recentSuccessCount"`
 	RecentAttemptCount         int64     `gorm:"-" json:"recentAttemptCount"`
+}
+
+type CircuitRecord struct {
+	ID             uint64     `gorm:"primaryKey;autoIncrement" json:"id"`
+	ChannelID      uint64     `gorm:"index;not null" json:"channelId"`
+	ChannelModelID uint64     `gorm:"index;not null" json:"channelModelId"`
+	ModelID        uint64     `gorm:"index;not null" json:"modelId"`
+	ChannelName    string     `gorm:"size:120;not null" json:"channelName"`
+	ModelName      string     `gorm:"size:160;not null" json:"modelName"`
+	UpstreamModel  string     `gorm:"size:200;not null" json:"upstreamModel"`
+	Level          int        `gorm:"index;not null" json:"level"`
+	FailureCount   int        `gorm:"not null" json:"failureCount"`
+	Immediate      bool       `gorm:"not null;default:false" json:"immediate"`
+	Message        string     `gorm:"type:text;not null" json:"message"`
+	OpenUntil      *time.Time `json:"openUntil"`
+	ResolvedAt     *time.Time `gorm:"index" json:"resolvedAt"`
+	Resolution     string     `gorm:"size:40;not null;default:''" json:"resolution"`
+	CreatedAt      time.Time  `gorm:"index;not null" json:"createdAt"`
 }
 
 type ClientToken struct {

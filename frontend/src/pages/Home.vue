@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
+import { ArrowDown, Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import RequestTrendChart from '@/pages/home/RequestTrendChart.vue'
 import type { Channel, ClientToken, DashboardSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
@@ -18,10 +19,13 @@ const defaultCodexModel = 'gpt-5.6-sol'
 const selectedModel = ref('')
 const serviceBaseUrl = ref(typeof window === 'undefined' ? '/v1' : `${window.location.origin}/v1`)
 const copyingConfig = ref(false)
+const quickStartExpanded = ref(false)
 
 type DashboardRangeDays = 1 | 2 | 3 | 5
+type TrendDimension = 'hour' | 'day'
 
 const selectedRangeDays = ref<DashboardRangeDays>(1)
+const trendDimension = ref<TrendDimension>('hour')
 const timeRangeOptions: Array<{ label: string; value: DashboardRangeDays }> = [
   { label: '当前', value: 1 },
   { label: '最近两天', value: 2 },
@@ -36,11 +40,29 @@ const topTokenModels = computed(() => [...(dashboard.value?.models ?? [])]
     || left.name.localeCompare(right.name))
   .slice(0, 4))
 const topCostModels = computed(() => (dashboard.value?.models ?? []).slice(0, 5))
+const topCostRatios = computed(() => dashboard.value?.costRatios ?? [])
 const selectedRangeLabel = computed(() => timeRangeOptions.find((option) => option.value === selectedRangeDays.value)?.label ?? '当前')
 const availableChannels = computed(() => channels.value.filter((channel) => (
   channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())
 )).length)
-const maxDailyRequests = computed(() => Math.max(1, ...(dashboard.value?.daily.map((day) => day.requests) ?? [1])))
+const trendDimensionOptions: Array<{ label: string; value: TrendDimension }> = [
+  { label: '小时', value: 'hour' },
+  { label: '天', value: 'day' },
+]
+const requestTrendPoints = computed(() => trendDimension.value === 'hour'
+  ? (dashboard.value?.hourly ?? []).map((hour) => ({
+      key: hour.hour,
+      label: formatHour(hour.hour),
+      requests: hour.requests,
+      successes: hour.successes,
+    }))
+  : (dashboard.value?.daily ?? []).map((day) => ({
+      key: day.date,
+      label: formatDate(day.date),
+      requests: day.requests,
+      successes: day.successes,
+    })))
+const requestTrendAriaLabel = computed(() => `${selectedRangeLabel.value}请求${trendDimension.value === 'hour' ? '小时' : '天'}维度折线图`)
 const readyChannels = computed(() => channels.value.filter((channel) => channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())))
 const readyModels = computed(() => models.value.filter((model) => model.enabled && readyChannels.value.some((channel) => channel.models.some((mapping) => mapping.enabled && mapping.modelId === model.id))))
 const readyTokens = computed(() => tokens.value.filter((token) => token.enabled))
@@ -77,6 +99,12 @@ function formatDate(value: string): string {
   return `${date.getUTCMonth() + 1}/${date.getUTCDate()}`
 }
 
+function formatHour(value: string): string {
+  const hour = value.slice(11, 13)
+  if (selectedRangeDays.value === 1) return `${hour}:00`
+  return `${Number(value.slice(5, 7))}/${Number(value.slice(8, 10))} ${hour}:00`
+}
+
 async function loadDashboard() {
   loading.value = true
   errorMessage.value = ''
@@ -105,6 +133,7 @@ async function loadDashboard() {
 }
 
 function handleTimeRangeChange() {
+  trendDimension.value = selectedRangeDays.value === 1 ? 'hour' : 'day'
   void loadDashboard()
 }
 
@@ -207,12 +236,29 @@ onMounted(loadDashboard)
             <small>悬浮查看费用最高的模型</small>
           </article>
         </el-tooltip>
-        <article class="metric-cell">
-          <span><Coin />费用倍率</span>
-          <strong v-if="!loading">{{ formatRatio(dashboard?.upstreamCostRatio ?? 0) }}</strong>
-          <el-skeleton v-else :rows="1" animated />
-          <small>预估 {{ formatRatio(dashboard?.estimatedCostRatio ?? 0) }} · 官方基准 {{ formatUSD(dashboard?.officialCostMicros ?? 0) }}</small>
-        </article>
+        <el-tooltip placement="bottom" :disabled="loading || topCostRatios.length === 0" popper-class="dashboard-metric-popper">
+          <template #content>
+            <div class="metric-tooltip cost-ratio-tooltip" aria-label="使用最多的五个费用倍率">
+              <header><strong>费用倍率分布</strong><span>按可计算官方基准的请求数排序</span></header>
+              <ol>
+                <li v-for="(item, index) in topCostRatios" :key="item.ratio">
+                  <span class="metric-tooltip-rank">{{ index + 1 }}</span>
+                  <code>{{ formatRatio(item.ratio) }}</code>
+                  <div>
+                    <strong>{{ formatPercent(item.share) }}</strong>
+                    <small>{{ formatCompactNumber(item.requests) }} 个请求</small>
+                  </div>
+                </li>
+              </ol>
+            </div>
+          </template>
+          <article class="metric-cell metric-cell-tooltip" tabindex="0">
+            <span><Coin />费用倍率</span>
+            <strong v-if="!loading">{{ formatRatio(dashboard?.upstreamCostRatio ?? 0) }}</strong>
+            <el-skeleton v-else :rows="1" animated />
+            <small>悬浮查看倍率占比前五</small>
+          </article>
+        </el-tooltip>
         <article class="metric-cell">
           <span><Timer />平均首 Token</span>
           <strong v-if="!loading">{{ dashboard?.firstTokenSampleCount ? formatDuration(dashboard.averageFirstTokenMs) : '--' }}</strong>
@@ -241,23 +287,36 @@ onMounted(loadDashboard)
       <p class="historical-cost-note">{{ selectedRangeLabel }}按东八区自然日和请求级记录统计；重试不会重复累计 Token 与费用，费用优先采用最终上游返回值。</p>
 
       <section class="surface-panel quick-start-panel">
-        <header class="panel-heading">
-          <div><h2>Codex 快速开始</h2><p>使用 Responses 接口连接当前网关</p></div>
+        <header class="panel-heading quick-start-heading">
+          <button
+            class="quick-start-toggle"
+            type="button"
+            :aria-expanded="quickStartExpanded"
+            aria-controls="codex-quick-start-content"
+            @click="quickStartExpanded = !quickStartExpanded"
+          >
+            <el-icon :class="{ 'is-expanded': quickStartExpanded }"><ArrowDown /></el-icon>
+            <span><strong>Codex 快速开始</strong><small>使用 Responses 接口连接当前网关</small></span>
+          </button>
           <el-button :icon="CopyDocument" :loading="copyingConfig" :disabled="!selectedModel" @click="copyCodexConfig">复制配置</el-button>
         </header>
-        <div class="readiness-strip" aria-label="Codex 接入状态">
-          <div><span>渠道</span><strong>{{ readyChannels.length }} / {{ channels.length }}</strong><el-tag :type="readyChannels.length ? 'success' : 'warning'" effect="plain">{{ readyChannels.length ? '就绪' : '待配置' }}</el-tag></div>
-          <div><span>模型</span><strong>{{ readyModels.length }} / {{ models.length }}</strong><el-tag :type="readyModels.length ? 'success' : 'warning'" effect="plain">{{ readyModels.length ? '就绪' : '待启用映射' }}</el-tag></div>
-          <div><span>令牌</span><strong>{{ readyTokens.length }} / {{ tokens.length }}</strong><el-tag :type="readyTokens.length ? 'success' : 'warning'" effect="plain">{{ readyTokens.length ? '就绪' : '待签发' }}</el-tag></div>
-        </div>
-        <div class="quick-start-body">
-          <div class="quick-start-fields">
-            <label><span>Codex 模型</span><el-select v-model="selectedModel" filterable placeholder="选择已就绪模型"><el-option v-for="model in readyModels" :key="model.id" :label="model.name" :value="model.name" /></el-select></label>
-            <label><span>服务地址</span><el-input v-model="serviceBaseUrl" /></label>
-            <div class="token-safety"><strong>env_key</strong><code>OPENAI_API_KEY</code><span>令牌只写入本机环境变量，不在此处显示。</span></div>
+        <el-collapse-transition>
+          <div v-show="quickStartExpanded" id="codex-quick-start-content">
+            <div class="readiness-strip" aria-label="Codex 接入状态">
+              <div><span>渠道</span><strong>{{ readyChannels.length }} / {{ channels.length }}</strong><el-tag :type="readyChannels.length ? 'success' : 'warning'" effect="plain">{{ readyChannels.length ? '就绪' : '待配置' }}</el-tag></div>
+              <div><span>模型</span><strong>{{ readyModels.length }} / {{ models.length }}</strong><el-tag :type="readyModels.length ? 'success' : 'warning'" effect="plain">{{ readyModels.length ? '就绪' : '待启用映射' }}</el-tag></div>
+              <div><span>令牌</span><strong>{{ readyTokens.length }} / {{ tokens.length }}</strong><el-tag :type="readyTokens.length ? 'success' : 'warning'" effect="plain">{{ readyTokens.length ? '就绪' : '待签发' }}</el-tag></div>
+            </div>
+            <div class="quick-start-body">
+              <div class="quick-start-fields">
+                <label><span>Codex 模型</span><el-select v-model="selectedModel" filterable placeholder="选择已就绪模型"><el-option v-for="model in readyModels" :key="model.id" :label="model.name" :value="model.name" /></el-select></label>
+                <label><span>服务地址</span><el-input v-model="serviceBaseUrl" /></label>
+                <div class="token-safety"><strong>env_key</strong><code>OPENAI_API_KEY</code><span>令牌只写入本机环境变量，不在此处显示。</span></div>
+              </div>
+              <pre>{{ codexConfig }}</pre>
+            </div>
           </div>
-          <pre>{{ codexConfig }}</pre>
-        </div>
+        </el-collapse-transition>
       </section>
 
       <div v-if="!loading && dashboard?.requests === 0" class="state-panel state-empty">
@@ -272,24 +331,12 @@ onMounted(loadDashboard)
           <header class="panel-heading">
             <div>
               <h2>{{ selectedRangeLabel }}请求</h2>
-              <p>每日请求量与成功量</p>
+              <p>{{ trendDimension === 'hour' ? '每小时' : '每日' }}请求量与成功量</p>
             </div>
+            <el-segmented v-model="trendDimension" :options="trendDimensionOptions" size="small" aria-label="请求趋势统计维度" />
           </header>
           <div v-if="loading" class="chart-skeleton"><el-skeleton :rows="5" animated /></div>
-          <div
-            v-else
-            class="bar-chart"
-            :style="{ gridTemplateColumns: `repeat(${selectedRangeDays}, minmax(48px, 96px))` }"
-            :aria-label="`${selectedRangeLabel}请求柱状图`"
-          >
-            <div v-for="day in dashboard?.daily" :key="day.date" class="bar-column">
-              <div class="bar-track">
-                <span class="bar-total" :style="{ height: `${day.requests ? Math.max(3, day.requests / maxDailyRequests * 100) : 0}%` }"></span>
-                <span class="bar-success" :style="{ height: `${Math.max(0, day.successes / maxDailyRequests * 100)}%` }"></span>
-              </div>
-              <small>{{ formatDate(day.date) }}</small>
-            </div>
-          </div>
+          <RequestTrendChart v-else :points="requestTrendPoints" :aria-label="requestTrendAriaLabel" />
           <div class="chart-legend"><span><i class="legend-total"></i>请求</span><span><i class="legend-success"></i>成功</span></div>
         </section>
 
@@ -355,6 +402,14 @@ onMounted(loadDashboard)
 .cost-tooltip-list code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .cost-tooltip-list strong { font-variant-numeric: tabular-nums; }
 .quick-start-panel { overflow: hidden; }
+.quick-start-heading { padding-left: 10px; }
+.quick-start-toggle { display: flex; flex: 1; align-items: center; gap: 10px; min-width: 0; padding: 6px 8px; border: 0; border-radius: var(--rose-radius-control); background: transparent; color: inherit; text-align: left; cursor: pointer; }
+.quick-start-toggle:focus-visible { outline: 2px solid var(--rose-primary); outline-offset: 1px; }
+.quick-start-toggle .el-icon { flex: none; color: var(--rose-text-muted); transition: transform 160ms ease; }
+.quick-start-toggle .el-icon.is-expanded { transform: rotate(180deg); }
+.quick-start-toggle > span { display: grid; min-width: 0; gap: 2px; }
+.quick-start-toggle strong { color: var(--rose-text); font-size: 14px; font-weight: 650; }
+.quick-start-toggle small { color: var(--rose-text-muted); font-size: 11px; }
 .readiness-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--rose-border); }
 .readiness-strip > div { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding: 12px 16px; border-right: 1px solid var(--rose-border); }
 .readiness-strip > div:last-child { border-right: 0; }
@@ -375,17 +430,10 @@ onMounted(loadDashboard)
 .cost-cell strong, .usage-cell strong, .success-cell strong { color: var(--rose-text); font-weight: 650; }
 .cost-cell small, .usage-cell small, .success-cell small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
 .chart-skeleton { padding: 24px; }
-.bar-chart { display: grid; align-items: end; justify-content: space-around; gap: 8px; height: 210px; padding: 20px 22px 12px; overflow-x: auto; }
-.bar-column { display: grid; grid-template-rows: 160px 22px; align-items: end; gap: 8px; min-width: 24px; text-align: center; }
-.bar-track { position: relative; height: 160px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
-.bar-track span { position: absolute; inset: auto 0 0; min-height: 0; transition: height 180ms ease; }
-.bar-total { background: var(--rose-primary-soft); }
-.bar-success { left: 28% !important; right: 28% !important; background: var(--rose-success); }
-.bar-column small { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .chart-legend { display: flex; justify-content: flex-end; gap: 18px; padding: 0 22px 18px; color: var(--rose-text-muted); font-size: 12px; }
 .chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .chart-legend i { width: 10px; height: 10px; }
-.legend-total { background: var(--rose-primary-soft); }
+.legend-total { background: var(--rose-primary); }
 .legend-success { background: var(--rose-success); }
 .dashboard-tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 @media (max-width: 860px) {

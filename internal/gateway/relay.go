@@ -273,7 +273,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 			result.costSource = CostSourceFallback
 		}
 		if ctx.Err() == nil && !errors.Is(requestErr, context.Canceled) {
-			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, requestErr.Error())
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, requestErr.Error())
 		}
 		s.recordAttempt(logCtx, execution, candidate, selection, *result, 0, false, requestErr)
 		return result, requestErr
@@ -312,9 +312,9 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 			result.retryDetail = "response_body_read"
 		}
 		if channelFailure {
-			result.circuitOpenUntil = s.recordChannelUnavailable(logCtx, candidate.Channel.ID, failureMessage)
+			result.circuitOpenUntil = s.recordChannelUnavailable(logCtx, candidate.Channel.ID, candidate.Mapping.ID, failureMessage)
 		} else {
-			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, failureMessage)
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, failureMessage)
 		}
 		s.recordAttempt(logCtx, execution, candidate, selection, *result, response.StatusCode, false, attemptErr)
 		if readErr != nil {
@@ -337,7 +337,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 			retryReason: SelectionReasonUpstreamApplicationError, retryDetail: truncateRunes(appErr.Message, 512),
 		}
 		if appErr.penalizesChannel() {
-			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, appErr.Error())
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, appErr.Error())
 		} else {
 			s.recordChannelResponsive(logCtx, candidate.Channel.ID)
 		}
@@ -360,7 +360,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	if readErr != nil {
 		result.retryReason = SelectionReasonResponseError
 		result.retryDetail = "response_body_read"
-		result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, readErr.Error())
+		result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, readErr.Error())
 	} else if success {
 		s.recordChannelSuccess(logCtx, candidate.Channel.ID, latency)
 	} else if !shouldRetryStatus(response.StatusCode) {
@@ -440,7 +440,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 					result.retryReason = SelectionReasonUpstreamApplicationError
 					result.retryDetail = truncateRunes(appErr.Message, 512)
 					logCtx := context.WithoutCancel(ctx)
-					result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, appErr.Error())
+					result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, appErr.Error())
 					s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, appErr)
 					return &result, appErr
 				}
@@ -517,7 +517,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 		result.retryReason = SelectionReasonResponseError
 		logCtx := context.WithoutCancel(ctx)
 		if ctx.Err() == nil && !errors.Is(streamErr, context.Canceled) {
-			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, streamErr.Error())
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, streamErr.Error())
 		}
 		s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, streamErr)
 		return &result, streamErr
@@ -528,7 +528,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			result.retryReason = SelectionReasonResponseError
 			result.retryDetail = "stream_first_event"
 			logCtx := context.WithoutCancel(ctx)
-			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, err.Error())
+			result.circuitOpenUntil = s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, err.Error())
 			s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, err)
 			return &result, err
 		}
@@ -582,7 +582,7 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 	} else if errors.As(streamErr, &appErr) && !appErr.penalizesChannel() {
 		s.recordChannelResponsive(logCtx, candidate.Channel.ID)
 	} else {
-		s.recordChannelFailure(logCtx, candidate.Channel.ID, streamErr.Error())
+		s.recordChannelFailure(logCtx, candidate.Channel.ID, candidate.Mapping.ID, streamErr.Error())
 	}
 	s.recordAttempt(logCtx, execution, candidate, selection, result, result.response.StatusCode, success, streamErr)
 	s.addUsage(execution, usage, estimatedCost, upstreamCost, costSource, success || clientCanceled)
@@ -1560,65 +1560,90 @@ func relayRequestOutcome(status int, errorCode string) string {
 	return RelayOutcomeFailed
 }
 
-func (s *RelayService) recordChannelFailure(ctx context.Context, channelID uint64, message string) *time.Time {
-	return s.recordChannelFailureState(ctx, channelID, message, false)
+func (s *RelayService) recordChannelFailure(ctx context.Context, channelID uint64, channelModelID uint64, message string) *time.Time {
+	return s.recordChannelFailureState(ctx, channelID, channelModelID, message, false)
 }
 
-func (s *RelayService) recordChannelUnavailable(ctx context.Context, channelID uint64, message string) *time.Time {
-	return s.recordChannelFailureState(ctx, channelID, message, true)
+func (s *RelayService) recordChannelUnavailable(ctx context.Context, channelID uint64, channelModelID uint64, message string) *time.Time {
+	return s.recordChannelFailureState(ctx, channelID, channelModelID, message, true)
 }
 
-func (s *RelayService) recordChannelFailureState(ctx context.Context, channelID uint64, message string, immediate bool) *time.Time {
+func (s *RelayService) recordChannelFailureState(ctx context.Context, channelID uint64, channelModelID uint64, message string, immediate bool) *time.Time {
 	message = truncateRunes(message, 2000)
 	now := time.Now()
 	lock := s.channelCircuitLock(channelID)
 	lock.Lock()
 	defer lock.Unlock()
 
-	var channel Channel
-	if err := s.store.db.WithContext(ctx).Select("enabled", "consecutive_failures", "circuit_level", "circuit_open_until").First(&channel, channelID).Error; err != nil {
-		return nil
-	}
-	if channel.CircuitLevel >= CircuitLevelManual {
-		_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
-			"last_error":     message,
-			"last_health_at": now,
-		}).Error
-		return nil
-	}
-
-	failures := channel.ConsecutiveFailures + 1
-	level := max(channel.CircuitLevel, CircuitLevelClosed)
-	var openUntil *time.Time
-	enabled := channel.Enabled
-	if immediate || failures >= circuitFailureThreshold {
-		level++
-		failures = 0
-		switch level {
-		case CircuitLevelTemporary:
-			value := now.Add(temporaryCircuitDuration)
-			openUntil = &value
-		case CircuitLevelExtended:
-			value := now.Add(extendedCircuitDuration)
-			openUntil = &value
-		default:
-			level = CircuitLevelManual
-			enabled = false
+	var activeOpenUntil *time.Time
+	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		var channel Channel
+		if err := db.Select("id", "name", "enabled", "consecutive_failures", "circuit_level", "circuit_open_until").First(&channel, channelID).Error; err != nil {
+			return err
 		}
-	} else if channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(now) {
-		openUntil = channel.CircuitOpenUntil
-	}
-	if err := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
-		"enabled":              enabled,
-		"consecutive_failures": failures,
-		"circuit_level":        level,
-		"circuit_open_until":   openUntil,
-		"last_error":           message,
-		"last_health_at":       now,
-	}).Error; err != nil || openUntil == nil || !openUntil.After(now) {
+		if channel.CircuitLevel >= CircuitLevelManual {
+			return db.Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+				"last_error":     message,
+				"last_health_at": now,
+			}).Error
+		}
+
+		failures := channel.ConsecutiveFailures + 1
+		failureCount := failures
+		level := max(channel.CircuitLevel, CircuitLevelClosed)
+		var openUntil *time.Time
+		if immediate || failures >= circuitFailureThreshold {
+			previousLevel := level
+			targetLevel := min(level+1, CircuitLevelManual)
+			failures = 0
+			switch targetLevel {
+			case CircuitLevelTemporary:
+				value := now.Add(temporaryCircuitDuration)
+				openUntil = &value
+				level = targetLevel
+			case CircuitLevelExtended:
+				value := now.Add(extendedCircuitDuration)
+				openUntil = &value
+				level = targetLevel
+			default:
+				var mapping ChannelModel
+				if err := db.Where("id = ? AND channel_id = ?", channelModelID, channelID).First(&mapping).Error; err != nil {
+					return err
+				}
+				if err := db.Model(&mapping).Updates(map[string]any{"enabled": false, "circuit_disabled": true}).Error; err != nil {
+					return err
+				}
+				level = CircuitLevelClosed
+			}
+			if previousLevel > CircuitLevelClosed {
+				if err := resolveCircuitRecords(db, channelID, 0, previousLevel, CircuitResolutionEscalated, now); err != nil {
+					return err
+				}
+			}
+			if err := createCircuitRecord(db, channel, channelModelID, targetLevel, failureCount, immediate, openUntil, message); err != nil {
+				return err
+			}
+		} else if channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(now) {
+			openUntil = channel.CircuitOpenUntil
+		}
+		if err := db.Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+			"consecutive_failures": failures,
+			"circuit_level":        level,
+			"circuit_open_until":   openUntil,
+			"last_error":           message,
+			"last_health_at":       now,
+		}).Error; err != nil {
+			return err
+		}
+		if openUntil != nil && openUntil.After(now) {
+			activeOpenUntil = openUntil
+		}
+		return nil
+	})
+	if err != nil {
 		return nil
 	}
-	return openUntil
+	return activeOpenUntil
 }
 
 func (s *RelayService) recordChannelSuccess(ctx context.Context, channelID uint64, latencyMS int64) {
@@ -1642,18 +1667,26 @@ func (s *RelayService) recordChannelRecovery(ctx context.Context, channelID uint
 	lock.Lock()
 	defer lock.Unlock()
 
-	var channel Channel
-	if err := s.store.db.WithContext(ctx).Select("circuit_level").First(&channel, channelID).Error; err != nil || channel.CircuitLevel >= CircuitLevelManual {
-		return
-	}
-	level := max(channel.CircuitLevel-1, CircuitLevelClosed)
-	updates["circuit_level"] = level
-	updates["circuit_open_until"] = nil
-	updates["last_health_at"] = time.Now()
-	if level == CircuitLevelClosed {
-		updates["last_error"] = ""
-	}
-	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(updates).Error
+	now := time.Now()
+	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		var channel Channel
+		if err := db.Select("circuit_level").First(&channel, channelID).Error; err != nil || channel.CircuitLevel >= CircuitLevelManual {
+			return err
+		}
+		level := max(channel.CircuitLevel-1, CircuitLevelClosed)
+		updates["circuit_level"] = level
+		updates["circuit_open_until"] = nil
+		updates["last_health_at"] = now
+		if level == CircuitLevelClosed {
+			updates["last_error"] = ""
+		}
+		if channel.CircuitLevel > CircuitLevelClosed {
+			if err := resolveCircuitRecords(db, channelID, 0, channel.CircuitLevel, CircuitResolutionAutomaticRecovery, now); err != nil {
+				return err
+			}
+		}
+		return db.Model(&Channel{}).Where("id = ?", channelID).Updates(updates).Error
+	})
 }
 
 func (s *RelayService) channelCircuitLock(channelID uint64) *sync.Mutex {

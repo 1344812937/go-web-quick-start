@@ -58,6 +58,7 @@ func (s *Store) migrate() error {
 		&Channel{},
 		&GatewayModel{},
 		&ChannelModel{},
+		&CircuitRecord{},
 		&ClientToken{},
 		&ClientTokenModel{},
 		&RelayRequestLog{},

@@ -29,6 +29,7 @@ interface MappingDraft {
   cacheWritePrice: number | null
   adjustmentMultiplier: number
   enabled: boolean
+  circuitDisabled: boolean
   recentAttemptCount: number
 }
 
@@ -142,6 +143,7 @@ function mappingDraft(mapping: ChannelModel): MappingDraft {
     cacheWritePrice: fromMicros(mapping.cacheWritePriceMicros),
     adjustmentMultiplier: Number.isFinite(mapping.priceMultiplierBasisPoints) ? mapping.priceMultiplierBasisPoints / 10_000 : 1,
     enabled: mapping.enabled,
+    circuitDisabled: mapping.circuitDisabled,
     recentAttemptCount: mapping.recentAttemptCount,
   }
 }
@@ -160,6 +162,7 @@ function discoveredMappingDraft(model: UpstreamModel, enabled = false): MappingD
     cacheWritePrice: fromMicros(price?.cacheWritePriceMicros ?? null),
     adjustmentMultiplier: 1,
     enabled,
+    circuitDisabled: false,
     recentAttemptCount: 0,
   }
 }
@@ -414,6 +417,11 @@ function modelTagStyle(modelId: number): CSSProperties {
 function removeMapping(mapping: MappingDraft) {
   const index = mappings.value.indexOf(mapping)
   if (index >= 0) mappings.value.splice(index, 1)
+}
+
+function updateMappingEnabled(mapping: MappingDraft, enabled: boolean) {
+  mapping.enabled = enabled
+  if (enabled) mapping.circuitDisabled = false
 }
 
 function formatPercent(value: number): string {
@@ -775,8 +783,8 @@ onUnmounted(() => {
           <div v-if="group.items.length === 0" class="mapping-group-empty">{{ group.emptyText }}</div>
           <article v-for="(mapping, index) in group.items" :key="mapping.clientKey" class="mapping-editor">
           <header class="mapping-editor-header">
-            <div><strong>{{ group.label }}映射 {{ index + 1 }}</strong><span>{{ mapping.upstreamModel || '未选择上游模型' }}</span></div>
-            <div class="mapping-editor-actions"><el-checkbox v-model="mapping.enabled">启用该映射</el-checkbox><el-button :icon="Delete" title="删除映射" circle @click="removeMapping(mapping)" /></div>
+            <div><strong>{{ group.label }}映射 {{ index + 1 }}</strong><el-tag v-if="mapping.circuitDisabled" type="danger" effect="plain" size="small">熔断关闭</el-tag><span>{{ mapping.upstreamModel || '未选择上游模型' }}</span></div>
+            <div class="mapping-editor-actions"><el-checkbox :model-value="mapping.enabled" @change="updateMappingEnabled(mapping, Boolean($event))">启用该映射</el-checkbox><el-button :icon="Delete" title="删除映射" circle @click="removeMapping(mapping)" /></div>
           </header>
 
           <div class="mapping-model-grid">

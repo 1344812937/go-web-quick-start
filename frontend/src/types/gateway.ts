@@ -35,6 +35,8 @@ export interface ChannelModel {
   priceMultiplierBasisPoints: number
   /** Whether this mapping can receive new requests. */
   enabled: boolean
+  /** Whether a level-three circuit event disabled this mapping pending manual reopening. */
+  circuitDisabled: boolean
 
   /** Successes divided by attempts for this channel-model mapping during the last 30 minutes; 1 without samples. */
   recentSuccessRate: number
@@ -101,7 +103,7 @@ export interface Channel {
   priceMultiplierBasisPoints: number
   /** Number of consecutive retryable failures. */
   consecutiveFailures: number
-  /** Circuit escalation level: 0 closed, 1 temporary, 2 extended, 3 manually recoverable. */
+  /** Channel circuit level: 0 closed, 1 temporary, 2 extended; 3 is retained only for legacy channel state. */
   circuitLevel: number
   /** Circuit reopening timestamp, or null when the circuit is closed. */
   circuitOpenUntil: string | null
@@ -121,6 +123,60 @@ export interface Channel {
   createdAt: string
   /** Channel update timestamp in RFC 3339 format. */
   updatedAt: string
+}
+
+export type CircuitResolution = '' | 'automatic_recovery' | 'escalated' | 'manual_reopen' | 'mapping_removed' | 'manual_reset'
+
+export interface CircuitRecord {
+  /** Persistent circuit event identifier. */
+  id: number
+  /** Channel involved when the event occurred. */
+  channelId: number
+  /** Channel-model mapping that triggered the event. */
+  channelModelId: number
+  /** Public model identifier captured for the triggering mapping. */
+  modelId: number
+  /** Channel name snapshot retained after configuration changes. */
+  channelName: string
+  /** Public model name snapshot retained after configuration changes. */
+  modelName: string
+  /** Upstream model name snapshot retained after configuration changes. */
+  upstreamModel: string
+  /** Circuit level opened by this event. */
+  level: 1 | 2 | 3
+  /** Consecutive failure count observed when the event opened. */
+  failureCount: number
+  /** Whether an account or credential failure bypassed the normal failure threshold. */
+  immediate: boolean
+  /** Truncated upstream failure text captured for diagnosis. */
+  message: string
+  /** Automatic routing exclusion deadline for level one or two, otherwise null. */
+  openUntil: string | null
+  /** Resolution timestamp, or null while recovery or manual reopening is pending. */
+  resolvedAt: string | null
+  /** How the event left its pending state. */
+  resolution: CircuitResolution
+  /** Event creation timestamp in RFC 3339 format. */
+  createdAt: string
+  /** Whether the original mapping still exists. */
+  mappingExists: boolean
+  /** Whether the original mapping currently accepts requests. */
+  mappingEnabled: boolean
+  /** Whether the original mapping is currently disabled by level-three circuit handling. */
+  mappingCircuitDisabled: boolean
+}
+
+export interface CircuitRecordPage {
+  /** Circuit events on the requested page. */
+  items: CircuitRecord[]
+  /** Number of events matching the active filters. */
+  total: number
+  /** Global number of level-three mappings still awaiting manual reopening. */
+  pendingManual: number
+  /** One-based page number returned by the backend. */
+  page: number
+  /** Maximum number of events returned on this page. */
+  pageSize: number
 }
 
 export interface ChannelModelDiscoveryRequest {
@@ -300,6 +356,24 @@ export interface DashboardDaily {
   durationSampleCount: number
 }
 
+export interface DashboardHourly {
+  /** UTC+8 hour bucket in RFC 3339 format. */
+  hour: string
+  /** Requests received during the hour. */
+  requests: number
+  /** Requests that reached a protocol-level successful completion during the hour. */
+  successes: number
+}
+
+export interface DashboardCostRatio {
+  /** Effective upstream-to-official cost ratio, rounded to two decimals. */
+  ratio: number
+  /** Requests in the selected range that used this effective ratio. */
+  requests: number
+  /** Share of requests with a calculable official-price baseline represented by this ratio. */
+  share: number
+}
+
 export interface DashboardBreakdown {
   /** Channel or public model label. */
   name: string
@@ -364,6 +438,10 @@ export interface DashboardSummary {
   durationSampleCount: number
   /** Daily metrics for each date in the selected range, including zero-value dates. */
   daily: DashboardDaily[]
+  /** Hourly request metrics from the start of the selected range through the current UTC+8 hour. */
+  hourly: DashboardHourly[]
+  /** Five most-used effective upstream cost ratios in the selected range. */
+  costRatios: DashboardCostRatio[]
   /** Highest-usage channel breakdown from detailed logs in the selected range. */
   channels: DashboardBreakdown[]
   /** Highest-usage public model breakdown from detailed logs in the selected range. */

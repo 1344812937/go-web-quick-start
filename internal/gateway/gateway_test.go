@@ -126,6 +126,7 @@ func newTestStore(t *testing.T) *Store {
 	t.Cleanup(func() { _ = sqlDB.Close() })
 	if err := db.AutoMigrate(
 		&AdminUser{}, &AdminSession{}, &Channel{}, &GatewayModel{}, &ChannelModel{},
+		&CircuitRecord{},
 		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
 		&ResponseAffinity{}, &SessionAffinity{},
 	); err != nil {
@@ -422,6 +423,41 @@ func TestReplaceChannelModelsPersistsDisabledMapping(t *testing.T) {
 	}
 	if stored.Enabled || stored.PriceMultiplierBasisPoints != priceMultiplierBasisPoints {
 		t.Fatalf("stored mapping = %+v", stored)
+	}
+}
+
+func TestReplaceChannelModelsManuallyReopensCircuitDisabledMapping(t *testing.T) {
+	store := newTestStore(t)
+	_, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	if err := store.db.Model(&ChannelModel{}).Where("id = ?", mappings[0].ID).Updates(map[string]any{
+		"enabled":          false,
+		"circuit_disabled": true,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	record := CircuitRecord{
+		ChannelID: channels[0].ID, ChannelModelID: mappings[0].ID, ModelID: model.ID,
+		ChannelName: channels[0].Name, ModelName: model.Name, UpstreamModel: mappings[0].UpstreamModel,
+		Level: CircuitLevelManual, FailureCount: circuitFailureThreshold, Message: "terminal failure", CreatedAt: time.Now(),
+	}
+	if err := store.db.Create(&record).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := NewManagementService(store).ReplaceChannelModels(context.Background(), channels[0].ID, []ChannelModelInput{{
+		ModelID: model.ID, UpstreamModel: mappings[0].UpstreamModel, Weight: 100, Enabled: true,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated) != 1 || updated[0].ID != mappings[0].ID || !updated[0].Enabled || updated[0].CircuitDisabled {
+		t.Fatalf("manually reopened mapping = %+v", updated)
+	}
+	if err := store.db.First(&record, record.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.ResolvedAt == nil || record.Resolution != CircuitResolutionManualReopen {
+		t.Fatalf("resolved circuit record = %+v", record)
 	}
 }
 
@@ -861,6 +897,40 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	}
 	if len(summary.Daily) != 1 || summary.Daily[0].Date != eastEightDate(now) || summary.Daily[0].Requests != 1 {
 		t.Fatalf("dashboard daily = %+v", summary.Daily)
+	}
+}
+
+func TestDashboardIncludesHourlyTrendAndTopCostRatios(t *testing.T) {
+	store := newTestStore(t)
+	currentHour := time.Now().In(eastEightLocation).Truncate(time.Hour)
+	requests := []RelayRequestLog{
+		{ID: "ratio-two-a", TokenID: 1, Endpoint: "responses", RequestedModel: "gpt-5", StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, InputTokens: 1_000_000, NormalInputTokens: 1_000_000, UpstreamCost: 2_500_000, CreatedAt: currentHour.Add(time.Minute).UTC()},
+		{ID: "ratio-two-b", TokenID: 1, Endpoint: "responses", RequestedModel: "gpt-5", StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, InputTokens: 1_000_000, NormalInputTokens: 1_000_000, UpstreamCost: 2_500_000, CreatedAt: currentHour.Add(2 * time.Minute).UTC()},
+		{ID: "ratio-one-half", TokenID: 1, Endpoint: "responses", RequestedModel: "gpt-5", StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, InputTokens: 1_000_000, NormalInputTokens: 1_000_000, UpstreamCost: 1_875_000, CreatedAt: currentHour.Add(3 * time.Minute).UTC()},
+	}
+	if err := store.db.Create(&requests).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := NewManagementService(store).Dashboard(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Hourly) == 0 {
+		t.Fatal("dashboard hourly trend is empty")
+	}
+	latest := summary.Hourly[len(summary.Hourly)-1]
+	if latest.Hour != currentHour.Format("2006-01-02T15:00:00-07:00") || latest.Requests != 3 || latest.Successes != 3 {
+		t.Fatalf("latest hourly bucket = %+v", latest)
+	}
+	if len(summary.CostRatios) != 2 {
+		t.Fatalf("cost ratio distribution = %+v", summary.CostRatios)
+	}
+	if first := summary.CostRatios[0]; first.Ratio != 2 || first.Requests != 2 || math.Abs(first.Share-2.0/3.0) > 0.0001 {
+		t.Fatalf("top cost ratio = %+v", first)
+	}
+	if second := summary.CostRatios[1]; second.Ratio != 1.5 || second.Requests != 1 || math.Abs(second.Share-1.0/3.0) > 0.0001 {
+		t.Fatalf("second cost ratio = %+v", second)
 	}
 }
 
@@ -2377,10 +2447,10 @@ func TestCodexSessionAffinityClassifiesUnavailableTarget(t *testing.T) {
 
 func TestCircuitOpensAfterThreeFailuresAndRecovers(t *testing.T) {
 	store := newTestStore(t)
-	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
 	relay := newTestRelay(store)
 	for range 3 {
-		relay.recordChannelFailure(context.Background(), channels[0].ID, "retryable failure")
+		relay.recordChannelFailure(context.Background(), channels[0].ID, mappings[0].ID, "retryable failure")
 	}
 	var channel Channel
 	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
@@ -2423,18 +2493,18 @@ func TestBackfillCircuitLevelsPreservesExistingOpenCircuits(t *testing.T) {
 
 func TestCircuitEscalatesAndRecoversOneLevelAtATime(t *testing.T) {
 	store := newTestStore(t)
-	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	_, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
 	relay := newTestRelay(store)
 	channelID := channels[0].ID
 
 	for range circuitFailureThreshold {
-		relay.recordChannelFailure(context.Background(), channelID, "temporary failure")
+		relay.recordChannelFailure(context.Background(), channelID, mappings[0].ID, "temporary failure")
 	}
 	if err := store.db.Model(&Channel{}).Where("id = ?", channelID).Update("circuit_open_until", time.Now().Add(-time.Second)).Error; err != nil {
 		t.Fatal(err)
 	}
 	for range circuitFailureThreshold {
-		relay.recordChannelFailure(context.Background(), channelID, "extended failure")
+		relay.recordChannelFailure(context.Background(), channelID, mappings[0].ID, "extended failure")
 	}
 
 	var channel Channel
@@ -2461,11 +2531,26 @@ func TestCircuitEscalatesAndRecoversOneLevelAtATime(t *testing.T) {
 	if channel.CircuitLevel != CircuitLevelClosed || channel.CircuitOpenUntil != nil || channel.LastError != "" {
 		t.Fatalf("full recovery = %+v", channel)
 	}
+	var records []CircuitRecord
+	if err := store.db.Order("level asc").Find(&records).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Resolution != CircuitResolutionEscalated || records[1].Resolution != CircuitResolutionAutomaticRecovery {
+		t.Fatalf("circuit records = %+v", records)
+	}
 }
 
-func TestHighestCircuitLevelRequiresManualRecovery(t *testing.T) {
+func TestHighestCircuitLevelDisablesOnlyFailingMapping(t *testing.T) {
 	store := newTestStore(t)
-	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	token, _, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	secondModel := GatewayModel{Name: "second-public-model", RoutingStrategy: RoutingPriorityWeighted, Enabled: true}
+	if err := store.db.Create(&secondModel).Error; err != nil {
+		t.Fatal(err)
+	}
+	secondMapping := ChannelModel{ChannelID: channels[0].ID, ModelID: secondModel.ID, UpstreamModel: "second-upstream-model", Priority: 10, Weight: 100, Enabled: true}
+	if err := store.db.Create(&secondMapping).Error; err != nil {
+		t.Fatal(err)
+	}
 	relay := newTestRelay(store)
 	channelID := channels[0].ID
 	if err := store.db.Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
@@ -2476,33 +2561,66 @@ func TestHighestCircuitLevelRequiresManualRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	relay.recordChannelFailure(context.Background(), channelID, "terminal failure")
+	relay.recordChannelFailure(context.Background(), channelID, mappings[0].ID, "terminal failure")
 	var channel Channel
 	if err := store.db.First(&channel, channelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.CircuitLevel != CircuitLevelManual || channel.Enabled || channel.CircuitOpenUntil != nil {
-		t.Fatalf("manual circuit = %+v", channel)
+	if channel.CircuitLevel != CircuitLevelClosed || !channel.Enabled || channel.CircuitOpenUntil != nil || channel.ConsecutiveFailures != 0 {
+		t.Fatalf("channel should remain available after terminal mapping circuit = %+v", channel)
 	}
-	relay.recordChannelSuccess(context.Background(), channelID, 10)
-	channel = Channel{}
-	if err := store.db.First(&channel, channelID).Error; err != nil {
+	var failedMapping ChannelModel
+	if err := store.db.First(&failedMapping, mappings[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.CircuitLevel != CircuitLevelManual || channel.Enabled {
-		t.Fatalf("automatic recovery changed manual circuit = %+v", channel)
+	if failedMapping.Enabled || !failedMapping.CircuitDisabled {
+		t.Fatalf("failed mapping = %+v", failedMapping)
+	}
+	var availableMapping ChannelModel
+	if err := store.db.First(&availableMapping, secondMapping.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !availableMapping.Enabled || availableMapping.CircuitDisabled {
+		t.Fatalf("unrelated mapping = %+v", availableMapping)
+	}
+	plan, err := relay.router.Plan(context.Background(), token, secondModel.Name, 10, 10, "", "")
+	if err != nil || len(plan.Candidates) != 1 || plan.Candidates[0].Mapping.ID != secondMapping.ID {
+		t.Fatalf("remaining route plan = %+v, error = %v", plan, err)
+	}
+
+	relay.recordChannelSuccess(context.Background(), channelID, 10)
+	failedMapping = ChannelModel{}
+	if err := store.db.First(&failedMapping, mappings[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if failedMapping.Enabled || !failedMapping.CircuitDisabled {
+		t.Fatalf("automatic channel recovery changed terminal mapping = %+v", failedMapping)
 	}
 
 	management := NewManagementService(store)
-	if err := management.ResetChannelCircuit(context.Background(), channelID); err != nil {
+	page, err := management.CircuitRecords(context.Background(), CircuitRecordQuery{Level: CircuitLevelManual})
+	if err != nil {
 		t.Fatal(err)
 	}
-	channel = Channel{}
-	if err := store.db.First(&channel, channelID).Error; err != nil {
+	if page.Total != 1 || page.PendingManual != 1 || len(page.Items) != 1 || !page.Items[0].MappingCircuitDisabled {
+		t.Fatalf("terminal circuit page = %+v", page)
+	}
+	if err := management.ReopenCircuitMapping(context.Background(), page.Items[0].ID); err != nil {
 		t.Fatal(err)
 	}
-	if channel.CircuitLevel != CircuitLevelClosed || !channel.Enabled || channel.LastError != "" {
-		t.Fatalf("manual recovery = %+v", channel)
+	failedMapping = ChannelModel{}
+	if err := store.db.First(&failedMapping, mappings[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !failedMapping.Enabled || failedMapping.CircuitDisabled {
+		t.Fatalf("manually reopened mapping = %+v", failedMapping)
+	}
+	var record CircuitRecord
+	if err := store.db.First(&record, page.Items[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if record.ResolvedAt == nil || record.Resolution != CircuitResolutionManualReopen {
+		t.Fatalf("resolved terminal record = %+v", record)
 	}
 }
 

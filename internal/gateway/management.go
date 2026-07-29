@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -167,6 +168,8 @@ type DashboardSummary struct {
 	AverageDurationMS     float64              `json:"averageDurationMs"`
 	DurationSampleCount   int64                `json:"durationSampleCount"`
 	Daily                 []DashboardDaily     `json:"daily"`
+	Hourly                []DashboardHourly    `json:"hourly"`
+	CostRatios            []DashboardCostRatio `json:"costRatios"`
 	Channels              []DashboardBreakdown `json:"channels"`
 	Models                []DashboardBreakdown `json:"models"`
 }
@@ -186,6 +189,18 @@ type DashboardDaily struct {
 	LatencySampleCount    int64   `json:"latencySampleCount"`
 	AverageDurationMS     float64 `json:"averageDurationMs"`
 	DurationSampleCount   int64   `json:"durationSampleCount"`
+}
+
+type DashboardHourly struct {
+	Hour      string `json:"hour"`
+	Requests  int64  `json:"requests"`
+	Successes int64  `json:"successes"`
+}
+
+type DashboardCostRatio struct {
+	Ratio    float64 `json:"ratio"`
+	Requests int64   `json:"requests"`
+	Share    float64 `json:"share"`
 }
 
 type DashboardBreakdown struct {
@@ -524,6 +539,9 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 
 func (s *ManagementService) DeleteChannel(ctx context.Context, id uint64) error {
 	return s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		if err := resolveCircuitRecords(db, id, 0, 0, CircuitResolutionMappingRemoved, time.Now()); err != nil {
+			return err
+		}
 		if err := db.Where("channel_id = ?", id).Delete(&ChannelModel{}).Error; err != nil {
 			return err
 		}
@@ -539,20 +557,22 @@ func (s *ManagementService) DeleteChannel(ctx context.Context, id uint64) error 
 }
 
 func (s *ManagementService) ResetChannelCircuit(ctx context.Context, id uint64) error {
-	result := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", id).Updates(map[string]any{
-		"enabled":              true,
-		"consecutive_failures": 0,
-		"circuit_level":        CircuitLevelClosed,
-		"circuit_open_until":   nil,
-		"last_error":           "",
+	return s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		result := db.Model(&Channel{}).Where("id = ?", id).Updates(map[string]any{
+			"enabled":              true,
+			"consecutive_failures": 0,
+			"circuit_level":        CircuitLevelClosed,
+			"circuit_open_until":   nil,
+			"last_error":           "",
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected == 0 {
+			return gorm.ErrRecordNotFound
+		}
+		return resolveCircuitRecords(db, id, 0, 0, CircuitResolutionManualReset, time.Now())
 	})
-	if result.Error != nil {
-		return result.Error
-	}
-	if result.RowsAffected == 0 {
-		return gorm.ErrRecordNotFound
-	}
-	return nil
 }
 
 func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID uint64, inputs []ChannelModelInput) ([]ChannelModel, error) {
@@ -604,13 +624,48 @@ func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID 
 		})
 	}
 	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
-		if err := db.Where("channel_id = ?", channelID).Delete(&ChannelModel{}).Error; err != nil {
+		var existing []ChannelModel
+		if err := db.Where("channel_id = ?", channelID).Find(&existing).Error; err != nil {
 			return err
 		}
-		if len(models) == 0 {
-			return nil
+		existingByModelID := make(map[uint64]ChannelModel, len(existing))
+		for _, mapping := range existing {
+			existingByModelID[mapping.ModelID] = mapping
 		}
-		return db.Create(&models).Error
+		requestedModelIDs := make(map[uint64]struct{}, len(models))
+		for index := range models {
+			requestedModelIDs[models[index].ModelID] = struct{}{}
+			current, exists := existingByModelID[models[index].ModelID]
+			if !exists {
+				if err := db.Create(&models[index]).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			models[index].ID = current.ID
+			models[index].CreatedAt = current.CreatedAt
+			models[index].CircuitDisabled = current.CircuitDisabled && !models[index].Enabled
+			if current.CircuitDisabled && models[index].Enabled {
+				if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionManualReopen, time.Now()); err != nil {
+					return err
+				}
+			}
+			if err := db.Save(&models[index]).Error; err != nil {
+				return err
+			}
+		}
+		for _, current := range existing {
+			if _, kept := requestedModelIDs[current.ModelID]; kept {
+				continue
+			}
+			if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionMappingRemoved, time.Now()); err != nil {
+				return err
+			}
+			if err := db.Delete(&current).Error; err != nil {
+				return err
+			}
+		}
+		return nil
 	})
 	for index := range models {
 		models[index].RecentSuccessRate = 1
@@ -1118,10 +1173,17 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	if days != 1 && days != 2 && days != 3 && days != 5 {
 		return nil, errors.New("统计时间范围仅支持 1、2、3 或 5 天")
 	}
-	today := eastEightStartOfDay(time.Now())
+	now := time.Now()
+	today := eastEightStartOfDay(now)
 	startTime := today.AddDate(0, 0, -(days - 1)).UTC()
 	endTime := today.AddDate(0, 0, 1).UTC()
-	summary := &DashboardSummary{Daily: []DashboardDaily{}, Channels: []DashboardBreakdown{}, Models: []DashboardBreakdown{}}
+	summary := &DashboardSummary{
+		Daily:      []DashboardDaily{},
+		Hourly:     []DashboardHourly{},
+		CostRatios: []DashboardCostRatio{},
+		Channels:   []DashboardBreakdown{},
+		Models:     []DashboardBreakdown{},
+	}
 	type totals struct {
 		Requests              int64
 		Successes             int64
@@ -1173,15 +1235,40 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		OutputTokens      int64
 		CachedTokens      int64
 		CacheWriteTokens  int64
+		UpstreamCost      int64
 	}
 	var officialUsage []officialUsageRow
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
-		Select("requested_model, input_tokens, normal_input_tokens, output_tokens, cached_tokens, cache_write_tokens").
+		Select("requested_model, input_tokens, normal_input_tokens, output_tokens, cached_tokens, cache_write_tokens, upstream_cost").
 		Where("created_at >= ? AND created_at < ?", startTime, endTime).Find(&officialUsage).Error; err != nil {
 		return nil, err
 	}
+	costRatioCounts := make(map[int64]int64)
+	var costRatioSamples int64
 	for _, usage := range officialUsage {
-		summary.OfficialCost += officialUsageCost(usage.RequestedModel, usage.InputTokens, usage.NormalInputTokens, usage.OutputTokens, usage.CachedTokens, usage.CacheWriteTokens)
+		officialCost := officialUsageCost(usage.RequestedModel, usage.InputTokens, usage.NormalInputTokens, usage.OutputTokens, usage.CachedTokens, usage.CacheWriteTokens)
+		summary.OfficialCost += officialCost
+		if officialCost > 0 {
+			ratioBasisPoints := int64(math.Round(float64(max(usage.UpstreamCost, 0)) / float64(officialCost) * 100))
+			costRatioCounts[ratioBasisPoints]++
+			costRatioSamples++
+		}
+	}
+	for ratioBasisPoints, requests := range costRatioCounts {
+		summary.CostRatios = append(summary.CostRatios, DashboardCostRatio{
+			Ratio:    float64(ratioBasisPoints) / 100,
+			Requests: requests,
+			Share:    float64(requests) / float64(costRatioSamples),
+		})
+	}
+	sort.Slice(summary.CostRatios, func(left, right int) bool {
+		if summary.CostRatios[left].Requests == summary.CostRatios[right].Requests {
+			return summary.CostRatios[left].Ratio > summary.CostRatios[right].Ratio
+		}
+		return summary.CostRatios[left].Requests > summary.CostRatios[right].Requests
+	})
+	if len(summary.CostRatios) > 5 {
+		summary.CostRatios = summary.CostRatios[:5]
 	}
 	if summary.OfficialCost > 0 {
 		summary.EstimatedCostRatio = float64(summary.EstimatedCost) / float64(summary.OfficialCost)
@@ -1223,6 +1310,27 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 			daily = DashboardDaily{Date: date}
 		}
 		summary.Daily = append(summary.Daily, daily)
+	}
+	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
+		Select(sqliteEastEightCreatedHour+" AS hour, COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes").
+		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group(sqliteEastEightCreatedHour).Order("hour asc").Scan(&summary.Hourly).Error; err != nil {
+		return nil, err
+	}
+	hourlyByHour := make(map[string]DashboardHourly, len(summary.Hourly))
+	for _, hourly := range summary.Hourly {
+		hourlyByHour[hourly.Hour] = hourly
+	}
+	currentHour := now.In(eastEightLocation).Truncate(time.Hour)
+	startHour := today.AddDate(0, 0, -(days - 1))
+	hourCount := int(currentHour.Sub(startHour)/time.Hour) + 1
+	summary.Hourly = make([]DashboardHourly, 0, max(hourCount, 0))
+	for hour := startHour; !hour.After(currentHour); hour = hour.Add(time.Hour) {
+		key := hour.Format("2006-01-02T15:00:00-07:00")
+		hourly, ok := hourlyByHour[key]
+		if !ok {
+			hourly = DashboardHourly{Hour: key}
+		}
+		summary.Hourly = append(summary.Hourly, hourly)
 	}
 	if err := s.store.db.WithContext(ctx).Table("relay_request_logs AS request").
 		Select("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道') AS name, COUNT(*) AS requests, "+
