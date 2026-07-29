@@ -59,6 +59,11 @@ type ChannelView struct {
 	Metrics          ChannelMetrics `json:"metrics"`
 }
 
+type GatewayModelView struct {
+	GatewayModel
+	RequestCount int64 `json:"requestCount"`
+}
+
 type ChannelLatencyPoint struct {
 	RecordedAt time.Time `json:"recordedAt"`
 	LatencyMS  int64     `json:"latencyMs"`
@@ -145,9 +150,16 @@ type DashboardSummary struct {
 	CanceledCount         int64                `json:"canceledCount"`
 	SuccessRate           float64              `json:"successRate"`
 	InputTokens           int64                `json:"inputTokens"`
+	NormalInputTokens     int64                `json:"normalInputTokens"`
 	OutputTokens          int64                `json:"outputTokens"`
+	CachedTokens          int64                `json:"cachedTokens"`
+	CacheWriteTokens      int64                `json:"cacheWriteTokens"`
+	CacheHitRate          float64              `json:"cacheHitRate"`
 	EstimatedCost         int64                `json:"estimatedCostMicros"`
 	UpstreamCost          int64                `json:"upstreamCostMicros"`
+	OfficialCost          int64                `json:"officialCostMicros"`
+	EstimatedCostRatio    float64              `json:"estimatedCostRatio"`
+	UpstreamCostRatio     float64              `json:"upstreamCostRatio"`
 	AverageFirstTokenMS   float64              `json:"averageFirstTokenMs"`
 	FirstTokenSampleCount int64                `json:"firstTokenSampleCount"`
 	AverageLatency        float64              `json:"averageLatencyMs"`
@@ -177,10 +189,15 @@ type DashboardDaily struct {
 }
 
 type DashboardBreakdown struct {
-	Name          string `json:"name"`
-	Requests      int64  `json:"requests"`
-	EstimatedCost int64  `json:"estimatedCostMicros"`
-	UpstreamCost  int64  `json:"upstreamCostMicros"`
+	Name          string  `json:"name"`
+	Requests      int64   `json:"requests"`
+	Successes     int64   `json:"successes"`
+	CanceledCount int64   `json:"canceledCount"`
+	SuccessRate   float64 `json:"successRate"`
+	InputTokens   int64   `json:"inputTokens"`
+	OutputTokens  int64   `json:"outputTokens"`
+	EstimatedCost int64   `json:"estimatedCostMicros"`
+	UpstreamCost  int64   `json:"upstreamCostMicros"`
 }
 
 type LogQuery struct {
@@ -452,6 +469,12 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 	}
 	channel.Name = input.Name
 	channel.BaseURL = input.BaseURL
+	if channel.CircuitLevel == CircuitLevelManual && input.Enabled {
+		channel.ConsecutiveFailures = 0
+		channel.CircuitLevel = CircuitLevelClosed
+		channel.CircuitOpenUntil = nil
+		channel.LastError = ""
+	}
 	channel.Enabled = input.Enabled
 	channel.SupportsStreamUsage = input.SupportsStreamUsage
 	if input.PriceMultiplierBasisPoints != nil {
@@ -517,7 +540,9 @@ func (s *ManagementService) DeleteChannel(ctx context.Context, id uint64) error 
 
 func (s *ManagementService) ResetChannelCircuit(ctx context.Context, id uint64) error {
 	result := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", id).Updates(map[string]any{
+		"enabled":              true,
 		"consecutive_failures": 0,
+		"circuit_level":        CircuitLevelClosed,
 		"circuit_open_until":   nil,
 		"last_error":           "",
 	})
@@ -597,10 +622,30 @@ func validRoutingStrategy(value string) bool {
 	return value == RoutingPriorityWeighted || value == RoutingLowestCost || value == RoutingLowestLatency
 }
 
-func (s *ManagementService) ListModels(ctx context.Context) ([]GatewayModel, error) {
+func (s *ManagementService) ListModels(ctx context.Context) ([]GatewayModelView, error) {
 	var models []GatewayModel
-	err := s.store.db.WithContext(ctx).Order("name asc").Find(&models).Error
-	return models, err
+	if err := s.store.db.WithContext(ctx).Order("name asc").Find(&models).Error; err != nil {
+		return nil, err
+	}
+	type modelRequestCount struct {
+		Name         string
+		RequestCount int64
+	}
+	var counts []modelRequestCount
+	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
+		Select("requested_model AS name, COUNT(*) AS request_count").
+		Group("requested_model").Scan(&counts).Error; err != nil {
+		return nil, err
+	}
+	countByName := make(map[string]int64, len(counts))
+	for _, count := range counts {
+		countByName[count.Name] = count.RequestCount
+	}
+	views := make([]GatewayModelView, 0, len(models))
+	for _, model := range models {
+		views = append(views, GatewayModelView{GatewayModel: model, RequestCount: countByName[model.Name]})
+	}
+	return views, nil
 }
 
 func (s *ManagementService) CreateModel(ctx context.Context, input GatewayModelInput) (*GatewayModel, error) {
@@ -1046,6 +1091,29 @@ func (s *ManagementService) updateDiscoveryHealth(channelID uint64, discovery *C
 	_ = s.store.db.Model(&Channel{}).Where("id = ?", channelID).Updates(updates).Error
 }
 
+func officialUsageCost(model string, inputTokens, normalInputTokens, outputTokens, cachedTokens, cacheWriteTokens int64) int64 {
+	price := OpenAIOfficialPrice(model)
+	if price == nil {
+		return 0
+	}
+	inputTokens = max(inputTokens, 0)
+	cachedTokens = min(max(cachedTokens, 0), inputTokens)
+	cacheWriteTokens = min(max(cacheWriteTokens, 0), inputTokens-cachedTokens)
+	normalInputTokens = min(max(normalInputTokens, 0), inputTokens-cachedTokens-cacheWriteTokens)
+	unclassifiedInputTokens := inputTokens - normalInputTokens - cachedTokens - cacheWriteTokens
+	cachedPrice := price.InputPriceMicros
+	if price.CachedInputPriceMicros != nil {
+		cachedPrice = *price.CachedInputPriceMicros
+	}
+	cacheWritePrice := price.InputPriceMicros
+	if price.CacheWritePriceMicros != nil {
+		cacheWritePrice = *price.CacheWritePriceMicros
+	}
+	return ((normalInputTokens+unclassifiedInputTokens)*price.InputPriceMicros +
+		cachedTokens*cachedPrice + cacheWriteTokens*cacheWritePrice +
+		max(outputTokens, 0)*price.OutputPriceMicros) / 1_000_000
+}
+
 func (s *ManagementService) Dashboard(ctx context.Context, days int) (*DashboardSummary, error) {
 	if days != 1 && days != 2 && days != 3 && days != 5 {
 		return nil, errors.New("统计时间范围仅支持 1、2、3 或 5 天")
@@ -1059,7 +1127,10 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		Successes             int64
 		CanceledCount         int64
 		InputTokens           int64
+		NormalInputTokens     int64
 		OutputTokens          int64
+		CachedTokens          int64
+		CacheWriteTokens      int64
 		EstimatedCost         int64
 		UpstreamCost          int64
 		FirstTokenMS          int64
@@ -1071,7 +1142,8 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	var total totals
 	err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ? AND created_at < ?", startTime, endTime).Select(
 		"COUNT(*) AS requests, COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, " +
-			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, " +
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(normal_input_tokens),0) AS normal_input_tokens, " +
+			"COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens, " +
 			"COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost, " +
 			"COALESCE(SUM(first_token_ms),0) AS first_token_ms, COALESCE(SUM(CASE WHEN first_token_ms > 0 THEN 1 ELSE 0 END),0) AS first_token_sample_count, " +
 			"COALESCE(SUM(latency_ms),0) AS latency_ms, COALESCE(SUM(CASE WHEN latency_ms > 0 THEN 1 ELSE 0 END),0) AS latency_sample_count, COALESCE(SUM(duration_ms),0) AS duration_ms",
@@ -1082,12 +1154,39 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 	summary.Requests = total.Requests
 	summary.CanceledCount = total.CanceledCount
 	summary.InputTokens = total.InputTokens
+	summary.NormalInputTokens = total.NormalInputTokens
 	summary.OutputTokens = total.OutputTokens
+	summary.CachedTokens = total.CachedTokens
+	summary.CacheWriteTokens = total.CacheWriteTokens
 	summary.EstimatedCost = total.EstimatedCost
 	summary.UpstreamCost = total.UpstreamCost
 	summary.FirstTokenSampleCount = total.FirstTokenSampleCount
 	summary.LatencySampleCount = total.LatencySampleCount
 	summary.DurationSampleCount = total.Requests
+	if total.InputTokens > 0 {
+		summary.CacheHitRate = float64(total.CachedTokens) / float64(total.InputTokens)
+	}
+	type officialUsageRow struct {
+		RequestedModel    string
+		InputTokens       int64
+		NormalInputTokens int64
+		OutputTokens      int64
+		CachedTokens      int64
+		CacheWriteTokens  int64
+	}
+	var officialUsage []officialUsageRow
+	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
+		Select("requested_model, input_tokens, normal_input_tokens, output_tokens, cached_tokens, cache_write_tokens").
+		Where("created_at >= ? AND created_at < ?", startTime, endTime).Find(&officialUsage).Error; err != nil {
+		return nil, err
+	}
+	for _, usage := range officialUsage {
+		summary.OfficialCost += officialUsageCost(usage.RequestedModel, usage.InputTokens, usage.NormalInputTokens, usage.OutputTokens, usage.CachedTokens, usage.CacheWriteTokens)
+	}
+	if summary.OfficialCost > 0 {
+		summary.EstimatedCostRatio = float64(summary.EstimatedCost) / float64(summary.OfficialCost)
+		summary.UpstreamCostRatio = float64(summary.UpstreamCost) / float64(summary.OfficialCost)
+	}
 	if total.FirstTokenSampleCount > 0 {
 		summary.AverageFirstTokenMS = float64(total.FirstTokenMS) / float64(total.FirstTokenSampleCount)
 	}
@@ -1126,7 +1225,10 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		summary.Daily = append(summary.Daily, daily)
 	}
 	if err := s.store.db.WithContext(ctx).Table("relay_request_logs AS request").
-		Select("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道') AS name, COUNT(*) AS requests, COALESCE(SUM(request.estimated_cost),0) AS estimated_cost, COALESCE(SUM(request.upstream_cost),0) AS upstream_cost").
+		Select("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道') AS name, COUNT(*) AS requests, "+
+			"COALESCE(SUM(CASE WHEN request.outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN request.outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
+			"COALESCE(1.0 * SUM(CASE WHEN request.outcome = 'success' THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN request.outcome <> 'canceled' THEN 1 ELSE 0 END),0),0) AS success_rate, "+
+			"COALESCE(SUM(request.input_tokens),0) AS input_tokens, COALESCE(SUM(request.output_tokens),0) AS output_tokens, COALESCE(SUM(request.estimated_cost),0) AS estimated_cost, COALESCE(SUM(request.upstream_cost),0) AS upstream_cost").
 		Joins("LEFT JOIN relay_attempt_logs AS final_attempt ON final_attempt.id = (SELECT a.id FROM relay_attempt_logs AS a WHERE a.request_id = request.id ORDER BY a.id DESC LIMIT 1)").
 		Joins("LEFT JOIN channels AS c ON c.id = final_attempt.channel_id").
 		Where("request.created_at >= ? AND request.created_at < ?", startTime, endTime).
@@ -1134,7 +1236,10 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		return nil, err
 	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
-		Select("requested_model AS name, COUNT(*) AS requests, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
+		Select("requested_model AS name, COUNT(*) AS requests, "+
+			"COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
+			"COALESCE(1.0 * SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN outcome <> 'canceled' THEN 1 ELSE 0 END),0),0) AS success_rate, "+
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
 		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("requested_model").Order("upstream_cost desc").Scan(&summary.Models).Error; err != nil {
 		return nil, err
 	}

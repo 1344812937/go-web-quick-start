@@ -34,14 +34,14 @@ type payloadDeltaEnvelope struct {
 	Payload  map[string]any       `json:"payload"`
 }
 
-func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, requestID string, title string, body []byte, responseBody []byte, now time.Time) []byte {
+func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, requestID string, title string, threadSource string, body []byte, responseBody []byte, now time.Time) []byte {
 	sessionID = truncateRunes(strings.TrimSpace(sessionID), 512)
 	if tokenID == 0 || sessionID == "" {
 		return body
 	}
 	manifest, ok := buildPayloadManifest(body)
 	if !ok {
-		upsertSessionTitleWithoutManifest(db, tokenID, sessionID, requestID, title, now)
+		upsertSessionTitleWithoutManifest(db, tokenID, sessionID, requestID, title, threadSource, now)
 		return body
 	}
 	appendResponseManifest(&manifest, body, responseBody)
@@ -54,6 +54,7 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 			TokenID:             tokenID,
 			SessionID:           sessionID,
 			Title:               title,
+			ThreadSource:        threadSource,
 			LatestRequestID:     requestID,
 			PayloadManifestJSON: string(encodedManifest),
 			CreatedAt:           now,
@@ -75,18 +76,21 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 	if !state.TitleCustomized && strings.TrimSpace(state.Title) == "" && title != "" {
 		updates["title"] = title
 	}
+	if preferred := preferredCodexThreadSource(state.ThreadSource, threadSource); preferred != state.ThreadSource {
+		updates["thread_source"] = preferred
+	}
 	_ = db.Model(&RelaySessionState{}).
 		Where("token_id = ? AND session_id = ?", tokenID, sessionID).
 		Updates(updates).Error
 	return compacted
 }
 
-func upsertSessionTitleWithoutManifest(db *gorm.DB, tokenID uint64, sessionID string, requestID string, title string, now time.Time) {
+func upsertSessionTitleWithoutManifest(db *gorm.DB, tokenID uint64, sessionID string, requestID string, title string, threadSource string, now time.Time) {
 	var state RelaySessionState
 	err := db.Where("token_id = ? AND session_id = ?", tokenID, sessionID).First(&state).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		_ = db.Create(&RelaySessionState{
-			TokenID: tokenID, SessionID: sessionID, Title: title, LatestRequestID: requestID,
+			TokenID: tokenID, SessionID: sessionID, Title: title, ThreadSource: threadSource, LatestRequestID: requestID,
 			CreatedAt: now, UpdatedAt: now,
 		}).Error
 		return
@@ -97,6 +101,9 @@ func upsertSessionTitleWithoutManifest(db *gorm.DB, tokenID uint64, sessionID st
 	updates := map[string]any{"latest_request_id": requestID, "updated_at": now}
 	if !state.TitleCustomized && strings.TrimSpace(state.Title) == "" && title != "" {
 		updates["title"] = title
+	}
+	if preferred := preferredCodexThreadSource(state.ThreadSource, threadSource); preferred != state.ThreadSource {
+		updates["thread_source"] = preferred
 	}
 	_ = db.Model(&RelaySessionState{}).
 		Where("token_id = ? AND session_id = ?", tokenID, sessionID).

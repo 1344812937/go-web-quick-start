@@ -38,6 +38,19 @@ func (e *TokenEstimator) EstimateJSON(data []byte) int64 {
 	if strings.TrimSpace(text) == "" {
 		text = string(data)
 	}
+	return e.estimateText(text)
+}
+
+func (e *TokenEstimator) EstimateValue(value any) int64 {
+	var builder strings.Builder
+	collectText(value, &builder)
+	return e.estimateText(builder.String())
+}
+
+func (e *TokenEstimator) estimateText(text string) int64 {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
 	ids, _, err := e.codec.Encode(text)
 	if err != nil {
 		return int64(math.Ceil(float64(len([]rune(text))) / 4))

@@ -71,6 +71,7 @@ type SessionLogSummary struct {
 	SessionID             string              `json:"sessionId"`
 	SessionName           string              `json:"sessionName"`
 	SessionSource         string              `json:"sessionSource"`
+	ThreadSource          string              `json:"threadSource"`
 	Identified            bool                `json:"identified"`
 	FallbackRequestID     string              `json:"fallbackRequestId"`
 	TokenID               uint64              `json:"tokenId"`
@@ -387,6 +388,7 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 			if strings.TrimSpace(state.Title) != "" {
 				summary.SessionName = state.Title
 			}
+			summary.ThreadSource = state.ThreadSource
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
@@ -422,6 +424,9 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 	}
 	if summary.SessionSource == "" {
 		summary.SessionSource = "unavailable"
+	}
+	if summary.ThreadSource == "" {
+		summary.ThreadSource = codexThreadSourceUnknown
 	}
 	summary.LatestModel = latest.RequestedModel
 	summary.LatestEndpoint = latest.Endpoint

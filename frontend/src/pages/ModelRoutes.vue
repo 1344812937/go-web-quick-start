@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, Delete, Edit, Plus, Refresh, Search } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { Channel, ChannelModel, GatewayModel, RoutingStrategy } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -24,33 +24,35 @@ const channels = ref<Channel[]>([])
 const dialogOpen = ref(false)
 const editingId = ref<number | null>(null)
 const deletingModelId = ref<number | null>(null)
+const togglingMappingId = ref<number | null>(null)
 const modelSearchQuery = ref('')
+const showAllModels = ref(false)
 const expandedStrategySections = ref<string[]>([])
 const strategyDetailsOpen = computed(() => expandedStrategySections.value.includes('strategy-guide'))
 const form = reactive<{ name: string; routingStrategy: RoutingStrategy; enabled: boolean }>({ name: '', routingStrategy: 'priority_weighted', enabled: true })
 const dialogTitle = computed(() => editingId.value ? '编辑公开模型' : '新增公开模型')
-const sortedModels = computed(() => [...models.value].sort((left, right) => modelUsageCount(right.id) - modelUsageCount(left.id)
+const maxVisibleModels = 5
+const sortedModels = computed(() => [...models.value].sort((left, right) => right.requestCount - left.requestCount
   || right.name.localeCompare(left.name, undefined, { numeric: true, sensitivity: 'base' })))
 const filteredModels = computed(() => {
   const query = modelSearchQuery.value.trim().toLocaleLowerCase()
   if (!query) return sortedModels.value
   return sortedModels.value.filter((model) => model.name.toLocaleLowerCase().includes(query))
 })
+const visibleModels = computed(() => {
+  if (modelSearchQuery.value.trim() || showAllModels.value) return filteredModels.value
+  return filteredModels.value.slice(0, maxVisibleModels)
+})
+const hiddenModelCount = computed(() => Math.max(0, models.value.length - maxVisibleModels))
 const modelTableEmptyText = computed(() => modelSearchQuery.value.trim() ? '未找到匹配的公开模型' : '还没有公开模型')
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
-  { value: 'priority_weighted', label: '优先级加权', note: '优先级高的渠道先选，同级按配置权重和近 30 分钟成功率分配' },
-  { value: 'lowest_cost', label: '最低成本', note: '按本次预计成本优势和近 30 分钟成功率动态分配' },
-  { value: 'lowest_latency', label: '最低延迟', note: '按延迟优势和近 30 分钟成功率动态分配，并探测新渠道' },
+  { value: 'priority_weighted', label: '优先级加权', note: '先限定最高优先级，再按系统配置的价格、效率和质量占比抽样' },
+  { value: 'lowest_cost', label: '成本优先', note: '在系统价格占比基础上放大渠道间的价格优势' },
+  { value: 'lowest_latency', label: '效率优先', note: '在系统效率占比基础上放大首 token、延迟和吞吐优势' },
 ]
 
 function strategyLabel(value: RoutingStrategy): string {
   return strategies.find((item) => item.value === value)?.label ?? value
-}
-
-function modelUsageCount(modelId: number): number {
-  return channels.value.reduce((total, channel) => total + channel.models
-    .filter((mapping) => mapping.modelId === modelId)
-    .reduce((modelTotal, mapping) => modelTotal + mapping.recentAttemptCount, 0), 0)
 }
 
 function candidates(modelId: number): CandidateRow[] {
@@ -98,6 +100,43 @@ function formatMultiplier(basisPoints: number): string {
 
 function formatPercent(value: number): string {
   return new Intl.NumberFormat('zh-CN', { style: 'percent', maximumFractionDigits: 1 }).format(value)
+}
+
+function mappingPayload(mapping: ChannelModel) {
+  return {
+    modelId: mapping.modelId,
+    upstreamModel: mapping.upstreamModel,
+    priority: mapping.priority,
+    weight: mapping.weight,
+    inputPriceMicros: mapping.inputPriceMicros,
+    outputPriceMicros: mapping.outputPriceMicros,
+    cachedInputPriceMicros: mapping.cachedInputPriceMicros,
+    cacheWritePriceMicros: mapping.cacheWritePriceMicros,
+    priceMultiplierBasisPoints: mapping.priceMultiplierBasisPoints,
+    enabled: mapping.enabled,
+  }
+}
+
+async function setMappingEnabled(candidate: CandidateRow, enabled: string | number | boolean) {
+  const nextEnabled = Boolean(enabled)
+  if (candidate.mapping.enabled === nextEnabled || togglingMappingId.value !== null) return
+  togglingMappingId.value = candidate.mapping.id
+  try {
+    const updatedMappings = await request<ChannelModel[]>(`/admin/gateway/channels/${candidate.channel.id}/models`, {
+      method: 'PUT',
+      body: JSON.stringify(candidate.channel.models.map((mapping) => ({
+        ...mappingPayload(mapping),
+        enabled: mapping.id === candidate.mapping.id ? nextEnabled : mapping.enabled,
+      }))),
+    })
+    candidate.channel.models = updatedMappings
+    ElMessage.success(nextEnabled ? '模型映射已启用' : '模型映射已停用')
+    await loadData()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '模型映射状态更新失败')
+  } finally {
+    togglingMappingId.value = null
+  }
 }
 
 function openEditor(model?: GatewayModel) {
@@ -194,11 +233,11 @@ onMounted(loadData)
           </header>
           <div class="strategy-formula">
             <span>候选期望值</span>
-            <code>E<sub>i</sub> = 1[p<sub>i</sub> = p<sub>max</sub>] &times; B<sub>i</sub> &times; (0.95 + 0.05A<sub>i</sub>)</code>
+            <code>E<sub>i</sub> = 1[p<sub>i</sub> = p<sub>max</sub>] &times; w<sub>i</sub> &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
           </div>
           <ol class="strategy-steps">
             <li><strong>分组</strong><span>只保留优先级 <code>p<sub>max</sub></code> 的渠道，低优先级本轮概率为 0。</span></li>
-            <li><strong>加权</strong><span>配置权重、成功率、缓存收益和近期分流情况共同形成 <code>B<sub>i</sub></code>。</span></li>
+            <li><strong>加权</strong><span>同级渠道按系统配置的价格、效率、质量占比和渠道权重形成期望值。</span></li>
             <li><strong>选择</strong><span>同级渠道按 <code>P<sub>i</sub></code> 随机抽样，不是固定轮询第一名。</span></li>
           </ol>
           <p class="strategy-conclusion"><strong>适合：</strong>有明确主备层级，同时希望同级渠道自动均衡。</p>
@@ -212,12 +251,12 @@ onMounted(loadData)
           <div class="strategy-formula">
             <span>成本优势与期望值</span>
             <code>A<sub>i</sub> = (c<sub>min</sub> + 1) / (c<sub>i</sub> + 1)</code>
-            <code>E<sub>i</sub> = B<sub>i</sub> &times; (0.90 + 0.10A<sub>i</sub>)</code>
+            <code>C<sub>i</sub> = A<sub>i</sub><sup>2</sup></code>
           </div>
           <ol class="strategy-steps">
             <li><strong>估价</strong><span><code>c<sub>i</sub></code> 按本次输入、预计输出及历史缓存率估算实际费用。</span></li>
             <li><strong>比较</strong><span>最便宜渠道的 <code>A<sub>i</sub> = 1</code>，成本越高，优势系数越低。</span></li>
-            <li><strong>选择</strong><span>成本因子位于 0.90～1.00，稳定性、缓存和分流均衡仍会影响结果。</span></li>
+            <li><strong>选择</strong><span>平方价格分放大价差，再按系统配置的价格占比进入综合期望值。</span></li>
           </ol>
           <p class="strategy-conclusion"><strong>适合：</strong>控制总体费用，但不希望低价渠道垄断或牺牲可用性。</p>
             </article>
@@ -225,17 +264,16 @@ onMounted(loadData)
             <article class="strategy-model-card is-latency">
           <header>
             <span class="strategy-index">03</span>
-            <div><h3>最低延迟</h3><p>响应越接近当前最快渠道，获得的抽样加成越高。</p></div>
+            <div><h3>效率优先</h3><p>首 token 更快、响应延迟更低、输出吞吐更高的渠道获得更高效率分。</p></div>
           </header>
           <div class="strategy-formula">
-            <span>延迟优势与期望值</span>
-            <code>T<sub>i</sub> = min(l<sub>min</sub> / l<sub>i</sub>, 1)</code>
-            <code>E<sub>i</sub> = B<sub>i</sub> &times; (0.70 + 0.30T<sub>i</sub>) &times; (0.95 + 0.05A<sub>i</sub>)</code>
+            <span>效率分</span>
+            <code>F<sub>i</sub> = (0.45T<sub>first</sub> + 0.20T<sub>header</sub> + 0.35V<sub>token</sub>)<sup>2</sup></code>
           </div>
           <ol class="strategy-steps">
-            <li><strong>采样</strong><span><code>l<sub>i</sub></code> 优先取近 30 分钟平均延迟，没有样本时回退到 EWMA。</span></li>
-            <li><strong>探测</strong><span>完全没有延迟样本的渠道按当前最快值参与，保留获得真实样本的机会。</span></li>
-            <li><strong>选择</strong><span>延迟因子位于 0.70～1.00，同时保留 0.95～1.00 的成本修正。</span></li>
+            <li><strong>采样</strong><span>只使用近 30 分钟成功尝试；响应延迟无样本时回退到渠道 EWMA。</span></li>
+            <li><strong>归一</strong><span>首 token 和响应延迟越低越好，每秒输出 token 越高越好；无样本按中性分参与。</span></li>
+            <li><strong>选择</strong><span>平方效率分放大实际差异，再按系统配置的效率占比进入综合期望值。</span></li>
           </ol>
           <p class="strategy-conclusion"><strong>适合：</strong>交互式请求、首响应敏感场景，并允许持续探测新渠道。</p>
             </article>
@@ -243,18 +281,18 @@ onMounted(loadData)
 
           <footer class="factor-legend">
             <div class="base-equation">
-              <span>三种策略共享的基础分</span>
-              <code>B<sub>i</sub> = max(w<sub>i</sub>, 1) / 100 &times; D<sub>i</sub> &times; S<sub>i</sub> &times; H<sub>i</sub> &times; K<sub>i</sub></code>
+              <span>三种策略共享的综合分</span>
+              <code>E<sub>i</sub> = max(w<sub>i</sub>, 1) / 100 &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
             </div>
             <dl>
-              <div><dt>w</dt><dd>配置权重，最小按 1 计算</dd></div>
-              <div><dt>D</dt><dd><code>1 / (1 + 4r)</code>，r 为最近最多 100 次路由占比</dd></div>
-              <div><dt>S</dt><dd><code>0.75 + 0.5s</code>，s 为近 30 分钟成功率</dd></div>
-              <div><dt>H / K</dt><dd><code>0.5 + 1.5h</code> / <code>0.8 + 0.4k</code>，无样本均为 1</dd></div>
-              <div><dt>A</dt><dd><code>(c<sub>min</sub> + 1) / (c<sub>i</sub> + 1)</code></dd></div>
-              <div><dt>T</dt><dd><code>min(l<sub>min</sub> / l<sub>i</sub>, 1)</code></dd></div>
+              <div><dt>&alpha; / &beta;</dt><dd>系统设置中的价格占比与效率占比，保存后实时生效</dd></div>
+              <div><dt>&gamma;</dt><dd><code>1 - &alpha; - &beta;</code>，用于成功率、缓存和近期分流均衡</dd></div>
+              <div><dt>C</dt><dd>本次缓存修正后预计费用相对最低费用的归一化价格分</dd></div>
+              <div><dt>F</dt><dd>首 token 45%、响应头延迟 20%、输出吞吐 35%</dd></div>
+              <div><dt>Q</dt><dd>成功率 65%、缓存命中 15%、缓存率 10%、流量均衡 10%</dd></div>
+              <div><dt>w</dt><dd>渠道模型映射的配置权重，最小按 1 计算</dd></div>
             </dl>
-            <p>无成功率样本按 100% 处理；无缓存样本时缓存系数保持 1，不奖励也不惩罚。</p>
+            <p>成本优先会平方价格分，效率优先会平方效率分；新渠道继续保留 20% 的有界探索流量。</p>
           </footer>
         </el-collapse-item>
       </el-collapse>
@@ -263,17 +301,33 @@ onMounted(loadData)
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>模型路由加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
       <header class="model-list-toolbar">
-        <div><strong>公开模型列表</strong><span>{{ filteredModels.length }} / {{ models.length }} 个模型</span></div>
+        <div><strong>公开模型列表</strong><span>按本站累计调用量排序 · 当前显示 {{ visibleModels.length }} / {{ models.length }} 个模型</span></div>
         <el-input v-model="modelSearchQuery" class="model-search" clearable :prefix-icon="Search" aria-label="按模型名称搜索" placeholder="搜索模型名称" />
       </header>
-      <el-table v-loading="loading" :data="filteredModels" row-key="id" scrollbar-always-on :empty-text="modelTableEmptyText">
+      <el-table v-loading="loading" class="model-list-table" :data="visibleModels" row-key="id" height="100%" scrollbar-always-on :empty-text="modelTableEmptyText">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="candidate-matrix">
               <div class="matrix-heading"><strong>候选渠道</strong><span>{{ routableCandidateCount(scope.row.id) }} 个可路由 / {{ candidates(scope.row.id).length }} 个映射</span></div>
-              <el-table :data="candidates(scope.row.id)" empty-text="请在渠道管理中添加模型映射">
+              <el-table class="candidate-table" :data="candidates(scope.row.id)" max-height="300" scrollbar-always-on empty-text="请在渠道管理中添加模型映射">
                 <el-table-column label="渠道" min-width="140"><template #default="candidate">{{ candidate.row.channel.name }}</template></el-table-column>
-                <el-table-column label="映射状态" width="104"><template #default="candidate"><el-tag :type="candidate.row.mapping.enabled ? 'success' : 'info'" effect="plain" size="small">{{ candidate.row.mapping.enabled ? '已启用' : '已停用' }}</el-tag></template></el-table-column>
+                <el-table-column label="映射状态" width="132">
+                  <template #default="candidate">
+                    <div class="mapping-state-control">
+                      <el-switch
+                        :model-value="candidate.row.mapping.enabled"
+                        inline-prompt
+                        active-text="启"
+                        inactive-text="停"
+                        :loading="togglingMappingId === candidate.row.mapping.id"
+                        :disabled="togglingMappingId !== null && togglingMappingId !== candidate.row.mapping.id"
+                        :aria-label="`${candidate.row.channel.name} 的 ${candidate.row.mapping.upstreamModel} 映射`"
+                        @change="setMappingEnabled(candidate.row, $event)"
+                      />
+                      <span>{{ candidate.row.mapping.enabled ? '已启用' : '已停用' }}</span>
+                    </div>
+                  </template>
+                </el-table-column>
                 <el-table-column label="渠道状态" width="104"><template #default="candidate"><el-tag :type="channelState(candidate.row.channel).type" effect="plain" size="small">{{ channelState(candidate.row.channel).label }}</el-tag></template></el-table-column>
                 <el-table-column label="上游模型" min-width="160"><template #default="candidate"><code>{{ candidate.row.mapping.upstreamModel }}</code></template></el-table-column>
                 <el-table-column label="近 30 分钟成功率" width="160" align="right">
@@ -297,10 +351,17 @@ onMounted(loadData)
           </template>
         </el-table-column>
         <el-table-column label="公开模型" min-width="210"><template #default="scope"><div class="primary-cell"><strong><code>{{ scope.row.name }}</code></strong><small>{{ candidateSummary(scope.row.id) }}</small></div></template></el-table-column>
+        <el-table-column label="累计调用量" width="128" align="right"><template #default="scope"><strong class="model-usage-count">{{ formatCompactNumber(scope.row.requestCount) }}</strong></template></el-table-column>
         <el-table-column label="调度策略" min-width="150"><template #default="scope">{{ strategyLabel(scope.row.routingStrategy) }}</template></el-table-column>
         <el-table-column label="状态" width="106"><template #default="scope"><el-tag :type="scope.row.enabled ? 'success' : 'info'" effect="plain">{{ scope.row.enabled ? '已公开' : '已停用' }}</el-tag></template></el-table-column>
         <el-table-column label="操作" width="92" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="编辑公开模型" placement="top"><el-button class="table-action-button" text :icon="Edit" :disabled="deletingModelId === scope.row.id" aria-label="编辑公开模型" @click="openEditor(scope.row)" /></el-tooltip><el-tooltip content="删除公开模型" placement="top"><el-button class="table-action-button" text type="danger" :icon="Delete" :loading="deletingModelId === scope.row.id" aria-label="删除公开模型" @click="deleteModel(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
+      <div v-if="!loading && !modelSearchQuery.trim() && hiddenModelCount" class="model-list-expand-bar">
+        <span>{{ showAllModels ? `已显示全部 ${models.length} 个模型` : `已显示调用量前 ${visibleModels.length} 个模型` }}</span>
+        <el-button text :icon="showAllModels ? ArrowUp : ArrowDown" :aria-expanded="showAllModels" @click="showAllModels = !showAllModels">
+          {{ showAllModels ? '收起，仅显示调用量前五' : `显示其余 ${hiddenModelCount} 个模型` }}
+        </el-button>
+      </div>
       <div v-if="!loading && models.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="openEditor()">添加第一个公开模型</el-button></div>
     </section>
 
@@ -366,21 +427,27 @@ onMounted(loadData)
 .model-list-toolbar strong { color: var(--rose-text); font-size: 14px; font-weight: 650; }
 .model-list-toolbar span { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .model-search { width: min(320px, 42vw); }
+.model-usage-count { color: var(--rose-text); font-family: var(--rose-font-mono); font-variant-numeric: tabular-nums; }
+.model-list-expand-bar { display: flex; min-height: 42px; align-items: center; justify-content: space-between; gap: 12px; padding: 5px 10px 5px 16px; border-top: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
+.model-list-expand-bar > span { color: var(--rose-text-subtle); font-size: 10px; font-variant-numeric: tabular-nums; }
 .candidate-matrix { padding: 12px 24px 20px 54px; background: var(--rose-surface-muted); }
 .matrix-heading { display: flex; justify-content: space-between; align-items: center; padding: 0 0 10px; color: var(--rose-text-muted); font-size: 12px; }
 .matrix-heading strong { color: var(--rose-text); }
 .success-rate-cell { display: grid; justify-items: end; gap: 2px; font-variant-numeric: tabular-nums; }
 .success-rate-cell strong { color: var(--rose-text); font-size: 13px; }
 .success-rate-cell small { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
+.mapping-state-control { display: flex; align-items: center; gap: 7px; }
+.mapping-state-control span { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
 .select-option { display: grid; line-height: 1.3; }
 .select-option small { color: var(--rose-text-muted); font-size: 11px; }
 @media (min-width: 961px) {
   .model-route-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; }
-  .model-route-page > .table-panel { display: flex; flex-direction: column; min-height: 0; }
-  .model-route-page > .table-panel > .el-table { flex: 1; min-height: 0; }
+  .model-route-page > .table-panel { display: flex; align-self: stretch; width: 100%; min-height: 0; flex-direction: column; }
+  .model-route-page > .table-panel > .model-list-table { flex: 1; min-height: 0; }
+  .model-list-expand-bar, .table-empty-action { flex: none; }
   .model-route-page.is-strategy-open { display: block; overflow-y: auto; scrollbar-gutter: stable; }
   .model-route-page.is-strategy-open > * + * { margin-top: 16px; }
-  .model-route-page.is-strategy-open > .table-panel > .el-table { max-height: 520px; }
+  .model-route-page.is-strategy-open > .table-panel { height: 520px; }
 }
 @media (max-width: 980px) {
   .strategy-model-grid { grid-template-columns: 1fr; }
@@ -403,6 +470,7 @@ onMounted(loadData)
 @media (max-width: 640px) {
   .model-list-toolbar { align-items: stretch; flex-direction: column; gap: 8px; }
   .model-search { width: 100%; }
+  .model-list-expand-bar { align-items: flex-start; flex-direction: column; padding: 8px 10px 8px 16px; }
   .candidate-matrix { padding: 10px; }
 }
 @media (max-width: 460px) {

@@ -30,6 +30,10 @@ const (
 	RelayOutcomeSuccess                           = "success"
 	RelayOutcomeCanceled                          = "canceled"
 	RelayOutcomeFailed                            = "failed"
+	CircuitLevelClosed                            = 0
+	CircuitLevelTemporary                         = 1
+	CircuitLevelExtended                          = 2
+	CircuitLevelManual                            = 3
 	DefaultPriceMultiplierBasisPoints       int64 = 10_000
 	MaxPriceMultiplierBasisPoints           int64 = 1_000_000
 )
@@ -61,6 +65,7 @@ type Channel struct {
 	SupportsStreamUsage        bool       `gorm:"not null;default:true" json:"supportsStreamUsage"`
 	PriceMultiplierBasisPoints int64      `gorm:"not null;default:10000" json:"priceMultiplierBasisPoints"`
 	ConsecutiveFailures        int        `gorm:"not null;default:0" json:"consecutiveFailures"`
+	CircuitLevel               int        `gorm:"not null;default:0" json:"circuitLevel"`
 	CircuitOpenUntil           *time.Time `json:"circuitOpenUntil"`
 	LatencyEWMA                float64    `gorm:"not null;default:0" json:"latencyEwmaMs"`
 	LastHealthAt               *time.Time `json:"lastHealthAt"`
@@ -179,6 +184,7 @@ type RelaySessionState struct {
 	SessionID           string    `gorm:"size:512;primaryKey" json:"sessionId"`
 	Title               string    `gorm:"size:80;index" json:"title"`
 	TitleCustomized     bool      `gorm:"not null;default:false" json:"titleCustomized"`
+	ThreadSource        string    `gorm:"size:48;index" json:"threadSource"`
 	LatestRequestID     string    `gorm:"size:36" json:"latestRequestId"`
 	PayloadManifestJSON string    `gorm:"type:text" json:"-"`
 	CreatedAt           time.Time `json:"createdAt"`

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import type { CSSProperties } from 'vue'
-import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight, Unlock } from '@element-plus/icons-vue'
+import { Connection, Delete, Edit, Plus, Refresh, RefreshLeft, RefreshRight, Search, Unlock } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ChannelLatencySparkline from '@/components/ChannelLatencySparkline.vue'
 import type {
+  ApplicationSettings,
   Channel,
   ChannelModel,
   ChannelModelDiscovery,
@@ -44,6 +45,7 @@ const saving = ref(false)
 const errorMessage = ref('')
 const channels = ref<Channel[]>([])
 const models = ref<GatewayModel[]>([])
+const channelSearchQuery = ref('')
 const drawerOpen = ref(false)
 const editingId = ref<number | null>(null)
 const form = reactive({ name: '', baseUrl: '', apiKey: '', enabled: true, supportsStreamUsage: true })
@@ -52,18 +54,32 @@ const discoveringModels = ref(false)
 const discoveryError = ref('')
 const discoveredModels = ref<UpstreamModel[]>([])
 const discoverySummary = ref<ChannelModelDiscovery | null>(null)
+const commonModelNames = ref<string[]>(['gpt-image-2', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini', 'codex-auto-review'])
+const mappingSearch = ref('')
 const priceMultiplier = ref(1)
 const testingChannelId = ref<number | null>(null)
 const deletingChannelId = ref<number | null>(null)
 const resettingCircuitChannelId = ref<number | null>(null)
 const currentTime = ref(Date.now())
 const drawerTitle = computed(() => editingId.value ? '编辑渠道' : '新增渠道')
+const filteredChannels = computed(() => {
+  const query = channelSearchQuery.value.trim().toLocaleLowerCase()
+  if (!query) return channels.value
+  return channels.value.filter((channel) => (
+    channel.name.toLocaleLowerCase().includes(query)
+    || channel.baseUrl.toLocaleLowerCase().includes(query)
+  ))
+})
+const channelTableEmptyText = computed(() => channelSearchQuery.value.trim() ? '未找到匹配的渠道' : '还没有渠道')
 const createdPublicModelCount = computed(() => discoveredModels.value.filter((model) => model.publicModelCreated).length)
 const sortedPublicModels = computed(() => [...models.value].sort((left, right) => compareModelsByUsage(left.id, left.name, right.id, right.name)))
-const sortedDiscoveredModels = computed(() => [...discoveredModels.value].sort((left, right) => compareModelsByUsage(left.publicModelId, left.id, right.publicModelId, right.id)))
+const sortedDiscoveredModels = computed(() => [...discoveredModels.value].sort((left, right) => (
+  Number(Boolean(right.officialPrice)) - Number(Boolean(left.officialPrice))
+  || compareModelsByUsage(left.publicModelId, left.id, right.publicModelId, right.id)
+)))
 const mappingGroups = computed<MappingGroup[]>(() => [
-  { key: 'enabled', label: '已启用', emptyText: '暂无已启用映射', items: sortedMappings(true) },
-  { key: 'disabled', label: '未启用', emptyText: '暂无未启用映射', items: sortedMappings(false) },
+  { key: 'enabled', label: '已启用', emptyText: '没有匹配的已启用映射', items: filteredMappings(true) },
+  { key: 'disabled', label: '未启用', emptyText: '没有匹配的未启用映射', items: filteredMappings(false) },
 ])
 const modelHueByName = computed(() => {
   const usedHues = new Set<number>()
@@ -130,7 +146,7 @@ function mappingDraft(mapping: ChannelModel): MappingDraft {
   }
 }
 
-function discoveredMappingDraft(model: UpstreamModel): MappingDraft {
+function discoveredMappingDraft(model: UpstreamModel, enabled = false): MappingDraft {
   const price = model.officialPrice
   return {
     clientKey: nextMappingClientKey(),
@@ -143,16 +159,17 @@ function discoveredMappingDraft(model: UpstreamModel): MappingDraft {
     cachedInputPrice: fromMicros(price?.cachedInputPriceMicros ?? null),
     cacheWritePrice: fromMicros(price?.cacheWritePriceMicros ?? null),
     adjustmentMultiplier: 1,
-    enabled: false,
+    enabled,
     recentAttemptCount: 0,
   }
 }
 
-function mergeDiscoveredMappings(discovered: UpstreamModel[]) {
+function mergeDiscoveredMappings(discovered: UpstreamModel[], enableCommon = false) {
   const configured = new Set(mappings.value.map((mapping) => mapping.upstreamModel.trim()))
+  const common = new Set(commonModelNames.value.map((name) => name.trim().toLowerCase()).filter(Boolean))
   for (const model of discovered) {
     if (!configured.has(model.id)) {
-      mappings.value.push(discoveredMappingDraft(model))
+      mappings.value.push(discoveredMappingDraft(model, enableCommon && common.has(model.id.toLowerCase())))
       configured.add(model.id)
     }
   }
@@ -171,11 +188,20 @@ function resetForm(channel?: Channel) {
   discoveryError.value = ''
   discoveredModels.value = []
   discoverySummary.value = null
+  mappingSearch.value = ''
   priceMultiplier.value = channel && Number.isFinite(channel.priceMultiplierBasisPoints)
     ? channel.priceMultiplierBasisPoints / 10_000
     : 1
   drawerOpen.value = true
   if (channel) void discoverChannelModels()
+}
+
+function filterMappingsByUpstreamModel(model: UpstreamModel) {
+  mappingSearch.value = mappingSearch.value.trim() === model.id ? '' : model.id
+}
+
+function supportedModelRowClassName({ row }: { row: UpstreamModel }): string {
+  return mappingSearch.value.trim() === row.id ? 'is-filtering-mappings' : ''
 }
 
 function addMapping() {
@@ -325,7 +351,7 @@ async function discoverChannelModels(showSuccess = false) {
     discoverySummary.value = result
     discoveredModels.value = result.models
     models.value = refreshedModels
-    mergeDiscoveredMappings(result.models)
+    mergeDiscoveredMappings(result.models, editingId.value === null)
     if (showSuccess) {
       const createdCount = result.models.filter((model) => model.publicModelCreated).length
       ElMessage.success(createdCount > 0 ? `已获取 ${result.models.length} 个模型，自动新增 ${createdCount} 个公共模型` : `已获取 ${result.models.length} 个模型，公共模型均已存在`)
@@ -347,9 +373,19 @@ function modelName(modelId: number): string {
 function sortedMappings(enabled: boolean): MappingDraft[] {
   return mappings.value
     .filter((mapping) => mapping.enabled === enabled)
-    .sort((left, right) => right.recentAttemptCount - left.recentAttemptCount
+    .sort((left, right) => Number(Boolean(officialPriceForMapping(right))) - Number(Boolean(officialPriceForMapping(left)))
+      || right.recentAttemptCount - left.recentAttemptCount
       || compareModelNamesDescending(modelName(left.modelId ?? 0), modelName(right.modelId ?? 0))
       || compareModelNamesDescending(left.upstreamModel, right.upstreamModel))
+}
+
+function filteredMappings(enabled: boolean): MappingDraft[] {
+  const query = mappingSearch.value.trim().toLowerCase()
+  if (!query) return sortedMappings(enabled)
+  return sortedMappings(enabled).filter((mapping) => (
+    mapping.upstreamModel.toLowerCase().includes(query)
+    || modelName(mapping.modelId ?? 0).toLowerCase().includes(query)
+  ))
 }
 
 function sortedChannelModels(channel: Channel): ChannelModel[] {
@@ -401,31 +437,45 @@ function isCircuitOpen(channel: Channel): boolean {
   return channel.circuitOpenUntil !== null && Date.parse(channel.circuitOpenUntil) > currentTime.value
 }
 
+function hasCircuitMark(channel: Channel): boolean {
+  return channel.circuitLevel > 0
+}
+
 function channelState(channel: Channel): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
-  if (isCircuitOpen(channel)) return { label: '熔断中', type: 'danger' }
+  if (channel.circuitLevel >= 3) return { label: '三级熔断', type: 'danger' }
+  if (isCircuitOpen(channel)) return { label: `${channel.circuitLevel === 2 ? '二' : '一'}级熔断`, type: 'danger' }
+  if (channel.circuitLevel > 0) return { label: `${channel.circuitLevel === 2 ? '二' : '一'}级恢复中`, type: 'warning' }
   if (!channel.enabled) return { label: '已停用', type: 'info' }
   if (channel.consecutiveFailures > 0) return { label: `${channel.consecutiveFailures} 次失败`, type: 'warning' }
   return { label: '可调度', type: 'success' }
 }
 
 function circuitRemaining(channel: Channel): string {
-  if (!channel.circuitOpenUntil) return ''
-  const seconds = Math.max(0, Math.ceil((Date.parse(channel.circuitOpenUntil) - currentTime.value) / 1000))
-  return `${seconds} 秒后自动恢复`
+  if (channel.circuitLevel >= 3) return '需人工恢复'
+  if (isCircuitOpen(channel) && channel.circuitOpenUntil) {
+    const seconds = Math.max(0, Math.ceil((Date.parse(channel.circuitOpenUntil) - currentTime.value) / 1000))
+    return `${seconds} 秒后自动探测`
+  }
+  if (channel.circuitLevel > 0) return `需 ${channel.circuitLevel} 次成功探测完全恢复`
+  return ''
 }
 
 function channelRowClassName({ row }: { row: Channel }): string {
-  return isCircuitOpen(row) ? 'channel-row--circuit-open' : ''
+  return hasCircuitMark(row) ? 'channel-row--circuit-open' : ''
 }
 
 async function loadData() {
   loading.value = true
   errorMessage.value = ''
   try {
-    [channels.value, models.value] = await Promise.all([
+    const [channelItems, modelItems, settings] = await Promise.all([
       request<Channel[]>('/admin/gateway/channels'),
       request<GatewayModel[]>('/admin/gateway/models'),
+      request<ApplicationSettings>('/settings'),
     ])
+    channels.value = channelItems
+    models.value = modelItems
+    if (settings.gatewayConfig.commonModelNames?.length) commonModelNames.value = settings.gatewayConfig.commonModelNames
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '渠道数据加载失败'
   } finally {
@@ -501,9 +551,9 @@ async function testChannel(channel: Channel) {
 async function resetChannelCircuit(channel: Channel) {
   try {
     await ElMessageBox.confirm(
-      `解除渠道“${channel.name}”的熔断？解除后该渠道会立即重新参与请求调度。`,
-      '解除渠道熔断',
-      { type: 'warning', confirmButtonText: '解除熔断', cancelButtonText: '取消' },
+      `人工恢复渠道“${channel.name}”？恢复后该渠道会立即重新参与请求调度。`,
+      '恢复三级熔断渠道',
+      { type: 'warning', confirmButtonText: '恢复并启用', cancelButtonText: '取消' },
     )
   } catch {
     return
@@ -511,7 +561,7 @@ async function resetChannelCircuit(channel: Channel) {
   resettingCircuitChannelId.value = channel.id
   try {
     await request<null>(`/admin/gateway/channels/${channel.id}/reset-circuit`, { method: 'POST' })
-    ElMessage.success('渠道熔断已解除')
+    ElMessage.success('渠道已恢复并重新启用')
     await loadData()
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '解除熔断失败')
@@ -547,7 +597,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="page-stack">
+  <div class="page-stack channel-page">
     <header class="page-heading">
       <div><h1>渠道管理</h1><p>维护上游连接、模型映射与每百万 Token 价格</p></div>
       <div class="page-actions">
@@ -560,18 +610,22 @@ onUnmounted(() => {
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>渠道加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadData">重试</el-button></div>
     <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="channels" row-key="id" empty-text="还没有渠道" :row-class-name="channelRowClassName">
+      <header class="channel-list-toolbar">
+        <div><strong>渠道列表</strong><span>{{ filteredChannels.length }} / {{ channels.length }} 个渠道</span></div>
+        <el-input v-model="channelSearchQuery" class="channel-search" clearable :prefix-icon="Search" aria-label="按渠道名称或 Base URL 筛选" placeholder="筛选名称或 Base URL" />
+      </header>
+      <el-table v-loading="loading" :data="filteredChannels" row-key="id" height="var(--channel-table-height)" :empty-text="channelTableEmptyText" :row-class-name="channelRowClassName">
         <el-table-column label="渠道" width="228" fixed="left">
           <template #default="scope"><div class="primary-cell"><strong>{{ scope.row.name }}</strong><small>{{ scope.row.baseUrl }}</small></div></template>
         </el-table-column>
         <el-table-column label="状态" width="116">
           <template #default="scope">
-            <div class="channel-state-cell" :class="{ 'is-circuit-open': isCircuitOpen(scope.row) }">
+            <div class="channel-state-cell" :class="{ 'is-circuit-open': hasCircuitMark(scope.row) }">
               <div class="channel-state-heading">
                 <el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag>
-                <strong v-if="isCircuitOpen(scope.row)">{{ circuitRemaining(scope.row) }}</strong>
+                <strong v-if="hasCircuitMark(scope.row)">{{ circuitRemaining(scope.row) }}</strong>
               </div>
-              <el-tooltip v-if="isCircuitOpen(scope.row) && scope.row.lastError" :content="scope.row.lastError" placement="top" :show-after="250">
+              <el-tooltip v-if="hasCircuitMark(scope.row) && scope.row.lastError" :content="scope.row.lastError" placement="top" :show-after="250">
                 <small tabindex="0">{{ scope.row.lastError }}</small>
               </el-tooltip>
             </div>
@@ -644,7 +698,7 @@ onUnmounted(() => {
         <el-table-column label="操作" width="164" fixed="right" align="right">
           <template #default="scope">
             <div class="table-actions">
-              <el-tooltip v-if="isCircuitOpen(scope.row)" content="解除熔断并恢复调度" placement="top"><el-button class="table-action-button reset-circuit-button" text type="warning" :icon="Unlock" :loading="resettingCircuitChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id || testingChannelId === scope.row.id" aria-label="解除渠道熔断" @click="resetChannelCircuit(scope.row)" /></el-tooltip>
+              <el-tooltip v-if="scope.row.circuitLevel >= 3" content="人工恢复并重新启用渠道" placement="top"><el-button class="table-action-button reset-circuit-button" text type="warning" :icon="Unlock" :loading="resettingCircuitChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id || testingChannelId === scope.row.id" aria-label="人工恢复三级熔断渠道" @click="resetChannelCircuit(scope.row)" /></el-tooltip>
               <el-tooltip content="测试渠道连接" placement="top"><el-button class="table-action-button" text :icon="Connection" :loading="testingChannelId === scope.row.id" :disabled="deletingChannelId === scope.row.id" aria-label="测试渠道连接" @click="testChannel(scope.row)" /></el-tooltip>
               <el-tooltip content="编辑渠道" placement="top"><el-button class="table-action-button" text :icon="Edit" aria-label="编辑渠道" @click="resetForm(scope.row)" /></el-tooltip>
               <el-tooltip content="删除渠道" placement="top"><el-button class="table-action-button" text type="danger" :icon="Delete" :loading="deletingChannelId === scope.row.id" :disabled="testingChannelId === scope.row.id" aria-label="删除渠道" @click="deleteChannel(scope.row)" /></el-tooltip>
@@ -681,8 +735,12 @@ onUnmounted(() => {
         <el-skeleton v-if="discoveringModels" :rows="3" animated />
         <div v-else-if="discoveryError" class="model-discovery-error inline-error" role="alert"><span>{{ discoveryError }}</span><el-button text @click="discoverChannelModels()">重试</el-button></div>
         <div v-else-if="discoveredModels.length === 0" class="mapping-empty">{{ discoverySummary ? '上游未返回可用模型' : '尚未获取上游模型' }}</div>
-        <el-table v-else :data="sortedDiscoveredModels" row-key="id" max-height="240" class="supported-model-table">
-          <el-table-column label="模型 ID" min-width="200"><template #default="scope"><code>{{ scope.row.id }}</code></template></el-table-column>
+        <el-table v-else :data="sortedDiscoveredModels" row-key="id" max-height="240" class="supported-model-table" :row-class-name="supportedModelRowClassName" @row-click="filterMappingsByUpstreamModel">
+          <el-table-column label="模型 ID" min-width="200">
+            <template #default="scope">
+              <button class="upstream-model-filter" type="button" :aria-pressed="mappingSearch.trim() === scope.row.id" :aria-label="`筛选 ${scope.row.id} 的模型映射`" @click.stop="filterMappingsByUpstreamModel(scope.row)"><code>{{ scope.row.id }}</code></button>
+            </template>
+          </el-table-column>
           <el-table-column label="所属方" min-width="100"><template #default="scope">{{ scope.row.ownedBy || '未提供' }}</template></el-table-column>
           <el-table-column label="官方短上下文价（USD / 百万 Token）" min-width="430"><template #default="scope"><span class="official-price" :class="{ 'muted-text': !scope.row.officialPrice }">{{ formatOfficialPrice(scope.row) }}</span></template></el-table-column>
           <el-table-column label="本站公共模型" min-width="190">
@@ -696,12 +754,15 @@ onUnmounted(() => {
         </el-table>
 
         <div class="subsection-heading mapping-heading">
-          <div><h3>模型映射与价格</h3><p>新发现映射默认停用；默认使用 Standard 短上下文价，仅按精确模型 ID 匹配</p></div>
-          <div class="mapping-heading-actions">
+          <div><h3>模型映射与价格</h3><p>按模型名称筛选配置；有官方价格的模型优先，首次配置会自动启用常用模型</p></div>
+          <el-button :icon="Plus" :disabled="discoveredModels.length === 0" @click="addMapping">添加映射</el-button>
+        </div>
+        <div class="mapping-toolbar" aria-label="模型映射筛选与批量价格操作">
+          <el-input v-model="mappingSearch" clearable :prefix-icon="Search" placeholder="搜索本站或上游模型" aria-label="搜索模型映射" />
+          <div class="mapping-bulk-actions">
             <label class="multiplier-control"><span>渠道官方价倍率</span><el-input-number v-model="priceMultiplier" :min="0" :max="100" :precision="2" :step="0.1" controls-position="right" /></label>
             <el-button :icon="RefreshRight" :disabled="discoveredModels.length === 0" @click="applyOfficialPriceMultiplier">应用倍率</el-button>
             <el-button :icon="RefreshLeft" :disabled="discoveredModels.length === 0" @click="restoreAllOfficialPrices">全部恢复默认</el-button>
-            <el-button :icon="Plus" :disabled="discoveredModels.length === 0" @click="addMapping">添加映射</el-button>
           </div>
         </div>
         <div v-if="mappings.length === 0" class="mapping-empty">当前渠道未配置模型映射</div>
@@ -792,10 +853,20 @@ onUnmounted(() => {
 .channel-state-cell small { display: block; max-width: 100%; overflow: hidden; color: var(--rose-text-muted); font-size: 11px; line-height: 1.3; text-overflow: ellipsis; white-space: nowrap; }
 .channel-state-cell.is-circuit-open small { color: var(--rose-danger); cursor: help; }
 .reset-circuit-button { color: var(--rose-danger); }
+.channel-page { --channel-table-height: min(660px, max(360px, calc(100dvh - var(--rose-header-height) - 220px))); }
+.channel-list-toolbar { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
+.channel-list-toolbar > div { display: grid; min-width: 0; gap: 2px; }
+.channel-list-toolbar strong { color: var(--rose-text); font-size: 14px; font-weight: 650; }
+.channel-list-toolbar span { color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.channel-search { width: min(360px, 44vw); }
 .model-discovery-heading { margin-top: 0; }
 .model-discovery-actions { display: flex; align-items: center; gap: 8px; }
 .model-discovery-error { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 0; }
 .supported-model-table { margin-bottom: 4px; border: 1px solid var(--rose-border); }
+.supported-model-table :deep(.el-table__row) { cursor: pointer; }
+.supported-model-table :deep(.el-table__row.is-filtering-mappings > td.el-table__cell) { background: var(--rose-primary-soft); }
+.upstream-model-filter { max-width: 100%; padding: 0; overflow: hidden; border: 0; color: var(--rose-primary-hover); background: transparent; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
+.upstream-model-filter:focus-visible { border-radius: 2px; outline: 2px solid var(--rose-primary); outline-offset: 2px; }
 .public-model-cell { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-width: 0; }
 .public-model-cell code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .official-price { font-family: var(--rose-font-mono); font-size: 11px; white-space: nowrap; }
@@ -828,8 +899,9 @@ onUnmounted(() => {
 .mapping-editor-header strong { color: var(--rose-text); font-size: 13px; }
 .mapping-editor-header span { overflow: hidden; color: var(--rose-text-muted); font-family: var(--rose-font-mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .mapping-editor-actions { display: flex; flex-shrink: 0; align-items: center; gap: 10px; }
-.mapping-heading-actions, .mapping-price-actions, .multiplier-control { display: flex; align-items: center; gap: 8px; }
-.mapping-heading-actions { flex-wrap: wrap; justify-content: flex-end; }
+.mapping-toolbar { display: grid; grid-template-columns: minmax(220px, 1fr) auto; align-items: center; gap: 10px 16px; margin-top: 10px; padding: 10px 0; border-block: 1px solid var(--rose-border); }
+.mapping-bulk-actions, .mapping-price-actions, .multiplier-control { display: flex; align-items: center; gap: 8px; }
+.mapping-bulk-actions { flex-wrap: wrap; justify-content: flex-end; }
 .mapping-price-actions { flex-wrap: wrap; justify-content: flex-end; }
 .multiplier-control span { color: var(--rose-text-muted); font-size: 11px; white-space: nowrap; }
 .multiplier-control :deep(.el-input-number) { width: 116px; }
@@ -846,5 +918,6 @@ onUnmounted(() => {
 .mapping-editor :deep(.el-select), .mapping-editor :deep(.el-input-number) { width: 100%; }
 .field-note { display: block; min-height: 30px; margin-top: 5px; color: var(--rose-text-muted); font-size: 11px; line-height: 1.35; }
 .mapping-empty { padding: 24px; border: 1px dashed var(--rose-border-strong); color: var(--rose-text-muted); text-align: center; }
-@media (max-width: 720px) { .model-discovery-heading, .mapping-editor-header, .mapping-heading, .mapping-price-heading { align-items: flex-start; flex-direction: column; } .model-discovery-actions, .mapping-heading-actions, .mapping-price-actions { width: 100%; justify-content: flex-start; } .mapping-model-grid, .mapping-routing-grid, .mapping-price-grid { grid-template-columns: 1fr; } .mapping-editor-header { flex-direction: column; } .mapping-editor-actions { width: 100%; justify-content: space-between; } .field-note { min-height: 0; } }
+@media (max-width: 860px) { .mapping-toolbar { grid-template-columns: 1fr; } .mapping-bulk-actions { justify-content: flex-start; } }
+@media (max-width: 720px) { .channel-page { --channel-table-height: 480px; } .channel-list-toolbar, .model-discovery-heading, .mapping-editor-header, .mapping-heading, .mapping-price-heading { align-items: flex-start; flex-direction: column; } .channel-search { width: 100%; } .model-discovery-actions, .mapping-bulk-actions, .mapping-price-actions { width: 100%; justify-content: flex-start; } .mapping-model-grid, .mapping-routing-grid, .mapping-price-grid { grid-template-columns: 1fr; } .mapping-editor-header { flex-direction: column; } .mapping-editor-actions { width: 100%; justify-content: space-between; } .field-note { min-height: 0; } }
 </style>

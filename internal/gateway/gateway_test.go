@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -34,6 +35,15 @@ type failAfterWritesStreamWriter struct {
 	status int
 	writes int
 	failAt int
+}
+
+type notifyingStreamWriter struct {
+	header     http.Header
+	status     int
+	body       bytes.Buffer
+	mu         sync.Mutex
+	firstWrite chan []byte
+	once       sync.Once
 }
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -83,6 +93,23 @@ func (w *failAfterWritesStreamWriter) Write(data []byte) (int, error) {
 }
 
 func (w *failAfterWritesStreamWriter) Flush() {}
+
+func (w *notifyingStreamWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *notifyingStreamWriter) WriteHeader(status int) {
+	w.status = status
+}
+
+func (w *notifyingStreamWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.once.Do(func() { w.firstWrite <- bytes.Clone(data) })
+	return w.body.Write(data)
+}
+
+func (w *notifyingStreamWriter) Flush() {}
 
 func newTestStore(t *testing.T) *Store {
 	t.Helper()
@@ -148,7 +175,7 @@ func createRouteFixture(t *testing.T, store *Store, strategy string, channelURLs
 
 func newTestRelay(store *Store) *RelayService {
 	access := NewClientAccessService(store)
-	router := NewRouter(store, access)
+	router := NewRouter(store, access, nil)
 	return NewRelayService(store, router, NewTokenEstimator(), &config.ApplicationConfigManager{})
 }
 
@@ -167,6 +194,59 @@ func TestSecretBoxAndHashing(t *testing.T) {
 	}
 	if hashSecret("sk-client") == "sk-client" || hashSecret("sk-client") != hashSecret("sk-client") {
 		t.Fatal("secret hash is not deterministic and one-way")
+	}
+}
+
+func TestTokenEstimatorUsesParsedPayload(t *testing.T) {
+	body := []byte(`{"model":"public-model","input":"hello world"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	estimator := NewTokenEstimator()
+	if parsed, encoded := estimator.EstimateValue(payload.values), estimator.EstimateJSON(body); parsed == 0 || parsed != encoded {
+		t.Fatalf("parsed estimate = %d, JSON estimate = %d", parsed, encoded)
+	}
+}
+
+func TestDurationAfterLatency(t *testing.T) {
+	tests := []struct {
+		total   int64
+		latency int64
+		want    int64
+	}{
+		{total: 350, latency: 100, want: 250},
+		{total: 100, latency: 100, want: 0},
+		{total: 0, latency: 100, want: 0},
+	}
+	for _, test := range tests {
+		if got := durationAfterLatency(test.total, test.latency); got != test.want {
+			t.Fatalf("durationAfterLatency(%d, %d) = %d, want %d", test.total, test.latency, got, test.want)
+		}
+	}
+}
+
+func TestFirstTokenAfterLatencyPreservesObservedSample(t *testing.T) {
+	tests := []struct {
+		firstToken int64
+		latency    int64
+		want       int64
+	}{
+		{firstToken: 350, latency: 100, want: 250},
+		{firstToken: 100, latency: 100, want: 1},
+		{firstToken: 0, latency: 100, want: 0},
+	}
+	for _, test := range tests {
+		if got := firstTokenAfterLatency(test.firstToken, test.latency); got != test.want {
+			t.Fatalf("firstTokenAfterLatency(%d, %d) = %d, want %d", test.firstToken, test.latency, got, test.want)
+		}
+	}
+}
+
+func TestRelayRequestElapsedDurationIncludesLatency(t *testing.T) {
+	log := RelayRequestLog{LatencyMS: 100, DurationMS: 800}
+	if got := relayRequestElapsedDuration(log); got != 900*time.Millisecond {
+		t.Fatalf("relayRequestElapsedDuration() = %s, want 900ms", got)
 	}
 }
 
@@ -414,6 +494,34 @@ func TestChannelPriceMultiplierPersistsDefaultsAndValidates(t *testing.T) {
 	}
 }
 
+func TestListModelsIncludesGlobalRequestCounts(t *testing.T) {
+	store := newTestStore(t)
+	models := []GatewayModel{
+		{Name: "model-a", RoutingStrategy: RoutingPriorityWeighted, Enabled: true},
+		{Name: "model-b", RoutingStrategy: RoutingPriorityWeighted, Enabled: true},
+	}
+	if err := store.db.Create(&models).Error; err != nil {
+		t.Fatal(err)
+	}
+	logs := []RelayRequestLog{
+		{ID: "model-count-a-1", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", CreatedAt: time.Now()},
+		{ID: "model-count-a-2", TokenID: 1, Endpoint: "responses", RequestedModel: "model-a", CreatedAt: time.Now()},
+		{ID: "model-count-b-1", TokenID: 1, Endpoint: "responses", RequestedModel: "model-b", CreatedAt: time.Now()},
+		{ID: "model-count-removed", TokenID: 1, Endpoint: "responses", RequestedModel: "removed-model", CreatedAt: time.Now()},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	views, err := NewManagementService(store).ListModels(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(views) != 2 || views[0].Name != "model-a" || views[0].RequestCount != 2 || views[1].Name != "model-b" || views[1].RequestCount != 1 {
+		t.Fatalf("model views = %+v", views)
+	}
+}
+
 func TestBackfillTokenStatsAndLogFieldsRunOnce(t *testing.T) {
 	store := newTestStore(t)
 	createdAt := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
@@ -461,6 +569,63 @@ func TestBackfillTokenStatsAndLogFieldsRunOnce(t *testing.T) {
 	statistics, err := NewManagementService(store).tokenStatistics(context.Background(), 7)
 	if err != nil || statistics.NormalInputTokens != 11 || statistics.CacheWriteTokens != 2 || statistics.SentTokens != 16 || statistics.UpstreamCost != 17 || statistics.AverageFirstTokenMS != 50 || statistics.AverageLatency != 45 || statistics.AverageDurationMS != 200 {
 		t.Fatalf("token statistics = %+v, error = %v", statistics, err)
+	}
+}
+
+func TestBackfillResponsePhaseTimingsRunsOnce(t *testing.T) {
+	store := newTestStore(t)
+	createdAt := time.Date(2026, 7, 20, 4, 0, 0, 0, time.UTC)
+	request := RelayRequestLog{
+		ID: "timing-request", TokenID: 7, Endpoint: "responses", RequestedModel: "model-a", StatusCode: http.StatusOK,
+		Outcome: RelayOutcomeSuccess, LatencyMS: 100, FirstTokenMS: 350, DurationMS: 900, AttemptCount: 1, CreatedAt: createdAt,
+	}
+	if err := store.db.Create(&request).Error; err != nil {
+		t.Fatal(err)
+	}
+	attempt := RelayAttemptLog{
+		RequestID: request.ID, ChannelID: 1, ChannelModelID: 1, UpstreamModel: "model-a", StatusCode: http.StatusOK,
+		Outcome: RelayOutcomeSuccess, Success: true, LatencyMS: 80, FirstTokenMS: 300, DurationMS: 800, CreatedAt: createdAt,
+	}
+	if err := store.db.Create(&attempt).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&TokenDailyStat{Date: "2026-07-20", TokenID: 7, RequestCount: 1, FirstTokenMS: 350, FirstTokenSamples: 1, LatencyMS: 100, LatencySamples: 1, DurationMS: 900}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&TokenDailyStat{Date: "2026-07-19", TokenID: 7, RequestCount: 2, FirstTokenMS: 700, FirstTokenSamples: 2, LatencyMS: 200, LatencySamples: 2, DurationMS: 1800}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillResponsePhaseTimings(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillResponsePhaseTimings(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.First(&request, "id = ?", request.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if request.FirstTokenMS != 250 || request.DurationMS != 800 || request.LatencyMS != 100 {
+		t.Fatalf("request timings = %+v", request)
+	}
+	if err := store.db.First(&attempt, attempt.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if attempt.FirstTokenMS != 220 || attempt.DurationMS != 720 || attempt.LatencyMS != 80 {
+		t.Fatalf("attempt timings = %+v", attempt)
+	}
+	var stat TokenDailyStat
+	if err := store.db.First(&stat, "date = ? AND token_id = ?", "2026-07-20", 7).Error; err != nil {
+		t.Fatal(err)
+	}
+	if stat.FirstTokenMS != 250 || stat.FirstTokenSamples != 1 || stat.DurationMS != 800 || stat.LatencyMS != 100 {
+		t.Fatalf("daily timings = %+v", stat)
+	}
+	var aggregateOnlyStat TokenDailyStat
+	if err := store.db.First(&aggregateOnlyStat, "date = ? AND token_id = ?", "2026-07-19", 7).Error; err != nil {
+		t.Fatal(err)
+	}
+	if aggregateOnlyStat.FirstTokenMS != 700 || aggregateOnlyStat.DurationMS != 1800 {
+		t.Fatalf("aggregate-only daily timings changed = %+v", aggregateOnlyStat)
 	}
 }
 
@@ -691,7 +856,7 @@ func TestDashboardUsesTokenStatsWithoutDoubleCountingDetails(t *testing.T) {
 	if summary.Requests != 1 || summary.InputTokens != 10 || summary.OutputTokens != 2 || summary.EstimatedCost != 50 || summary.UpstreamCost != 30 || summary.AverageFirstTokenMS != 0 || summary.AverageLatency != 0 || summary.AverageDurationMS != 0 {
 		t.Fatalf("dashboard totals = %+v", summary)
 	}
-	if len(summary.Channels) != 1 || summary.Channels[0].Requests != 1 || summary.Channels[0].UpstreamCost != 30 || len(summary.Models) != 1 || summary.Models[0].Requests != 1 || summary.Models[0].UpstreamCost != 30 {
+	if len(summary.Channels) != 1 || summary.Channels[0].Requests != 1 || summary.Channels[0].Successes != 1 || summary.Channels[0].SuccessRate != 1 || summary.Channels[0].InputTokens != 10 || summary.Channels[0].OutputTokens != 2 || summary.Channels[0].UpstreamCost != 30 || len(summary.Models) != 1 || summary.Models[0].Requests != 1 || summary.Models[0].Successes != 1 || summary.Models[0].SuccessRate != 1 || summary.Models[0].InputTokens != 10 || summary.Models[0].OutputTokens != 2 || summary.Models[0].UpstreamCost != 30 {
 		t.Fatalf("dashboard breakdowns = channels %+v models %+v", summary.Channels, summary.Models)
 	}
 	if len(summary.Daily) != 1 || summary.Daily[0].Date != eastEightDate(now) || summary.Daily[0].Requests != 1 {
@@ -732,11 +897,47 @@ func TestDashboardChannelBreakdownCountsEachRequestOnce(t *testing.T) {
 	for _, item := range summary.Channels {
 		byName[item.Name] = item
 	}
-	if final := byName[channels[1].Name]; final.Requests != 1 || final.UpstreamCost != 60 || final.EstimatedCost != 70 {
+	if final := byName[channels[1].Name]; final.Requests != 1 || final.Successes != 1 || final.SuccessRate != 1 || final.UpstreamCost != 60 || final.EstimatedCost != 70 {
 		t.Fatalf("final channel breakdown = %+v", final)
 	}
-	if unrouted := byName["未归属渠道"]; unrouted.Requests != 1 || unrouted.UpstreamCost != 0 || unrouted.EstimatedCost != 0 {
+	if unrouted := byName["未归属渠道"]; unrouted.Requests != 1 || unrouted.Successes != 0 || unrouted.SuccessRate != 0 || unrouted.UpstreamCost != 0 || unrouted.EstimatedCost != 0 {
 		t.Fatalf("unrouted breakdown = %+v", unrouted)
+	}
+}
+
+func TestDashboardBreakdownSuccessRateExcludesCanceledRequests(t *testing.T) {
+	store := newTestStore(t)
+	_, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	now := time.Now().UTC()
+	requests := []RelayRequestLog{
+		{ID: "breakdown-success", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, CreatedAt: now},
+		{ID: "breakdown-failed", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusBadGateway, Outcome: RelayOutcomeFailed, CreatedAt: now},
+		{ID: "breakdown-canceled", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: 499, Outcome: RelayOutcomeCanceled, CreatedAt: now},
+	}
+	if err := store.db.Create(&requests).Error; err != nil {
+		t.Fatal(err)
+	}
+	for index, request := range requests {
+		if err := store.db.Create(&RelayAttemptLog{
+			RequestID: request.ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name,
+			ChannelModelID: mappings[0].ID, UpstreamModel: mappings[0].UpstreamModel,
+			StatusCode: request.StatusCode, Success: request.Outcome == RelayOutcomeSuccess, CreatedAt: now.Add(time.Duration(index) * time.Millisecond),
+		}).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := NewManagementService(store).Dashboard(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Channels) != 1 || len(summary.Models) != 1 {
+		t.Fatalf("dashboard breakdowns = channels %+v models %+v", summary.Channels, summary.Models)
+	}
+	for _, item := range []DashboardBreakdown{summary.Channels[0], summary.Models[0]} {
+		if item.Requests != 3 || item.Successes != 1 || item.CanceledCount != 1 || item.SuccessRate != 0.5 {
+			t.Fatalf("breakdown success summary = %+v", item)
+		}
 	}
 }
 
@@ -1327,7 +1528,7 @@ func TestRouterPlanLoadsRecentModelSuccessRates(t *testing.T) {
 	if err := store.db.Create(&attempts).Error; err != nil {
 		t.Fatal(err)
 	}
-	router := NewRouter(store, NewClientAccessService(store))
+	router := NewRouter(store, NewClientAccessService(store), nil)
 	plan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "")
 	if err != nil {
 		t.Fatal(err)
@@ -1372,10 +1573,10 @@ func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
 	store := newTestStore(t)
 	now := time.Now()
 	attempts := []RelayAttemptLog{
-		{RequestID: "target-a-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 100, CachedTokens: 50, LatencyMS: 20, CreatedAt: now.Add(-time.Minute)},
-		{RequestID: "target-b-cache-miss", ChannelID: 2, ChannelModelID: 22, InputTokens: 200, CachedTokens: 0, LatencyMS: 40, CreatedAt: now.Add(-2 * time.Minute)},
-		{RequestID: "other-model", ChannelID: 3, ChannelModelID: 33, InputTokens: 100, CachedTokens: 100, LatencyMS: 10, CreatedAt: now.Add(-3 * time.Minute)},
-		{RequestID: "target-a-expired-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 300, CachedTokens: 300, LatencyMS: 90, CreatedAt: now.Add(-31 * time.Minute)},
+		{RequestID: "target-a-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 100, CachedTokens: 50, OutputTokens: 20, LatencyMS: 20, FirstTokenMS: 50, DurationMS: 250, Success: true, CreatedAt: now.Add(-time.Minute)},
+		{RequestID: "target-b-cache-miss", ChannelID: 2, ChannelModelID: 22, InputTokens: 200, CachedTokens: 0, OutputTokens: 10, LatencyMS: 40, FirstTokenMS: 100, DurationMS: 300, Success: true, CreatedAt: now.Add(-2 * time.Minute)},
+		{RequestID: "other-model", ChannelID: 3, ChannelModelID: 33, InputTokens: 100, CachedTokens: 100, OutputTokens: 5, LatencyMS: 10, FirstTokenMS: 20, DurationMS: 120, Success: true, CreatedAt: now.Add(-3 * time.Minute)},
+		{RequestID: "target-a-expired-cache-hit", ChannelID: 1, ChannelModelID: 11, InputTokens: 300, CachedTokens: 300, OutputTokens: 30, LatencyMS: 90, FirstTokenMS: 200, DurationMS: 500, Success: true, CreatedAt: now.Add(-31 * time.Minute)},
 	}
 	if err := store.db.Create(&attempts).Error; err != nil {
 		t.Fatal(err)
@@ -1386,11 +1587,11 @@ func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := metrics[11]
-	if first.RouteCount != 2 || first.RouteSampleSize != 4 || first.RouteShare != 0.5 || first.CacheHitRate != 1 || first.CacheSampleCount != 1 || first.CacheRate != 0.5 || first.CacheTokenCount != 100 || first.LatencyMS != 20 {
+	if first.RouteCount != 2 || first.RouteSampleSize != 4 || first.RouteShare != 0.5 || first.CacheHitRate != 1 || first.CacheSampleCount != 1 || first.CacheRate != 0.5 || first.CacheTokenCount != 100 || first.LatencyMS != 20 || first.FirstTokenMS != 50 || first.TokensPerSecond != 100 {
 		t.Fatalf("first routing metric = %+v", first)
 	}
 	second := metrics[22]
-	if second.RouteCount != 1 || second.RouteSampleSize != 4 || second.RouteShare != 0.25 || second.CacheHitRate != 0 || second.CacheSampleCount != 1 || second.CacheRate != 0 || second.CacheTokenCount != 200 || second.LatencyMS != 40 {
+	if second.RouteCount != 1 || second.RouteSampleSize != 4 || second.RouteShare != 0.25 || second.CacheHitRate != 0 || second.CacheSampleCount != 1 || second.CacheRate != 0 || second.CacheTokenCount != 200 || second.LatencyMS != 40 || second.FirstTokenMS != 100 || second.TokensPerSecond != 50 {
 		t.Fatalf("second routing metric = %+v", second)
 	}
 	empty := metrics[44]
@@ -1399,7 +1600,7 @@ func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
 	}
 }
 
-func TestRouterRecentRouteShareAndCacheHitOutweighPrice(t *testing.T) {
+func TestRouterConfiguredPriceWeightOutweighsCacheAndRouteShare(t *testing.T) {
 	router := &Router{random: func(int) int { return 999_999 }}
 	candidates := []RouteCandidate{
 		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 10, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentCacheHitRate: 0.1, RecentCacheSamples: 10, RecentCacheRate: 0.1, RecentCacheTokens: 1000, RecentRouteShare: 0.9, RouteSampleSize: 100, MetricsLoaded: true},
@@ -1411,8 +1612,44 @@ func TestRouterRecentRouteShareAndCacheHitOutweighPrice(t *testing.T) {
 	for _, candidate := range decision.Candidates {
 		probabilityByMapping[candidate.ChannelModelID] = candidate.Probability
 	}
-	if probabilityByMapping[2] <= probabilityByMapping[1] || candidates[0].Mapping.ID != 2 {
-		t.Fatalf("routing priorities were not applied: candidates = %+v, decision = %+v", candidates, decision.Candidates)
+	if probabilityByMapping[1] <= probabilityByMapping[2] {
+		t.Fatalf("configured price weight was not applied: candidates = %+v, decision = %+v", candidates, decision.Candidates)
+	}
+}
+
+func TestRouterRoutingWeightsUpdateAtRuntime(t *testing.T) {
+	currentConfig := &config.ApplicationConfig{GatewayConfig: config.GatewayConfig{
+		RoutingPriceWeightPercent:      80,
+		RoutingEfficiencyWeightPercent: 10,
+	}}
+	router := &Router{
+		random: func(int) int { return 0 },
+		configProvider: func() *config.ApplicationConfig {
+			return currentConfig
+		},
+	}
+	base := []RouteCandidate{
+		{Channel: Channel{ID: 1}, Mapping: ChannelModel{ID: 1, Priority: 10, Weight: 100}, Cost: 10, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentLatencyMS: 20, RecentFirstTokenMS: 100, RecentTokensPerSecond: 10, MetricsLoaded: true},
+		{Channel: Channel{ID: 2}, Mapping: ChannelModel{ID: 2, Priority: 10, Weight: 100}, Cost: 100, RecentSuccessRate: 1, RecentAttemptCount: 10, RecentLatencyMS: 10, RecentFirstTokenMS: 10, RecentTokensPerSecond: 100, MetricsLoaded: true},
+	}
+
+	priceCandidates := append([]RouteCandidate(nil), base...)
+	priceDecision := router.orderCandidates(RoutingPriorityWeighted, priceCandidates)
+	if priceDecision.Candidates[0].Probability <= priceDecision.Candidates[1].Probability {
+		t.Fatalf("price-weighted decision = %+v", priceDecision.Candidates)
+	}
+
+	currentConfig = &config.ApplicationConfig{GatewayConfig: config.GatewayConfig{
+		RoutingPriceWeightPercent:      10,
+		RoutingEfficiencyWeightPercent: 80,
+	}}
+	efficiencyCandidates := append([]RouteCandidate(nil), base...)
+	efficiencyDecision := router.orderCandidates(RoutingPriorityWeighted, efficiencyCandidates)
+	if efficiencyDecision.Candidates[1].Probability <= efficiencyDecision.Candidates[0].Probability {
+		t.Fatalf("efficiency-weighted decision = %+v", efficiencyDecision.Candidates)
+	}
+	if efficiencyDecision.Weights.Price != 0.1 || efficiencyDecision.Weights.Efficiency != 0.8 || efficiencyDecision.Weights.Quality != 0.1 {
+		t.Fatalf("updated decision weights = %+v", efficiencyDecision.Weights)
 	}
 }
 
@@ -1496,7 +1733,7 @@ func TestRouterSessionAffinityDoesNotConsumeWeightedAllocation(t *testing.T) {
 	if err := store.db.Model(&ChannelModel{}).Where("model_id = ?", model.ID).Update("priority", 100).Error; err != nil {
 		t.Fatal(err)
 	}
-	router := NewRouter(store, NewClientAccessService(store))
+	router := NewRouter(store, NewClientAccessService(store), nil)
 	router.random = func(int) int { return 0 }
 
 	firstPlan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "new-session-a")
@@ -1528,7 +1765,7 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	payload, err := ParseRelayPayload([]byte(`{
 		"model":"public-model",
 		"prompt_cache_key":" codex-session ",
-		"client_metadata":{"session_id":"fallback-session","private":"do-not-log"},
+		"client_metadata":{"session_id":"fallback-session","x-codex-turn-metadata":"{\"thread_source\":\"user\"}","private":"do-not-log"},
 		"messages":[{"role":"user","content":"private prompt"}],
 		"temperature":0.2,
 		"reasoning":{"effort":"high","private":"do-not-log"},
@@ -1540,6 +1777,9 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	}
 	if payload.SessionKey != "codex-session" || payload.SessionSource != "prompt_cache_key" {
 		t.Fatalf("session = %q from %q", payload.SessionKey, payload.SessionSource)
+	}
+	if payload.ThreadSource != codexThreadSourceUser {
+		t.Fatalf("thread source = %q", payload.ThreadSource)
 	}
 	parameters := decodeRequestParameters(payload.RequestParametersJSON)
 	if parameters["model"] != "public-model" || parameters["temperature"] != json.Number("0.2") || parameters["message_count"] != json.Number("1") || parameters["tool_count"] != json.Number("1") {
@@ -1566,6 +1806,13 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	}
 	if unavailable.SessionKey != "" || unavailable.SessionSource != "unavailable" || strings.Contains(unavailable.RequestParametersJSON, "private prompt") {
 		t.Fatalf("unavailable session payload = %+v", unavailable)
+	}
+	ambient, err := ParseRelayPayload([]byte(`{"model":"public-model","prompt_cache_key":"ambient-session","client_metadata":{"x-codex-turn-metadata":"{\"thread_source\":\"ambient_suggestions\"}"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ambient.ThreadSource != codexThreadSourceAmbient {
+		t.Fatalf("ambient thread source = %q", ambient.ThreadSource)
 	}
 }
 
@@ -1607,7 +1854,7 @@ func TestCodexAuxiliaryRequestsMergeIntoMainSession(t *testing.T) {
 		rawBody: titleBody, responseBody: titleResponse, startedAt: requestStart,
 	}, http.StatusOK, "")
 
-	mainBody := []byte(`{"model":"main-model","prompt_cache_key":"main-session","stream":true,"input":[{"role":"user","type":"message","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\ninvestigate session grouping"},{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/screenshot.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":"</image>"}]}]}`)
+	mainBody := []byte(`{"model":"main-model","prompt_cache_key":"main-session","client_metadata":{"x-codex-turn-metadata":"{\"thread_source\":\"user\"}"},"stream":true,"input":[{"role":"user","type":"message","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\ninvestigate session grouping"},{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/screenshot.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":"</image>"}]}]}`)
 	mainPayload, err := ParseRelayPayload(mainBody)
 	if err != nil {
 		t.Fatal(err)
@@ -1650,7 +1897,7 @@ func TestCodexAuxiliaryRequestsMergeIntoMainSession(t *testing.T) {
 	if err := store.db.Where("token_id = ? AND session_id = ?", token.ID, "main-session").First(&mainState).Error; err != nil {
 		t.Fatal(err)
 	}
-	if mainState.Title != "Investigate session grouping" {
+	if mainState.Title != "Investigate session grouping" || mainState.ThreadSource != codexThreadSourceUser {
 		t.Fatalf("main state = %+v", mainState)
 	}
 	var oldStateCount int64
@@ -1804,6 +2051,58 @@ func TestBackfillCodexAuxiliarySessions(t *testing.T) {
 	}
 }
 
+func TestBackfillCodexThreadSourcesRunsOnce(t *testing.T) {
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	ambientBody := []byte(`{"model":"gpt-5.6-terra","prompt_cache_key":"ambient-session","client_metadata":{"x-codex-turn-metadata":"{\"thread_source\":\"ambient_suggestions\"}"},"input":"# Overview"}`)
+	userBody := []byte(`{"model":"gpt-5.6-sol","prompt_cache_key":"user-session","client_metadata":{"x-codex-turn-metadata":"{\"thread_source\":\"user\"}"},"input":"normal request"}`)
+	logs := []RelayRequestLog{
+		{ID: "ambient-request", TokenID: 7, Endpoint: "responses", RequestedModel: "gpt-5.6-terra", CodexSessionID: "ambient-session", RequestBody: compressStoredPayload(ambientBody), StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, CreatedAt: now},
+		{ID: "user-request", TokenID: 7, Endpoint: "responses", RequestedModel: "gpt-5.6-sol", CodexSessionID: "user-session", RequestBody: compressStoredPayload(userBody), StatusCode: http.StatusOK, Outcome: RelayOutcomeSuccess, CreatedAt: now},
+	}
+	if err := store.db.Create(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&RelaySessionState{TokenID: 7, SessionID: "ambient-session", Title: "# Overview", CreatedAt: now, UpdatedAt: now}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCodexThreadSources(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCodexThreadSources(); err != nil {
+		t.Fatal(err)
+	}
+	var ambientState RelaySessionState
+	if err := store.db.First(&ambientState, "token_id = ? AND session_id = ?", 7, "ambient-session").Error; err != nil {
+		t.Fatal(err)
+	}
+	if ambientState.ThreadSource != codexThreadSourceAmbient {
+		t.Fatalf("ambient state = %+v", ambientState)
+	}
+	var userState RelaySessionState
+	if err := store.db.First(&userState, "token_id = ? AND session_id = ?", 7, "user-session").Error; err != nil {
+		t.Fatal(err)
+	}
+	if userState.ThreadSource != codexThreadSourceUser {
+		t.Fatalf("user state = %+v", userState)
+	}
+	page, err := NewManagementService(store).SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 2 {
+		t.Fatalf("session page = %+v", page)
+	}
+	for _, item := range page.Items {
+		if item.SessionID == "ambient-session" && item.ThreadSource != codexThreadSourceAmbient {
+			t.Fatalf("ambient summary = %+v", item)
+		}
+		if item.SessionID == "user-session" && item.ThreadSource != codexThreadSourceUser {
+			t.Fatalf("user summary = %+v", item)
+		}
+	}
+}
+
 func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	store := newTestStore(t)
 	token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
@@ -1825,7 +2124,7 @@ func TestSessionLogsAggregateExistingFiveDayDetails(t *testing.T) {
 	if err := store.db.Create(&attempts).Error; err != nil {
 		t.Fatal(err)
 	}
-	NewRouter(store, NewClientAccessService(store)).RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session", mappings[1].ID)
+	NewRouter(store, NewClientAccessService(store), nil).RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session", mappings[1].ID)
 
 	management := NewManagementService(store)
 	page, err := management.SessionLogs(context.Background(), SessionLogQuery{Page: 1, PageSize: 25})
@@ -1941,7 +2240,7 @@ func TestResponsesAffinityPinsOriginalMapping(t *testing.T) {
 	store := newTestStore(t)
 	token, model, channels, mappings := createRouteFixture(t, store, RoutingLowestCost, "http://one.invalid", "http://two.invalid")
 	access := NewClientAccessService(store)
-	router := NewRouter(store, access)
+	router := NewRouter(store, access, nil)
 	router.RecordAffinity(context.Background(), "resp_123", mappings[1].ID)
 	plan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "resp_123", "")
 	if err != nil {
@@ -1965,7 +2264,7 @@ func TestResponsesAffinityPinsOriginalMapping(t *testing.T) {
 func TestCodexSessionAffinityPinsMappingAndAllowsCircuitFailover(t *testing.T) {
 	store := newTestStore(t)
 	token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
-	router := NewRouter(store, NewClientAccessService(store))
+	router := NewRouter(store, NewClientAccessService(store), nil)
 	router.RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session-a", mappings[1].ID)
 
 	plan, err := router.Plan(context.Background(), token, model.Name, 10, 10, "", "codex-session-a")
@@ -2045,7 +2344,7 @@ func TestCodexSessionAffinityClassifiesUnavailableTarget(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			store := newTestStore(t)
 			token, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
-			router := NewRouter(store, NewClientAccessService(store))
+			router := NewRouter(store, NewClientAccessService(store), nil)
 			router.RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session", mappings[0].ID)
 			if err := store.db.Create(&RelayRequestLog{
 				ID: "historical-request", TokenID: token.ID, RequestedModel: model.Name,
@@ -2087,7 +2386,7 @@ func TestCircuitOpensAfterThreeFailuresAndRecovers(t *testing.T) {
 	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.ConsecutiveFailures != 3 || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
+	if channel.ConsecutiveFailures != 0 || channel.CircuitLevel != CircuitLevelTemporary || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
 		t.Fatalf("channel circuit state = %+v", channel)
 	}
 	channelID := channel.ID
@@ -2096,8 +2395,114 @@ func TestCircuitOpensAfterThreeFailuresAndRecovers(t *testing.T) {
 	if err := store.db.First(&channel, channelID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.ConsecutiveFailures != 0 || channel.CircuitOpenUntil != nil || channel.LatencyEWMA != 42 {
+	if channel.ConsecutiveFailures != 0 || channel.CircuitLevel != CircuitLevelClosed || channel.CircuitOpenUntil != nil || channel.LatencyEWMA != 42 {
 		t.Fatalf("recovered channel = %+v", channel)
+	}
+}
+
+func TestBackfillCircuitLevelsPreservesExistingOpenCircuits(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	if err := store.db.Model(&Channel{}).Where("id = ?", channels[0].ID).Update("circuit_open_until", time.Now().Add(time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCircuitLevels(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.backfillCircuitLevels(); err != nil {
+		t.Fatal(err)
+	}
+	var channel Channel
+	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelTemporary {
+		t.Fatalf("backfilled circuit level = %d", channel.CircuitLevel)
+	}
+}
+
+func TestCircuitEscalatesAndRecoversOneLevelAtATime(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	relay := newTestRelay(store)
+	channelID := channels[0].ID
+
+	for range circuitFailureThreshold {
+		relay.recordChannelFailure(context.Background(), channelID, "temporary failure")
+	}
+	if err := store.db.Model(&Channel{}).Where("id = ?", channelID).Update("circuit_open_until", time.Now().Add(-time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	for range circuitFailureThreshold {
+		relay.recordChannelFailure(context.Background(), channelID, "extended failure")
+	}
+
+	var channel Channel
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelExtended || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now().Add(4*time.Minute)) {
+		t.Fatalf("extended circuit = %+v", channel)
+	}
+
+	relay.recordChannelSuccess(context.Background(), channelID, 25)
+	channel = Channel{}
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelTemporary || channel.CircuitOpenUntil != nil || channel.LastError == "" {
+		t.Fatalf("first recovery = %+v", channel)
+	}
+	relay.recordChannelSuccess(context.Background(), channelID, 20)
+	channel = Channel{}
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelClosed || channel.CircuitOpenUntil != nil || channel.LastError != "" {
+		t.Fatalf("full recovery = %+v", channel)
+	}
+}
+
+func TestHighestCircuitLevelRequiresManualRecovery(t *testing.T) {
+	store := newTestStore(t)
+	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
+	relay := newTestRelay(store)
+	channelID := channels[0].ID
+	if err := store.db.Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+		"circuit_level":        CircuitLevelExtended,
+		"consecutive_failures": circuitFailureThreshold - 1,
+		"circuit_open_until":   time.Now().Add(-time.Second),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	relay.recordChannelFailure(context.Background(), channelID, "terminal failure")
+	var channel Channel
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelManual || channel.Enabled || channel.CircuitOpenUntil != nil {
+		t.Fatalf("manual circuit = %+v", channel)
+	}
+	relay.recordChannelSuccess(context.Background(), channelID, 10)
+	channel = Channel{}
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelManual || channel.Enabled {
+		t.Fatalf("automatic recovery changed manual circuit = %+v", channel)
+	}
+
+	management := NewManagementService(store)
+	if err := management.ResetChannelCircuit(context.Background(), channelID); err != nil {
+		t.Fatal(err)
+	}
+	channel = Channel{}
+	if err := store.db.First(&channel, channelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if channel.CircuitLevel != CircuitLevelClosed || !channel.Enabled || channel.LastError != "" {
+		t.Fatalf("manual recovery = %+v", channel)
 	}
 }
 
@@ -2106,7 +2511,9 @@ func TestResetChannelCircuitClearsFailureState(t *testing.T) {
 	_, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid")
 	openUntil := time.Now().Add(time.Minute)
 	if err := store.db.Model(&Channel{}).Where("id = ?", channels[0].ID).Updates(map[string]any{
+		"enabled":              false,
 		"consecutive_failures": 4,
+		"circuit_level":        CircuitLevelManual,
 		"circuit_open_until":   openUntil,
 		"last_error":           "insufficient balance",
 	}).Error; err != nil {
@@ -2120,7 +2527,7 @@ func TestResetChannelCircuitClearsFailureState(t *testing.T) {
 	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.ConsecutiveFailures != 0 || channel.CircuitOpenUntil != nil || channel.LastError != "" {
+	if !channel.Enabled || channel.ConsecutiveFailures != 0 || channel.CircuitLevel != CircuitLevelClosed || channel.CircuitOpenUntil != nil || channel.LastError != "" {
 		t.Fatalf("reset channel = %+v", channel)
 	}
 	if err := management.ResetChannelCircuit(context.Background(), channel.ID+1000); !errors.Is(err, gorm.ErrRecordNotFound) {
@@ -2388,10 +2795,10 @@ func TestSessionPayloadCompactionRetainsOnlyIncrement(t *testing.T) {
 	})
 
 	firstResponse := []byte(`{"choices":[{"message":{"role":"assistant","content":"first answer"}}]}`)
-	if got := compactSessionPayload(store.db, 7, "session-a", "request-1", "first prom", first, firstResponse, now); string(got) != string(first) {
+	if got := compactSessionPayload(store.db, 7, "session-a", "request-1", "first prom", codexThreadSourceUser, first, firstResponse, now); string(got) != string(first) {
 		t.Fatalf("first payload = %s", got)
 	}
-	compacted := compactSessionPayload(store.db, 7, "session-a", "request-2", "second pro", second, nil, now.Add(time.Minute))
+	compacted := compactSessionPayload(store.db, 7, "session-a", "request-2", "second pro", codexThreadSourceUser, second, nil, now.Add(time.Minute))
 	var envelope payloadDeltaEnvelope
 	if err := json.Unmarshal(compacted, &envelope); err != nil {
 		t.Fatalf("decode compacted payload: %v (%s)", err, compacted)
@@ -2407,7 +2814,7 @@ func TestSessionPayloadCompactionRetainsOnlyIncrement(t *testing.T) {
 	if err := store.db.Where("token_id = ? AND session_id = ?", 7, "session-a").First(&state).Error; err != nil {
 		t.Fatal(err)
 	}
-	if state.Title != "first prom" || state.LatestRequestID != "request-2" {
+	if state.Title != "first prom" || state.ThreadSource != codexThreadSourceUser || state.LatestRequestID != "request-2" {
 		t.Fatalf("session state = %+v", state)
 	}
 }
@@ -2677,10 +3084,10 @@ func TestRelayRecordsDistinctStreamingTimings(t *testing.T) {
 	if err := store.db.First(&attemptLog).Error; err != nil {
 		t.Fatal(err)
 	}
-	if requestLog.LatencyMS <= 0 || requestLog.FirstTokenMS <= requestLog.LatencyMS || requestLog.DurationMS <= requestLog.FirstTokenMS {
+	if requestLog.LatencyMS <= 0 || requestLog.FirstTokenMS <= 0 || requestLog.DurationMS <= requestLog.FirstTokenMS {
 		t.Fatalf("request timings = latency %d, first token %d, duration %d", requestLog.LatencyMS, requestLog.FirstTokenMS, requestLog.DurationMS)
 	}
-	if attemptLog.LatencyMS <= 0 || attemptLog.FirstTokenMS <= attemptLog.LatencyMS || attemptLog.DurationMS <= attemptLog.FirstTokenMS {
+	if attemptLog.LatencyMS <= 0 || attemptLog.FirstTokenMS <= 0 || attemptLog.DurationMS <= attemptLog.FirstTokenMS {
 		t.Fatalf("attempt timings = latency %d, first token %d, duration %d", attemptLog.LatencyMS, attemptLog.FirstTokenMS, attemptLog.DurationMS)
 	}
 	var stat TokenDailyStat
@@ -2689,6 +3096,48 @@ func TestRelayRecordsDistinctStreamingTimings(t *testing.T) {
 	}
 	if stat.FirstTokenSamples != 1 || stat.LatencySamples != 1 || stat.FirstTokenMS != requestLog.FirstTokenMS || stat.LatencyMS != requestLog.LatencyMS || stat.DurationMS != requestLog.DurationMS {
 		t.Fatalf("daily timing stats = %+v", stat)
+	}
+}
+
+func TestRelayForwardsFirstSSEEventBeforeOutputToken(t *testing.T) {
+	store := newTestStore(t)
+	releaseOutput := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		flusher := writer.(http.Flusher)
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_fast\"}}\n\n"))
+		flusher.Flush()
+		<-releaseOutput
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fast\",\"status\":\"completed\"}}\n\n"))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	body := []byte(`{"model":"public-model","stream":true,"input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &notifyingStreamWriter{header: make(http.Header), firstWrite: make(chan []byte, 1)}
+	done := make(chan *PublicError, 1)
+	go func() {
+		done <- newTestRelay(store).Relay(context.Background(), writer, nil, "", "responses", token, payload, body)
+	}()
+	select {
+	case firstWrite := <-writer.firstWrite:
+		if !bytes.Contains(firstWrite, []byte("response.created")) {
+			t.Fatalf("first downstream event = %s", firstWrite)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("first SSE event was buffered until output")
+	}
+	close(releaseOutput)
+	if publicErr := <-done; publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	var refreshedToken ClientToken
+	if err := store.db.First(&refreshedToken, token.ID).Error; err != nil || refreshedToken.LastUsedAt == nil {
+		t.Fatalf("last used token = %+v, error = %v", refreshedToken, err)
 	}
 }
 
@@ -2954,7 +3403,7 @@ func TestRelayKeepsCodexSessionAffinityUntilOriginalChannelIsUnavailable(t *test
 	}))
 	defer second.Close()
 	token, model, _, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
-	router := NewRouter(store, NewClientAccessService(store))
+	router := NewRouter(store, NewClientAccessService(store), nil)
 	router.RecordSessionAffinity(context.Background(), token.ID, model.ID, "codex-session-sticky", mappings[0].ID)
 	relay := NewRelayService(store, router, NewTokenEstimator(), &config.ApplicationConfigManager{})
 
@@ -3252,7 +3701,7 @@ func TestRelayCircuitsBalanceFailureAndSwitchesChannel(t *testing.T) {
 	if err := store.db.First(&failedChannel, channels[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if failedChannel.ConsecutiveFailures != 1 || failedChannel.CircuitOpenUntil == nil || !failedChannel.CircuitOpenUntil.After(time.Now()) || !strings.Contains(failedChannel.LastError, "预扣费额度失败") {
+	if failedChannel.ConsecutiveFailures != 0 || failedChannel.CircuitLevel != CircuitLevelTemporary || failedChannel.CircuitOpenUntil == nil || !failedChannel.CircuitOpenUntil.After(time.Now()) || !strings.Contains(failedChannel.LastError, "预扣费额度失败") {
 		t.Fatalf("failed channel = %+v", failedChannel)
 	}
 }
@@ -3312,7 +3761,7 @@ func TestRelayCircuitsAuthenticationFailureAndSwitchesChannel(t *testing.T) {
 	if err := store.db.First(&channel, channels[0].ID).Error; err != nil {
 		t.Fatal(err)
 	}
-	if channel.ConsecutiveFailures != 1 || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
+	if channel.ConsecutiveFailures != 0 || channel.CircuitLevel != CircuitLevelTemporary || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(time.Now()) {
 		t.Fatalf("authentication failure channel = %+v", channel)
 	}
 	if attempts := relayAttempts(t, store); len(attempts) != 2 || attempts[0].StatusCode != http.StatusUnauthorized || !attempts[1].Success {
@@ -3357,11 +3806,10 @@ func TestResponseAffinityBalanceFailureCircuitsWithoutCrossChannelRetry(t *testi
 	}
 }
 
-func TestRelayRetriesPretokenSSEApplicationErrorWithoutLeakingEvents(t *testing.T) {
+func TestRelayRetriesFirstSSEApplicationErrorWithoutLeakingEvents(t *testing.T) {
 	store := newTestStore(t)
 	first := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "text/event-stream")
-		_, _ = writer.Write([]byte("data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_failed\"}}\n\n"))
 		_, _ = writer.Write([]byte("data: {\"type\":\"error\",\"error\":{\"code\":\"model_at_capacity\",\"message\":\"Selected model is at capacity. Please try a different model.\"}}\n\n"))
 	}))
 	defer first.Close()
@@ -3583,8 +4031,7 @@ func TestResponsesStreamDoneWithoutCompletedIsNotSuccessful(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	publicErr := newTestRelay(store).Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body)
-	if publicErr == nil || publicErr.Code != "upstream_unavailable" {
+	if publicErr := newTestRelay(store).Relay(context.Background(), httptest.NewRecorder(), nil, "", "responses", token, payload, body); publicErr != nil {
 		t.Fatalf("Relay() error = %+v", publicErr)
 	}
 	attempts := relayAttempts(t, store)

@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
-import { EditPen, Right, View } from '@element-plus/icons-vue'
+import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
+import { ArrowDown, ArrowUp, EditPen, Refresh, Right, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import RouteDecisionPanel from '@/components/RouteDecisionPanel.vue'
@@ -24,15 +24,24 @@ interface ChannelSwitch {
 type SessionDetailStatus = 'all' | 'success' | 'canceled' | 'failure'
 
 const { summary } = defineProps<SessionLogDrawerProps>()
+const emit = defineEmits<{
+  /** Notify the session list after the drawer has fully closed. */
+  closed: []
+}>()
 const open = defineModel<boolean>({ required: true })
 const loading = ref(false)
+const timelineLoading = ref(false)
+const loadingMore = ref(false)
 const errorMessage = ref('')
+const timelineErrorMessage = ref('')
 const detail = ref<CodexSessionDetail | null>(null)
 const pagination = ref({ page: 1, pageSize: 25 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
 const detailStatus = ref<SessionDetailStatus>('all')
+const expandedRequestIds = ref<Set<string>>(new Set())
+const timelineScroller = useTemplateRef<HTMLElement>('timelineScroller')
 const detailStatusOptions: Array<{ label: string; value: SessionDetailStatus }> = [
   { label: '全部', value: 'all' },
   { label: '成功', value: 'success' },
@@ -81,6 +90,8 @@ const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requ
     channelSwitch: resolveChannelSwitch(requests, requestIndex, attemptIndex),
   })),
 })))
+const hasMoreRequests = computed(() => (detail.value?.requests.length ?? 0) < (detail.value?.requestTotal ?? 0))
+const failureCount = computed(() => Math.max(0, (detail.value?.summary.requestCount ?? 0) - (detail.value?.summary.successCount ?? 0) - (detail.value?.summary.canceledCount ?? 0)))
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'Asia/Shanghai' }).format(new Date(value))
@@ -227,10 +238,11 @@ function currentChannelState(): { label: string; type: 'success' | 'warning' | '
   return { label: '可用', type: 'success' }
 }
 
-async function showParameters(requestItem: RelayRequestLog) {
-  payloadLoadingId.value = requestItem.id
+async function showParameters(requestId: string) {
+  if (payloadLoadingId.value) return
+  payloadLoadingId.value = requestId
   try {
-    selectedRequest.value = await request<RelayRequestLog>(`/admin/gateway/logs/${encodeURIComponent(requestItem.id)}`)
+    selectedRequest.value = await request<RelayRequestLog>(`/admin/gateway/logs/${encodeURIComponent(requestId)}`)
     payloadDialogOpen.value = true
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '调用详情加载失败')
@@ -239,45 +251,122 @@ async function showParameters(requestItem: RelayRequestLog) {
   }
 }
 
-async function loadDetail() {
-  if (!summary) return
-  loading.value = true
-  errorMessage.value = ''
+async function refreshDetail() {
+  if (loading.value || timelineLoading.value || loadingMore.value) return
+  pagination.value.page = 1
+  await loadDetail()
+}
+
+function handleDrawerClosed() {
+  emit('closed')
+}
+
+async function requestDetailPage(page: number): Promise<CodexSessionDetail> {
+  const currentSummary = summary
+  if (!currentSummary) throw new Error('会话信息不存在')
   const query = new URLSearchParams({
-    page: String(pagination.value.page),
+    page: String(page),
     pageSize: String(pagination.value.pageSize),
   })
-  if (summary.identified) {
-    query.set('sessionId', summary.sessionId)
-    query.set('tokenId', String(summary.tokenId))
+  if (currentSummary.identified) {
+    query.set('sessionId', currentSummary.sessionId)
+    query.set('tokenId', String(currentSummary.tokenId))
   } else {
-    query.set('requestId', summary.fallbackRequestId)
+    query.set('requestId', currentSummary.fallbackRequestId)
   }
   if (detailStatus.value !== 'all') query.set('status', detailStatus.value)
+  return request<CodexSessionDetail>(`/admin/gateway/sessions/detail?${query}`)
+}
+
+async function loadDetail(append = false) {
+  if (!summary) return
+  if (append) loadingMore.value = true
+  else loading.value = true
+  errorMessage.value = ''
+  const requestedPage = append ? pagination.value.page + 1 : pagination.value.page
   try {
-    detail.value = await request<CodexSessionDetail>(`/admin/gateway/sessions/detail?${query}`)
+    const result = await requestDetailPage(requestedPage)
+    if (append && detail.value) {
+      const existingIds = new Set(detail.value.requests.map((item) => item.id))
+      detail.value.requests.push(...result.requests.filter((item) => !existingIds.has(item.id)))
+      detail.value.requestTotal = result.requestTotal
+      detail.value.summary = result.summary
+      pagination.value.page = requestedPage
+    } else {
+      detail.value = result
+    }
   } catch (error) {
     errorMessage.value = error instanceof Error ? error.message : '会话详情加载失败'
   } finally {
-    loading.value = false
+    if (append) loadingMore.value = false
+    else loading.value = false
   }
 }
 
-function filterDetailByStatus() {
+async function filterDetailByStatus() {
+  if (!summary || loading.value || timelineLoading.value || loadingMore.value) return
   pagination.value.page = 1
-  void loadDetail()
+  expandedRequestIds.value = new Set()
+  timelineLoading.value = true
+  timelineErrorMessage.value = ''
+  try {
+    const result = await requestDetailPage(1)
+    if (detail.value) {
+      detail.value.requests = result.requests
+      detail.value.requestTotal = result.requestTotal
+    } else {
+      detail.value = result
+    }
+    await nextTick()
+    timelineScroller.value?.scrollTo({ top: 0 })
+  } catch (error) {
+    timelineErrorMessage.value = error instanceof Error ? error.message : '调用时间线加载失败'
+  } finally {
+    timelineLoading.value = false
+  }
+}
+
+function toggleRequest(requestId: string) {
+  const next = new Set(expandedRequestIds.value)
+  if (next.has(requestId)) next.delete(requestId)
+  else next.add(requestId)
+  expandedRequestIds.value = next
+}
+
+function isRequestExpanded(requestId: string): boolean {
+  return expandedRequestIds.value.has(requestId)
+}
+
+function selectDetailStatus(status: SessionDetailStatus) {
+  if (detailStatus.value === status || loading.value || timelineLoading.value || loadingMore.value) return
+  detailStatus.value = status
+  void filterDetailByStatus()
+}
+
+function handleTimelineScroll(event: Event) {
+  const target = event.currentTarget as HTMLElement
+  if (!hasMoreRequests.value || loading.value || timelineLoading.value || loadingMore.value) return
+  if (target.scrollTop + target.clientHeight >= target.scrollHeight - 180) void loadDetail(true)
+}
+
+async function scrollTimeline(edge: 'top' | 'bottom') {
+  if (timelineLoading.value) return
+  if (edge === 'bottom' && hasMoreRequests.value && !loadingMore.value) await loadDetail(true)
+  await nextTick()
+  timelineScroller.value?.scrollTo({ top: edge === 'top' ? 0 : timelineScroller.value.scrollHeight, behavior: 'smooth' })
 }
 
 watch(
   () => [open.value, summary?.sessionId, summary?.fallbackRequestId, summary?.tokenId],
   ([isOpen], previous) => {
     if (!isOpen) return
-    const identityChanged = !previous || previous[1] !== summary?.sessionId || previous[2] !== summary?.fallbackRequestId || previous[3] !== summary?.tokenId
+    const identityChanged = !previous || previous[0] !== true || previous[1] !== summary?.sessionId || previous[2] !== summary?.fallbackRequestId || previous[3] !== summary?.tokenId
     if (identityChanged) {
       pagination.value.page = 1
       detailStatus.value = 'all'
       detail.value = null
       selectedRequest.value = null
+      expandedRequestIds.value = new Set()
     }
     void loadDetail()
   },
@@ -285,9 +374,12 @@ watch(
 </script>
 
 <template>
-  <el-drawer v-model="open" size="min(1180px, 100vw)" destroy-on-close>
+  <el-drawer v-model="open" class="session-detail-drawer" size="min(1180px, 100vw)" destroy-on-close @closed="handleDrawerClosed">
     <template #header>
-      <div class="drawer-title"><strong>{{ drawerTitle }}</strong><el-tooltip content="修改会话名称" placement="bottom"><el-button text :icon="EditPen" aria-label="修改会话名称" @click="renameCurrentSession" /></el-tooltip></div>
+      <div class="drawer-title">
+        <div class="drawer-title-main"><strong>{{ drawerTitle }}</strong><el-tooltip content="修改会话名称" placement="bottom"><el-button text :icon="EditPen" aria-label="修改会话名称" @click="renameCurrentSession" /></el-tooltip></div>
+        <el-tooltip content="刷新会话数据" placement="bottom"><el-button class="drawer-refresh-button" text :icon="Refresh" :loading="loading || timelineLoading || loadingMore" aria-label="刷新会话数据" @click="refreshDetail" /></el-tooltip>
+      </div>
     </template>
     <el-skeleton v-if="loading && !detail" :rows="8" animated />
     <div v-else-if="errorMessage" class="state-panel state-error" role="alert">
@@ -324,9 +416,12 @@ watch(
           <div class="migration-heading"><strong>渠道迁移历史</strong><span>迁移后由接班渠道继续处理，直到接班渠道不可用</span></div>
           <ol>
             <li v-for="migration in detail.summary.currentChannel.migrationHistory" :key="`${migration.requestId}-${migration.occurredAt}-${migration.toChannelId}`">
-              <time :datetime="migration.occurredAt">{{ formatDate(migration.occurredAt) }}</time>
-              <div class="migration-route"><strong>{{ migration.fromChannelName || `渠道 #${migration.fromChannelId}` }}</strong><el-icon><Right /></el-icon><strong>{{ migration.toChannelName || `渠道 #${migration.toChannelId}` }}</strong></div>
-              <div class="migration-reason"><span>{{ migrationReasonLabel(migration.reason) }}</span><small v-if="migration.detail">{{ migration.detail }}</small></div>
+              <button type="button" class="migration-record" :aria-label="`查看 ${formatDate(migration.occurredAt)} 的调用详情`" @click="showParameters(migration.requestId)">
+                <time :datetime="migration.occurredAt">{{ formatDate(migration.occurredAt) }}</time>
+                <div class="migration-route"><strong>{{ migration.fromChannelName || `渠道 #${migration.fromChannelId}` }}</strong><el-icon><Right /></el-icon><strong>{{ migration.toChannelName || `渠道 #${migration.toChannelId}` }}</strong></div>
+                <div class="migration-reason"><span>{{ migrationReasonLabel(migration.reason) }}</span><small v-if="migration.detail">{{ migration.detail }}</small></div>
+                <el-icon class="migration-view-icon" :class="{ 'is-loading': payloadLoadingId === migration.requestId }"><Refresh v-if="payloadLoadingId === migration.requestId" /><View v-else /></el-icon>
+              </button>
             </li>
           </ol>
         </div>
@@ -336,17 +431,40 @@ watch(
         <header class="timeline-heading">
           <div><h3>调用时间线</h3><p>按调用发生时间从新到旧排列</p></div>
           <div class="timeline-heading-actions">
-            <el-segmented v-model="detailStatus" :options="detailStatusOptions" size="small" aria-label="筛选调用状态" @change="filterDetailByStatus" />
+            <div class="timeline-status-tabs" role="tablist" aria-label="筛选调用状态">
+              <button
+                v-for="option in detailStatusOptions"
+                :key="option.value"
+                type="button"
+                role="tab"
+                :aria-selected="detailStatus === option.value"
+                :class="{ 'is-active': detailStatus === option.value }"
+                :disabled="loading || timelineLoading || loadingMore"
+                @click="selectDetailStatus(option.value)"
+              >
+                <span>{{ option.label }}</span>
+                <i v-if="option.value === 'canceled'">{{ formatCompactNumber(detail.summary.canceledCount) }}</i>
+                <i v-else-if="option.value === 'failure'">{{ formatCompactNumber(failureCount) }}</i>
+              </button>
+            </div>
             <span>{{ formatCompactNumber(detail.requestTotal) }} 个匹配请求 · 会话共 {{ formatCompactNumber(detail.summary.attemptCount) }} 次上游尝试</span>
           </div>
         </header>
-        <div v-if="timelineRequests.length === 0" class="timeline-empty">当前页没有调用记录</div>
-        <ol v-else class="request-timeline">
+        <div v-loading="timelineLoading" class="timeline-list-shell">
+          <div v-if="!timelineErrorMessage" class="timeline-scroll-tools" aria-label="时间线快捷滚动">
+            <el-tooltip content="回到顶部" placement="left"><el-button :icon="ArrowUp" circle aria-label="回到时间线顶部" @click="scrollTimeline('top')" /></el-tooltip>
+            <el-tooltip content="前往底部" placement="left"><el-button :icon="ArrowDown" circle :loading="loadingMore" aria-label="前往时间线底部" @click="scrollTimeline('bottom')" /></el-tooltip>
+          </div>
+          <div v-if="timelineErrorMessage" class="timeline-filter-error" role="alert"><span>{{ timelineErrorMessage }}</span><el-button :loading="timelineLoading" @click="filterDetailByStatus">重试</el-button></div>
+          <div v-else ref="timelineScroller" class="timeline-scroller" @scroll="handleTimelineScroll">
+          <div v-if="timelineRequests.length === 0" class="timeline-empty">当前筛选条件下没有调用记录</div>
+          <ol v-else class="request-timeline">
           <li v-for="(entry, requestIndex) in timelineRequests" :key="entry.request.id" class="request-event">
-            <div class="request-marker" aria-hidden="true">{{ (pagination.page - 1) * pagination.pageSize + requestIndex + 1 }}</div>
-            <article class="request-content">
-              <header class="request-header">
+            <div class="request-marker" aria-hidden="true">{{ requestIndex + 1 }}</div>
+            <article class="request-content" :class="{ 'is-expanded': isRequestExpanded(entry.request.id) }">
+              <header class="request-header" role="button" tabindex="0" :aria-expanded="isRequestExpanded(entry.request.id)" @click="toggleRequest(entry.request.id)" @keydown.enter.prevent="toggleRequest(entry.request.id)" @keydown.space.prevent="toggleRequest(entry.request.id)">
                 <div class="request-title">
+                  <el-icon class="request-expand-icon"><Right /></el-icon>
                   <time :datetime="entry.request.createdAt">{{ formatDate(entry.request.createdAt) }}</time>
                   <span>{{ entry.request.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</span>
                   <code>{{ entry.request.apiPath }}</code>
@@ -357,10 +475,11 @@ watch(
                   <el-tag :type="statusType(entry.request)" effect="plain">{{ statusLabel(entry.request) }}</el-tag>
                   <span>{{ entry.request.attemptCount }} 次尝试</span>
                   <el-tooltip content="查看完整请求与响应" placement="top">
-                    <el-button class="icon-action" text :icon="View" :loading="payloadLoadingId === entry.request.id" aria-label="查看完整请求与响应" @click="showParameters(entry.request)" />
+                    <el-button class="icon-action" text :icon="View" :loading="payloadLoadingId === entry.request.id" aria-label="查看完整请求与响应" @click.stop="showParameters(entry.request.id)" />
                   </el-tooltip>
                 </div>
               </header>
+              <div v-if="isRequestExpanded(entry.request.id)" class="request-expanded">
               <div class="request-id"><code>{{ entry.request.id }}</code></div>
               <dl class="request-timings">
                 <div><dt>首 Token</dt><dd>{{ formatTiming(entry.request.firstTokenMs) }}</dd></div>
@@ -394,12 +513,15 @@ watch(
                   :reasoning-effort="entry.request.reasoningEffort"
                 />
               </div>
+              </div>
             </article>
           </li>
-        </ol>
+          </ol>
+          <div v-if="loadingMore" class="timeline-loading"><el-icon class="is-loading"><Refresh /></el-icon><span>正在加载更多调用</span></div>
+          <div v-else-if="timelineRequests.length && !hasMoreRequests" class="timeline-end">已加载全部 {{ formatCompactNumber(detail.requestTotal) }} 条调用</div>
+          </div>
+        </div>
       </section>
-
-      <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="detail.requestTotal" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadDetail" /></footer>
     </div>
   </el-drawer>
 
@@ -407,9 +529,13 @@ watch(
 </template>
 
 <style scoped>
-.session-detail { display: grid; gap: 22px; }
-.drawer-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+:global(.session-detail-drawer > .el-drawer__body) { min-height: 0; overflow: hidden; }
+.session-detail { display: grid; height: 100%; min-height: 0; grid-template-rows: auto auto minmax(220px, 1fr); gap: 18px; overflow: hidden; }
+.drawer-title, .drawer-title-main { display: flex; align-items: center; min-width: 0; }
+.drawer-title { flex: 1; justify-content: space-between; gap: 16px; }
+.drawer-title-main { gap: 8px; }
 .drawer-title strong { overflow: hidden; color: var(--rose-text); text-overflow: ellipsis; white-space: nowrap; }
+.drawer-refresh-button { flex: 0 0 auto; width: 34px; height: 34px; padding: 0; }
 .session-summary-strip { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); border-block: 1px solid var(--rose-border); }
 .session-summary-strip > div { display: grid; gap: 5px; padding: 13px 14px; border-right: 1px solid var(--rose-border); }
 .session-summary-strip > div:last-child { border-right: 0; }
@@ -429,17 +555,35 @@ watch(
 .migration-heading strong { color: var(--rose-text); font-size: 12px; }
 .migration-heading span { color: var(--rose-text-muted); font-size: 10px; }
 .channel-migration-history ol { display: grid; gap: 8px; margin: 0; padding: 0; list-style: none; }
-.channel-migration-history li { display: grid; grid-template-columns: 125px minmax(220px, auto) minmax(0, 1fr); align-items: center; gap: 12px; padding: 8px 10px; border-left: 3px solid var(--rose-warning); background: var(--rose-warning-soft); }
+.channel-migration-history li { min-width: 0; }
+.migration-record { display: grid; width: 100%; grid-template-columns: 125px minmax(220px, auto) minmax(0, 1fr) 24px; align-items: center; gap: 12px; padding: 8px 10px; border: 0; border-left: 3px solid var(--rose-warning); color: inherit; background: var(--rose-warning-soft); text-align: left; cursor: pointer; }
+.migration-record:hover, .migration-record:focus-visible { background: color-mix(in srgb, var(--rose-warning-soft) 82%, var(--rose-warning)); outline: none; }
+.migration-record:focus-visible { box-shadow: inset 0 0 0 2px var(--rose-warning); }
 .channel-migration-history time { color: var(--rose-text-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
 .migration-route, .migration-reason { display: flex; align-items: center; gap: 7px; min-width: 0; }
 .migration-route strong { overflow: hidden; color: var(--rose-text); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .migration-route .el-icon { flex: 0 0 auto; color: var(--rose-warning); }
 .migration-reason { flex-wrap: wrap; color: var(--rose-warning); font-size: 11px; }
 .migration-reason small { color: var(--rose-text-muted); }
-.timeline-section { min-width: 0; }
+.migration-view-icon { justify-self: end; color: var(--rose-text-muted); }
+.timeline-section { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
 .timeline-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
 .timeline-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .timeline-heading-actions > span { color: var(--rose-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.timeline-status-tabs { display: flex; align-items: stretch; border: 1px solid var(--rose-border); border-radius: 4px; overflow: hidden; }
+.timeline-status-tabs button { display: inline-flex; min-height: 30px; align-items: center; gap: 6px; padding: 0 10px; border: 0; border-right: 1px solid var(--rose-border); color: var(--rose-text-muted); background: var(--rose-surface); cursor: pointer; }
+.timeline-status-tabs button:last-child { border-right: 0; }
+.timeline-status-tabs button:hover { color: var(--rose-primary); background: var(--rose-primary-soft); }
+.timeline-status-tabs button.is-active { color: var(--rose-surface); background: var(--rose-primary); }
+.timeline-status-tabs button:disabled { cursor: wait; opacity: .65; }
+.timeline-status-tabs i { display: inline-grid; min-width: 18px; height: 18px; padding: 0 5px; place-items: center; border-radius: 9px; color: var(--rose-danger); background: var(--rose-danger-soft); font: normal 600 10px/1 var(--rose-font-mono); }
+.timeline-status-tabs button.is-active i { color: var(--rose-primary-hover); background: var(--rose-surface); }
+.timeline-list-shell { position: relative; display: grid; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr) 44px; }
+.timeline-scroller { grid-column: 1; grid-row: 1; height: 100%; min-height: 0; overflow-y: auto; padding-right: 12px; scrollbar-gutter: stable; }
+.timeline-scroll-tools { z-index: 3; display: flex; grid-column: 2; grid-row: 1; align-self: stretch; align-items: center; justify-content: center; flex-direction: column; gap: 8px; border-left: 1px solid var(--rose-border); background: var(--rose-surface); }
+.timeline-scroll-tools .el-button { width: 34px; height: 34px; }
+.timeline-scroll-tools .el-button + .el-button { margin-left: 0; }
+.timeline-filter-error { display: flex; grid-column: 1; grid-row: 1; min-height: 160px; align-items: center; justify-content: center; gap: 12px; color: var(--rose-danger); }
 .timeline-empty { padding: 32px 16px; color: var(--rose-text-muted); text-align: center; }
 .request-timeline { display: grid; margin: 0; padding: 0; list-style: none; }
 .request-timings { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
@@ -449,9 +593,14 @@ watch(
 .request-event { position: relative; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 18px 0; }
 .request-event:not(:last-child)::before { position: absolute; top: 46px; bottom: -12px; left: 16px; width: 1px; background: var(--rose-border-strong); content: ''; }
 .request-marker { z-index: 1; display: grid; width: 33px; height: 33px; place-items: center; border: 1px solid var(--rose-primary); border-radius: 50%; color: var(--rose-primary-hover); background: var(--rose-surface); font: 600 11px/1 var(--rose-font-mono); }
-.request-content { min-width: 0; padding-bottom: 18px; border-bottom: 1px solid var(--rose-border); }
+.request-content { min-width: 0; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
 .request-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 34px; }
+.request-header { padding: 5px 6px; border-radius: 3px; cursor: pointer; }
+.request-header:hover, .request-header:focus-visible { background: var(--rose-surface-muted); outline: none; }
 .request-title, .request-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 7px 12px; min-width: 0; }
+.request-expand-icon { flex: 0 0 auto; color: var(--rose-text-subtle); transition: transform 150ms ease; }
+.request-content.is-expanded .request-expand-icon { transform: rotate(90deg); }
+.request-expanded { padding: 0 6px 6px; }
 .request-title time { color: var(--rose-text); font-weight: 650; }
 .request-title span, .request-actions > span, .request-id { color: var(--rose-text-muted); font-size: 11px; }
 .request-id { margin-top: 2px; }
@@ -466,6 +615,8 @@ watch(
 .switch-route .el-icon { flex: 0 0 auto; color: var(--rose-warning); }
 .switch-reason { flex-wrap: wrap; color: var(--rose-warning); font-size: 12px; }
 .switch-reason small { color: var(--rose-text-muted); }
-@media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
+.timeline-loading, .timeline-end { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 16px; color: var(--rose-text-muted); font-size: 11px; }
+@media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .migration-record { grid-template-columns: 116px minmax(0, 1fr) 24px; } .migration-reason { grid-column: 1 / -2; } .migration-view-icon { grid-column: -2 / -1; grid-row: 1; } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
+@media (max-width: 860px) { :global(.session-detail-drawer > .el-drawer__body) { overflow-y: auto; } .session-detail { height: auto; grid-template-rows: auto; overflow: visible; } .timeline-list-shell { height: min(62dvh, 640px); min-height: 320px; } }
 @media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
 </style>

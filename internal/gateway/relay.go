@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -24,8 +25,10 @@ import (
 const (
 	statusClientClosedRequest      = 499
 	maxDetailedPayloadBytes        = 4 << 20
-	maxPreTokenStreamBufferBytes   = 256 << 10
 	upstreamApplicationErrorStatus = http.StatusBadGateway
+	circuitFailureThreshold        = 3
+	temporaryCircuitDuration       = time.Minute
+	extendedCircuitDuration        = 5 * time.Minute
 )
 
 type PublicError struct {
@@ -45,6 +48,7 @@ type RelayService struct {
 	estimator     *TokenEstimator
 	configManager *config.ApplicationConfigManager
 	client        *http.Client
+	circuitLocks  sync.Map
 }
 
 type relayExecution struct {
@@ -71,6 +75,7 @@ type relayExecution struct {
 	responseBody             []byte
 	responseBodyTruncated    bool
 	payloadLogDetail         string
+	attemptLogs              []RelayAttemptLog
 }
 
 type attemptResult struct {
@@ -117,14 +122,19 @@ func NewRelayService(store *Store, router *Router, estimator *TokenEstimator, co
 }
 
 func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, headers http.Header, rawQuery string, endpoint string, token *ClientToken, payload *RelayPayload, rawBody []byte) *PublicError {
+	startedAt := time.Now()
+	inputTokens := s.estimator.EstimateValue(payload.values)
+	if inputTokens == 0 {
+		inputTokens = s.estimator.EstimateJSON(rawBody)
+	}
 	execution := &relayExecution{
 		requestID:        uuid.NewString(),
 		token:            token,
 		endpoint:         endpoint,
 		payload:          payload,
 		rawBody:          rawBody,
-		inputTokens:      s.estimator.EstimateJSON(rawBody),
-		startedAt:        time.Now(),
+		inputTokens:      inputTokens,
+		startedAt:        startedAt,
 		usageSources:     make(map[string]struct{}),
 		costSources:      make(map[string]struct{}),
 		payloadLogDetail: s.currentPayloadLogDetail(),
@@ -238,7 +248,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Gateway-Request-Id", execution.requestID)
 
-	sentTokens := s.estimator.EstimateJSON(body)
+	sentTokens := execution.inputTokens
 	execution.sentTokens += sentTokens
 	started := time.Now()
 	response, requestErr := s.client.Do(request)
@@ -384,20 +394,18 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	terminalSuccess := false
 	result := attemptResult{response: response, requestBody: requestBody, sentTokens: sentTokens, latencyMS: latency}
 	capture := payloadCapture{}
-	pending := bytes.Buffer{}
 	committed := false
-	commit := func() error {
+	commit := func(event []byte) error {
 		if committed {
 			return nil
 		}
 		copyUpstreamResponseHeaders(writer.Header(), response.Header, true)
 		writer.WriteHeader(response.StatusCode)
 		committed = true
-		if pending.Len() > 0 {
-			if _, err := writer.Write(pending.Bytes()); err != nil {
+		if len(event) > 0 {
+			if _, err := writer.Write(event); err != nil {
 				return err
 			}
-			pending.Reset()
 		}
 		if flusher != nil {
 			flusher.Flush()
@@ -421,7 +429,6 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			}
 
 			if !committed {
-				_, _ = pending.Write(event)
 				if hasApplicationError && !hasOutput && appErr.shouldRetry() {
 					finishedAt := time.Now()
 					_ = response.Body.Close()
@@ -437,26 +444,13 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 					s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, appErr)
 					return &result, appErr
 				}
-				if hasApplicationError && !hasOutput {
-					if writeErr := commit(); writeErr != nil {
-						streamErr = writeErr
-						downstreamError = true
-						break
-					}
-				}
 				if hasOutput {
 					recordFirstToken(event, &result, execution, started)
-					if writeErr := commit(); writeErr != nil {
-						streamErr = writeErr
-						downstreamError = true
-						break
-					}
-				} else if pending.Len() > maxPreTokenStreamBufferBytes {
-					if writeErr := commit(); writeErr != nil {
-						streamErr = writeErr
-						downstreamError = true
-						break
-					}
+				}
+				if writeErr := commit(event); writeErr != nil {
+					streamErr = writeErr
+					downstreamError = true
+					break
 				}
 				if hasApplicationError {
 					streamErr = appErr
@@ -538,7 +532,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			s.recordAttempt(logCtx, execution, candidate, selection, result, response.StatusCode, false, err)
 			return &result, err
 		}
-		if writeErr := commit(); writeErr != nil {
+		if writeErr := commit(nil); writeErr != nil {
 			streamErr = writeErr
 			downstreamError = true
 		}
@@ -618,6 +612,17 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 func elapsedMilliseconds(started time.Time, finished time.Time) int64 {
 	elapsed := finished.Sub(started).Milliseconds()
 	return max(elapsed, int64(1))
+}
+
+func durationAfterLatency(totalMS int64, latencyMS int64) int64 {
+	return max(totalMS-latencyMS, int64(0))
+}
+
+func firstTokenAfterLatency(firstTokenMS int64, latencyMS int64) int64 {
+	if firstTokenMS <= 0 {
+		return 0
+	}
+	return max(firstTokenMS-latencyMS, int64(1))
 }
 
 func recordFirstToken(event []byte, result *attemptResult, execution *relayExecution, attemptStarted time.Time) {
@@ -1291,7 +1296,7 @@ func (s *RelayService) addUsage(execution *relayExecution, usage Usage, estimate
 	}
 }
 
-func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecution, candidate RouteCandidate, selection RouteSelection, result attemptResult, status int, success bool, attemptErr error) {
+func (s *RelayService) recordAttempt(_ context.Context, execution *relayExecution, candidate RouteCandidate, selection RouteSelection, result attemptResult, status int, success bool, attemptErr error) {
 	message := ""
 	if attemptErr != nil {
 		message = truncateRunes(attemptErr.Error(), 2000)
@@ -1347,13 +1352,14 @@ func (s *RelayService) recordAttempt(ctx context.Context, execution *relayExecut
 		UpstreamCost:          result.upstreamCost,
 		CostSource:            result.costSource,
 		UsageSource:           result.usage.Source,
-		FirstTokenMS:          result.firstTokenMS,
+		FirstTokenMS:          firstTokenAfterLatency(result.firstTokenMS, result.latencyMS),
 		LatencyMS:             result.latencyMS,
-		DurationMS:            result.durationMS,
+		DurationMS:            durationAfterLatency(result.durationMS, result.latencyMS),
 		Success:               success,
 		ErrorMessage:          message,
+		CreatedAt:             time.Now().UTC(),
 	}
-	_ = s.store.db.WithContext(ctx).Create(&log).Error
+	execution.attemptLogs = append(execution.attemptLogs, log)
 }
 
 func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecution, status int, errorCode string) {
@@ -1386,6 +1392,8 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	if durationMS == 0 {
 		durationMS = elapsedMilliseconds(execution.startedAt, now)
 	}
+	firstTokenMS := firstTokenAfterLatency(execution.firstTokenMS, execution.latencyMS)
+	durationMS = durationAfterLatency(durationMS, execution.latencyMS)
 	responseBody, responseBodyTruncated := retainLoggedPayload(execution.payloadLogDetail, execution.responseBody, execution.responseBodyTruncated)
 	sessionName := requestSessionName(execution.rawBody)
 	loggedSessionID, loggedSessionSource := loggedCodexSessionIdentity(execution.payload.SessionKey, execution.payload.SessionSource)
@@ -1424,7 +1432,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		CostSource:            costSource,
 		UsageSource:           usageSource,
 		AttemptCount:          execution.attempts,
-		FirstTokenMS:          execution.firstTokenMS,
+		FirstTokenMS:          firstTokenMS,
 		LatencyMS:             execution.latencyMS,
 		DurationMS:            durationMS,
 		Stream:                execution.payload.Stream,
@@ -1475,6 +1483,9 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		responseForManifest = execution.responseBody
 	}
 	_ = s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		if err := db.Model(&ClientToken{}).Where("id = ?", execution.token.ID).Update("last_used_at", now).Error; err != nil {
+			return err
+		}
 		mergedTitle, err := s.store.mergePrecedingCodexTitleRequest(db, &log, execution.rawBody, execution.startedAt.UTC())
 		if err != nil {
 			return err
@@ -1490,6 +1501,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 			loggedSessionID,
 			execution.requestID,
 			effectiveSessionName,
+			execution.payload.ThreadSource,
 			execution.rawBody,
 			responseForManifest,
 			now,
@@ -1497,6 +1509,11 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		log.RequestBody, log.RequestBodyTruncated = retainLoggedPayload(execution.payloadLogDetail, compactedRequestBody, len(execution.rawBody) > maxDetailedPayloadBytes)
 		if err := db.Create(&log).Error; err != nil {
 			return err
+		}
+		if len(execution.attemptLogs) > 0 {
+			if err := db.CreateInBatches(execution.attemptLogs, len(execution.attemptLogs)).Error; err != nil {
+				return err
+			}
 		}
 		canonicalSessionID, title, err := s.store.mergeFollowingCodexTitleRequest(db, &log, execution.startedAt.UTC())
 		if err != nil {
@@ -1554,43 +1571,94 @@ func (s *RelayService) recordChannelUnavailable(ctx context.Context, channelID u
 func (s *RelayService) recordChannelFailureState(ctx context.Context, channelID uint64, message string, immediate bool) *time.Time {
 	message = truncateRunes(message, 2000)
 	now := time.Now()
-	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
-		"consecutive_failures": gorm.Expr("consecutive_failures + 1"),
-		"last_error":           message,
-		"last_health_at":       now,
-	}).Error
-	openUntil := now.Add(60 * time.Second)
-	query := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID)
-	if !immediate {
-		query = query.Where("consecutive_failures >= 3")
-	}
-	_ = query.Update("circuit_open_until", openUntil).Error
+	lock := s.channelCircuitLock(channelID)
+	lock.Lock()
+	defer lock.Unlock()
+
 	var channel Channel
-	if err := s.store.db.WithContext(ctx).Select("circuit_open_until").First(&channel, channelID).Error; err != nil || channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(now) {
+	if err := s.store.db.WithContext(ctx).Select("enabled", "consecutive_failures", "circuit_level", "circuit_open_until").First(&channel, channelID).Error; err != nil {
 		return nil
 	}
-	return channel.CircuitOpenUntil
+	if channel.CircuitLevel >= CircuitLevelManual {
+		_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+			"last_error":     message,
+			"last_health_at": now,
+		}).Error
+		return nil
+	}
+
+	failures := channel.ConsecutiveFailures + 1
+	level := max(channel.CircuitLevel, CircuitLevelClosed)
+	var openUntil *time.Time
+	enabled := channel.Enabled
+	if immediate || failures >= circuitFailureThreshold {
+		level++
+		failures = 0
+		switch level {
+		case CircuitLevelTemporary:
+			value := now.Add(temporaryCircuitDuration)
+			openUntil = &value
+		case CircuitLevelExtended:
+			value := now.Add(extendedCircuitDuration)
+			openUntil = &value
+		default:
+			level = CircuitLevelManual
+			enabled = false
+		}
+	} else if channel.CircuitOpenUntil != nil && channel.CircuitOpenUntil.After(now) {
+		openUntil = channel.CircuitOpenUntil
+	}
+	if err := s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+		"enabled":              enabled,
+		"consecutive_failures": failures,
+		"circuit_level":        level,
+		"circuit_open_until":   openUntil,
+		"last_error":           message,
+		"last_health_at":       now,
+	}).Error; err != nil || openUntil == nil || !openUntil.After(now) {
+		return nil
+	}
+	return openUntil
 }
 
 func (s *RelayService) recordChannelSuccess(ctx context.Context, channelID uint64, latencyMS int64) {
-	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+	s.recordChannelRecovery(ctx, channelID, map[string]any{
 		"consecutive_failures": 0,
-		"circuit_open_until":   nil,
-		"last_error":           "",
-		"last_health_at":       time.Now(),
 		"latency_ewma": gorm.Expr(
 			"CASE WHEN latency_ewma <= 0 THEN ? ELSE latency_ewma * 0.8 + ? * 0.2 END",
 			latencyMS, latencyMS,
 		),
-	}).Error
+	})
 }
 
 func (s *RelayService) recordChannelResponsive(ctx context.Context, channelID uint64) {
-	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(map[string]any{
+	s.recordChannelRecovery(ctx, channelID, map[string]any{
 		"consecutive_failures": 0,
-		"circuit_open_until":   nil,
-		"last_health_at":       time.Now(),
-	}).Error
+	})
+}
+
+func (s *RelayService) recordChannelRecovery(ctx context.Context, channelID uint64, updates map[string]any) {
+	lock := s.channelCircuitLock(channelID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	var channel Channel
+	if err := s.store.db.WithContext(ctx).Select("circuit_level").First(&channel, channelID).Error; err != nil || channel.CircuitLevel >= CircuitLevelManual {
+		return
+	}
+	level := max(channel.CircuitLevel-1, CircuitLevelClosed)
+	updates["circuit_level"] = level
+	updates["circuit_open_until"] = nil
+	updates["last_health_at"] = time.Now()
+	if level == CircuitLevelClosed {
+		updates["last_error"] = ""
+	}
+	_ = s.store.db.WithContext(ctx).Model(&Channel{}).Where("id = ?", channelID).Updates(updates).Error
+}
+
+func (s *RelayService) channelCircuitLock(channelID uint64) *sync.Mutex {
+	lock, _ := s.circuitLocks.LoadOrStore(channelID, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 func upstreamErrorCode(body []byte) string {

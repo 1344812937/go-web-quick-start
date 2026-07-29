@@ -28,6 +28,20 @@ func TestGatewayConfigDefaultsPayloadLogDetail(t *testing.T) {
 	if gatewayConfig.PayloadLogDetail != PayloadLogDetailDefault {
 		t.Fatalf("payload log detail = %q, want %q", gatewayConfig.PayloadLogDetail, PayloadLogDetailDefault)
 	}
+	if gatewayConfig.RoutingPriceWeightPercent != DefaultRoutingPriceWeightPercent || gatewayConfig.RoutingEfficiencyWeightPercent != DefaultRoutingEfficiencyWeightPercent {
+		t.Fatalf("routing weights = %d/%d", gatewayConfig.RoutingPriceWeightPercent, gatewayConfig.RoutingEfficiencyWeightPercent)
+	}
+}
+
+func TestNormalizeCommonModelNamesUsesDefaultsAndDeduplicates(t *testing.T) {
+	defaults := normalizeCommonModelNames(nil)
+	if len(defaults) != len(DefaultCommonModelNames) || defaults[0] != DefaultCommonModelNames[0] {
+		t.Fatalf("default common models = %#v", defaults)
+	}
+	normalized := normalizeCommonModelNames([]string{" gpt-5.6-sol ", "GPT-5.6-SOL", "", "gpt-5.4-mini"})
+	if len(normalized) != 2 || normalized[0] != "gpt-5.6-sol" || normalized[1] != "gpt-5.4-mini" {
+		t.Fatalf("normalized common models = %#v", normalized)
+	}
 }
 
 func TestApplicationConfigManagerSaveUpdatesPayloadLogDetailAtRuntime(t *testing.T) {
@@ -58,6 +72,35 @@ func TestApplicationConfigManagerSaveUpdatesPayloadLogDetailAtRuntime(t *testing
 	}
 	if got := EffectivePayloadLogDetail(manager.GetConfig()); got != PayloadLogDetailNone {
 		t.Fatalf("invalid save changed runtime payload log detail to %q", got)
+	}
+}
+
+func TestApplicationConfigManagerSaveUpdatesRoutingWeightsAtRuntime(t *testing.T) {
+	originalConfigPath := configPath
+	configPath = filepath.Join(t.TempDir(), "config.toml")
+	t.Cleanup(func() { configPath = originalConfigPath })
+
+	manager := &ApplicationConfigManager{}
+	cfg := &ApplicationConfig{GatewayConfig: GatewayConfig{
+		RoutingPriceWeightPercent:      60,
+		RoutingEfficiencyWeightPercent: 30,
+	}}
+	if err := manager.Save(cfg); err != nil {
+		t.Fatalf("Save(weights) error = %v", err)
+	}
+	price, efficiency, quality := EffectiveRoutingDecisionWeights(manager.GetConfig())
+	if price != 0.6 || efficiency != 0.3 || quality != 0.1 {
+		t.Fatalf("runtime routing weights = %v/%v/%v", price, efficiency, quality)
+	}
+
+	cfg.GatewayConfig.RoutingPriceWeightPercent = 80
+	cfg.GatewayConfig.RoutingEfficiencyWeightPercent = 30
+	if err := manager.Save(cfg); err == nil {
+		t.Fatal("Save(invalid weights) error = nil")
+	}
+	price, efficiency, quality = EffectiveRoutingDecisionWeights(manager.GetConfig())
+	if price != 0.6 || efficiency != 0.3 || quality != 0.1 {
+		t.Fatalf("invalid save changed runtime routing weights to %v/%v/%v", price, efficiency, quality)
 	}
 }
 

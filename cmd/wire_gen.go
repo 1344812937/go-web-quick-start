@@ -31,7 +31,7 @@ func InitializeApp() *app.ApplicationHolder {
 	gatewayManagementApi := api.NewGatewayManagementApi(managementService, adminSecurity)
 	v := providers2.ProvideApis(siteApi, settingsApi, adminApi, gatewayManagementApi)
 	clientAccessService := gateway.NewClientAccessService(store)
-	router := gateway.NewRouter(store, clientAccessService)
+	router := gateway.NewRouter(store, clientAccessService, applicationConfigManager)
 	tokenEstimator := gateway.NewTokenEstimator()
 	relayService := gateway.NewRelayService(store, router, tokenEstimator, applicationConfigManager)
 	openAIRelayApi := api.NewOpenAIRelayApi(clientAccessService, relayService, applicationConfigManager)

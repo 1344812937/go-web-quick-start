@@ -22,12 +22,24 @@ var log = until.Log
 var configPath = filepath.Join("./", "config", "config.toml")
 
 const (
-	DefaultWebHost          = "0.0.0.0"
-	DefaultWebPort          = "8888"
-	PayloadLogDetailDefault = "default"
-	PayloadLogDetailSummary = "summary"
-	PayloadLogDetailNone    = "none"
+	DefaultWebHost                        = "0.0.0.0"
+	DefaultWebPort                        = "8888"
+	DefaultRoutingPriceWeightPercent      = 45
+	DefaultRoutingEfficiencyWeightPercent = 45
+	PayloadLogDetailDefault               = "default"
+	PayloadLogDetailSummary               = "summary"
+	PayloadLogDetailNone                  = "none"
 )
+
+var DefaultCommonModelNames = []string{
+	"gpt-image-2",
+	"gpt-5.6-terra",
+	"gpt-5.6-sol",
+	"gpt-5.6-luna",
+	"gpt-5.5",
+	"gpt-5.4-mini",
+	"codex-auto-review",
+}
 
 type ApplicationConfigManager struct {
 	mu     sync.RWMutex
@@ -41,6 +53,7 @@ func (acm *ApplicationConfigManager) GetConfig() *ApplicationConfig {
 		return nil
 	}
 	configCopy := *acm.config
+	configCopy.GatewayConfig.CommonModelNames = append([]string(nil), acm.config.GatewayConfig.CommonModelNames...)
 	return &configCopy
 }
 
@@ -72,6 +85,10 @@ func (acm *ApplicationConfigManager) Load() {
 		panic(err)
 	}
 	cfg.GatewayConfig.PayloadLogDetail = payloadLogDetail
+	cfg.GatewayConfig.CommonModelNames = normalizeCommonModelNames(cfg.GatewayConfig.CommonModelNames)
+	if err := normalizeRoutingDecisionWeights(&cfg.GatewayConfig); err != nil {
+		panic(err)
+	}
 
 	guidePlan, err := buildStartupGuidePlan(firstRun, presence, &cfg)
 	if err != nil {
@@ -123,13 +140,16 @@ type NodeConfig struct {
 }
 
 type GatewayConfig struct {
-	MaxAttempts                  int    `toml:"max_attempts" json:"maxAttempts" default:"3"`
-	RequestBodyLimitMB           int    `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
-	ResponseHeaderTimeoutSeconds int    `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
-	StreamIdleTimeoutSeconds     int    `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
-	SessionTTLHours              int    `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
-	SecureCookie                 bool   `toml:"secure_cookie" json:"secureCookie" default:"false"`
-	PayloadLogDetail             string `toml:"payload_log_detail" json:"payloadLogDetail" default:"default"`
+	MaxAttempts                    int      `toml:"max_attempts" json:"maxAttempts" default:"3"`
+	RequestBodyLimitMB             int      `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
+	ResponseHeaderTimeoutSeconds   int      `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
+	StreamIdleTimeoutSeconds       int      `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
+	RoutingPriceWeightPercent      int      `toml:"routing_price_weight_percent" json:"routingPriceWeightPercent" default:"45"`
+	RoutingEfficiencyWeightPercent int      `toml:"routing_efficiency_weight_percent" json:"routingEfficiencyWeightPercent" default:"45"`
+	SessionTTLHours                int      `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
+	SecureCookie                   bool     `toml:"secure_cookie" json:"secureCookie" default:"false"`
+	PayloadLogDetail               string   `toml:"payload_log_detail" json:"payloadLogDetail" default:"default"`
+	CommonModelNames               []string `toml:"common_model_names" json:"commonModelNames"`
 }
 
 func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
@@ -142,6 +162,10 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 		return err
 	}
 	configCopy.GatewayConfig.PayloadLogDetail = payloadLogDetail
+	configCopy.GatewayConfig.CommonModelNames = normalizeCommonModelNames(configCopy.GatewayConfig.CommonModelNames)
+	if err := normalizeRoutingDecisionWeights(&configCopy.GatewayConfig); err != nil {
+		return err
+	}
 	if err := writeConfigFile(configPath, &configCopy); err != nil {
 		return err
 	}
@@ -149,6 +173,53 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 	acm.config = &configCopy
 	acm.mu.Unlock()
 	return nil
+}
+
+func normalizeRoutingDecisionWeights(gatewayConfig *GatewayConfig) error {
+	if gatewayConfig.RoutingPriceWeightPercent == 0 && gatewayConfig.RoutingEfficiencyWeightPercent == 0 {
+		gatewayConfig.RoutingPriceWeightPercent = DefaultRoutingPriceWeightPercent
+		gatewayConfig.RoutingEfficiencyWeightPercent = DefaultRoutingEfficiencyWeightPercent
+	}
+	price := gatewayConfig.RoutingPriceWeightPercent
+	efficiency := gatewayConfig.RoutingEfficiencyWeightPercent
+	if price < 0 || price > 100 || efficiency < 0 || efficiency > 100 || price+efficiency > 100 {
+		return fmt.Errorf("路由价格与效率占比必须在 0%% 到 100%% 之间，且合计不能超过 100%%")
+	}
+	return nil
+}
+
+func normalizeCommonModelNames(values []string) []string {
+	seen := make(map[string]struct{}, len(values))
+	normalized := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || len(value) > 200 {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		normalized = append(normalized, value)
+	}
+	if len(normalized) == 0 {
+		return append([]string(nil), DefaultCommonModelNames...)
+	}
+	return normalized
+}
+
+func EffectiveRoutingDecisionWeights(cfg *ApplicationConfig) (price float64, efficiency float64, quality float64) {
+	pricePercent := DefaultRoutingPriceWeightPercent
+	efficiencyPercent := DefaultRoutingEfficiencyWeightPercent
+	if cfg != nil {
+		candidate := cfg.GatewayConfig
+		if normalizeRoutingDecisionWeights(&candidate) == nil {
+			pricePercent = candidate.RoutingPriceWeightPercent
+			efficiencyPercent = candidate.RoutingEfficiencyWeightPercent
+		}
+	}
+	return float64(pricePercent) / 100, float64(efficiencyPercent) / 100, float64(100-pricePercent-efficiencyPercent) / 100
 }
 
 func normalizePayloadLogDetail(value string) (string, error) {

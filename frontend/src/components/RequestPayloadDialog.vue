@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import ChatTranscript from '@/components/ChatTranscript.vue'
+import JsonCodeViewer from '@/components/JsonCodeViewer.vue'
 import type { PayloadLogDetail, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { conversation, deltaDescription, requestConversation } from '@/utils/conversation'
 
@@ -56,16 +57,6 @@ function emptyPayloadText(value: PayloadLogDetail | undefined, fallback: string)
   return value === 'none' ? '本次调用未保存请求参数和响应正文' : fallback
 }
 
-function formattedPayload(value: string): string {
-  const trimmed = value.trim()
-  if (!trimmed) return ''
-  try {
-    return JSON.stringify(JSON.parse(trimmed), null, 2)
-  } catch {
-    return value
-  }
-}
-
 watch(
   () => [open.value, request?.id],
   ([isOpen]) => {
@@ -106,7 +97,7 @@ watch(
           <el-alert v-if="requestPayloadLogDetail === 'default' && request.requestBodyTruncated" title="原始正文超过 4 MiB，留存内容已截断" type="warning" :closable="false" show-icon />
           <el-alert v-if="deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />
           <ChatTranscript v-if="detailMode === 'chat'" :messages="originalMessages" />
-          <pre v-else-if="request.requestBody" class="payload-code">{{ formattedPayload(request.requestBody) }}</pre>
+          <JsonCodeViewer v-else-if="request.requestBody" :value="request.requestBody" />
           <div v-else class="payload-empty">{{ emptyPayloadText(request.payloadLogDetail, '没有留存原始请求正文') }}</div>
         </el-tab-pane>
 
@@ -128,13 +119,13 @@ watch(
               <h3>发送到上游的请求</h3>
               <el-alert v-if="attempt.payloadLogDetail !== 'summary' && attempt.requestBodyTruncated" title="原始正文超过 4 MiB，留存内容已截断" type="warning" :closable="false" show-icon />
               <el-alert v-if="deltaDescription(attempt.requestBody)" :title="deltaDescription(attempt.requestBody)" type="info" :closable="false" show-icon />
-              <pre v-if="attempt.requestBody" class="payload-code">{{ formattedPayload(attempt.requestBody) }}</pre>
+              <JsonCodeViewer v-if="attempt.requestBody" :value="attempt.requestBody" />
               <div v-else class="payload-empty">{{ emptyPayloadText(attempt.payloadLogDetail, '本次尝试没有可展示的请求正文') }}</div>
             </section>
             <section class="payload-section">
               <h3>上游返回</h3>
               <el-alert v-if="attempt.payloadLogDetail !== 'summary' && attempt.responseBodyTruncated" title="正文超过 4 MiB，当前内容已截断" type="warning" :closable="false" show-icon />
-              <pre v-if="attempt.responseBody" class="payload-code">{{ formattedPayload(attempt.responseBody) }}</pre>
+              <JsonCodeViewer v-if="attempt.responseBody" :value="attempt.responseBody" />
               <div v-else class="payload-empty">{{ emptyPayloadText(attempt.payloadLogDetail, '本次尝试没有收到响应正文') }}</div>
             </section>
           </template>
@@ -144,7 +135,7 @@ watch(
           <el-alert v-if="requestPayloadLogDetail === 'default' && request.responseBodyTruncated" title="正文超过 4 MiB，当前内容已截断" type="warning" :closable="false" show-icon />
           <el-alert v-if="detailMode === 'chat' && deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />
           <ChatTranscript v-if="detailMode === 'chat'" :messages="finalMessages" />
-          <pre v-else-if="request.responseBody" class="payload-code">{{ formattedPayload(request.responseBody) }}</pre>
+          <JsonCodeViewer v-else-if="request.responseBody" :value="request.responseBody" />
           <div v-else class="payload-empty">{{ emptyPayloadText(request.payloadLogDetail, '没有留存最终响应正文') }}</div>
         </el-tab-pane>
       </el-tabs>
@@ -170,7 +161,6 @@ watch(
 .payload-dialog > .el-alert { margin-bottom: 12px; }
 .payload-section + .payload-section { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--rose-border); }
 .payload-section h3 { margin: 0 0 10px; color: var(--rose-text); font-size: 13px; }
-.payload-code { max-height: 58vh; margin: 0; padding: 14px; overflow: auto; border: 1px solid var(--rose-border); background: var(--rose-surface-muted); color: var(--rose-text); font: 12px/1.6 var(--rose-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
 .payload-empty { padding: 40px 12px; color: var(--rose-text-muted); text-align: center; }
 @media (max-width: 640px) {
   :global(.request-payload-modal.el-dialog) { max-height: calc(100dvh - 24px); margin: 12px auto; }

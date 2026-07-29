@@ -4,7 +4,7 @@ import { Coin, Connection, DataLine, Delete, Refresh, RefreshLeft, Search, Ticke
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
-import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, LogPayloadCleanupResult, RelayRequestLog } from '@/types/gateway'
+import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, LogPayloadCleanupResult, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 import { logDateDefaultTimes, logDateRangeShortcuts, toEastEightISOString, todayLogRange } from '@/utils/logDateRanges'
@@ -46,6 +46,20 @@ function formatAverageTiming(value: number, samples: number): string {
 
 function tokenName(log: RelayRequestLog): string {
   return log.tokenName || tokens.value.find((token) => token.id === log.tokenId)?.name || `令牌 #${log.tokenId}`
+}
+
+function finalAttempt(log: RelayRequestLog): RelayAttemptLog | undefined {
+  return log.attempts[log.attempts.length - 1]
+}
+
+function finalChannelName(log: RelayRequestLog): string {
+  const attempt = finalAttempt(log)
+  if (!attempt) return ''
+  return attempt.channelName || channels.value.find((channel) => channel.id === attempt.channelId)?.name || `渠道 #${attempt.channelId}`
+}
+
+function finalChannelModel(log: RelayRequestLog): string {
+  return finalAttempt(log)?.upstreamModel || '未知上游模型'
 }
 
 function usageSource(value: string): string {
@@ -231,8 +245,8 @@ onMounted(async () => {
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>
-    <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="logs" row-key="id" max-height="var(--log-table-max-height)" empty-text="当前筛选条件下没有调用日志">
+    <section v-else class="surface-panel table-panel log-table-panel">
+      <el-table v-loading="loading" :data="logs" row-key="id" height="100%" empty-text="当前筛选条件下没有调用日志">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="attempt-list">
@@ -252,6 +266,7 @@ onMounted(async () => {
         <el-table-column label="时间 / 请求 ID" min-width="220"><template #default="scope"><div class="primary-cell"><strong>{{ formatDate(scope.row.createdAt) }}</strong><small><code>{{ scope.row.id }}</code></small></div></template></el-table-column>
         <el-table-column label="会话 / 调用令牌" min-width="210"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.sessionName || scope.row.codexSessionId || '未命名会话' }}</strong><small>{{ tokenName(scope.row) }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
         <el-table-column label="接口 / 模型" min-width="200"><template #default="scope"><div class="primary-cell"><strong><code>{{ scope.row.apiPath }}</code></strong><small>{{ scope.row.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }} · <code>{{ scope.row.requestedModel }}</code></small></div></template></el-table-column>
+        <el-table-column label="渠道" min-width="160"><template #default="scope"><div v-if="finalAttempt(scope.row)" class="primary-cell"><strong>{{ finalChannelName(scope.row) }}</strong><small><code>{{ finalChannelModel(scope.row) }}</code></small></div><span v-else class="muted-text">未进入上游渠道</span></template></el-table-column>
         <el-table-column label="状态" width="108"><template #default="scope"><el-tag :type="outcomeType(scope.row)" effect="plain">{{ outcomeLabel(scope.row) }}</el-tag></template></el-table-column>
         <el-table-column label="Token 明细" min-width="300">
           <template #default="scope">
@@ -279,7 +294,10 @@ onMounted(async () => {
 </template>
 
 <style scoped>
-.log-page { --log-table-max-height: max(240px, calc(100dvh - 520px)); }
+.log-page { padding-bottom: 16px; }
+.log-table-panel { display: flex; min-width: 0; flex-direction: column; }
+.log-table-panel :deep(.el-table__inner-wrapper::before) { display: none; }
+.log-table-panel .table-pagination { flex: none; min-height: 56px; align-items: center; background: var(--rose-surface); }
 .attempt-list { display: grid; gap: 8px; padding: 14px 24px 18px 54px; background: var(--rose-surface-muted); }
 .attempt-list > header { display: flex; justify-content: space-between; color: var(--rose-text-muted); font-size: 12px; }
 .attempt-list > header strong { color: var(--rose-text); }
@@ -293,7 +311,9 @@ onMounted(async () => {
 .cost-breakdown small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; }
 .source-breakdown { justify-items: start; }
 @media (min-width: 961px) {
-  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; }
+  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
+  .log-table-panel { min-height: 0; }
+  .log-table-panel > .el-table { min-height: 0; flex: 1 1 0; }
   .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .log-page .metric-cell { min-height: 80px; padding-block: 10px; border-right: 1px solid var(--rose-border); border-bottom: 0; }
   .log-page .metric-cell:nth-child(3) { border-right: 1px solid var(--rose-border); }
@@ -301,15 +321,10 @@ onMounted(async () => {
   .log-page .metric-cell:last-child { border-right: 0; }
   .log-page .metric-cell strong { margin-top: 5px; font-size: 17px; }
   .log-page .metric-cell small { margin-top: 3px; }
-  .table-panel { display: flex; flex-direction: column; min-height: 0; }
-  .table-panel > .el-table { flex: 1; min-height: 0; }
-  .table-pagination { flex: none; }
 }
 @media (min-width: 961px) and (max-width: 1360px) {
   .log-page .filter-bar { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .log-page .filter-bar .el-date-editor { grid-column: span 3; }
 }
 @media (max-width: 720px) { .attempt-list { padding: 10px; overflow-x: auto; } }
-@media (max-width: 1360px) { .log-page { --log-table-max-height: max(240px, calc(100dvh - 680px)); } }
-@media (max-width: 720px) { .log-page { --log-table-max-height: 420px; } }
 </style>

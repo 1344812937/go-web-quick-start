@@ -16,6 +16,9 @@ const (
 	codexTitleSessionSource    = "codex_title_generation"
 	codexGuardianSessionSource = "codex_guardian"
 	codexGuardianSessionPrefix = "guardian:"
+	codexThreadSourceUser      = "user"
+	codexThreadSourceAmbient   = "ambient_suggestions"
+	codexThreadSourceUnknown   = "unavailable"
 	codexTitlePromptMarker     = "User prompt:"
 	codexAttachedPromptMarker  = "## My request for Codex:"
 	codexTitleMatchWindow      = 5 * time.Minute
@@ -23,6 +26,53 @@ const (
 )
 
 var codexAuxiliarySessionSources = []string{codexTitleSessionSource, codexGuardianSessionSource}
+
+func codexThreadSourceFromPayload(payload map[string]any) string {
+	for _, metadataKey := range []string{"client_metadata", "metadata"} {
+		metadata, _ := payload[metadataKey].(map[string]any)
+		if metadata == nil {
+			continue
+		}
+		if source := normalizeCodexThreadSource(stringValue(metadata["thread_source"])); source != "" {
+			return source
+		}
+		turnMetadata := make(map[string]any)
+		switch value := metadata["x-codex-turn-metadata"].(type) {
+		case string:
+			_ = json.Unmarshal([]byte(value), &turnMetadata)
+		case map[string]any:
+			turnMetadata = value
+		}
+		if source := normalizeCodexThreadSource(stringValue(turnMetadata["thread_source"])); source != "" {
+			return source
+		}
+	}
+	return ""
+}
+
+func codexThreadSourceFromBody(body []byte) string {
+	payload, ok := decodeJSONObject(body)
+	if !ok {
+		return ""
+	}
+	return codexThreadSourceFromPayload(payload)
+}
+
+func normalizeCodexThreadSource(source string) string {
+	return truncateRunes(strings.ToLower(strings.TrimSpace(source)), 48)
+}
+
+func preferredCodexThreadSource(current string, candidate string) string {
+	current = normalizeCodexThreadSource(current)
+	candidate = normalizeCodexThreadSource(candidate)
+	if candidate == "" {
+		return current
+	}
+	if current == "" || candidate == codexThreadSourceUser {
+		return candidate
+	}
+	return current
+}
 
 func loggedCodexSessionIdentity(sessionID string, source string) (string, string) {
 	sessionID = strings.TrimSpace(sessionID)
@@ -198,7 +248,7 @@ func (s *Store) mergePrecedingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 		return "", nil
 	}
 	var candidates []RelayRequestLog
-	if err := db.Select("id, token_id, codex_session_id, codex_session_source, session_name, codex_prompt_hash, codex_title_request, codex_generated_title, request_body, response_body, duration_ms, created_at").
+	if err := db.Select("id, token_id, codex_session_id, codex_session_source, session_name, codex_prompt_hash, codex_title_request, codex_generated_title, request_body, response_body, latency_ms, duration_ms, created_at").
 		Where("token_id = ? AND codex_session_id <> ? AND codex_session_source = ? AND outcome = ?", log.TokenID, log.CodexSessionID, "prompt_cache_key", RelayOutcomeSuccess).
 		Where("created_at >= ? AND created_at <= ?", mainStartedAt.Add(-codexTitleStartTolerance), mainStartedAt.Add(codexTitleMatchWindow)).
 		Where("codex_title_request = ? OR request_parameters_json LIKE ?", true, `%"text_format":"json_schema"%`).
@@ -207,7 +257,7 @@ func (s *Store) mergePrecedingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 	}
 	for index := range candidates {
 		candidate := &candidates[index]
-		candidateStartedAt := candidate.CreatedAt.Add(-time.Duration(max(candidate.DurationMS, 0)) * time.Millisecond)
+		candidateStartedAt := candidate.CreatedAt.Add(-relayRequestElapsedDuration(*candidate))
 		if candidateStartedAt.Before(mainStartedAt.Add(-codexTitleStartTolerance)) || candidateStartedAt.After(mainStartedAt.Add(codexTitleStartTolerance)) {
 			continue
 		}
@@ -248,7 +298,7 @@ func (s *Store) mergeFollowingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 		return "", "", nil
 	}
 	var candidates []RelayRequestLog
-	if err := db.Select("id, token_id, codex_session_id, codex_session_source, codex_prompt_hash, request_body, duration_ms, created_at").
+	if err := db.Select("id, token_id, codex_session_id, codex_session_source, codex_prompt_hash, request_body, latency_ms, duration_ms, created_at").
 		Where("token_id = ? AND codex_session_id <> ? AND codex_session_id <> ''", log.TokenID, log.CodexSessionID).
 		Where("codex_session_source = ? AND codex_title_request = ? AND outcome = ?", "prompt_cache_key", false, RelayOutcomeSuccess).
 		Where("created_at >= ? AND created_at <= ?", titleStartedAt.Add(-codexTitleStartTolerance), titleStartedAt.Add(codexTitleMatchWindow)).
@@ -257,7 +307,7 @@ func (s *Store) mergeFollowingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 	}
 	for index := range candidates {
 		candidate := &candidates[index]
-		candidateStartedAt := candidate.CreatedAt.Add(-time.Duration(max(candidate.DurationMS, 0)) * time.Millisecond)
+		candidateStartedAt := candidate.CreatedAt.Add(-relayRequestElapsedDuration(*candidate))
 		if candidateStartedAt.Before(titleStartedAt.Add(-codexTitleStartTolerance)) || candidateStartedAt.After(titleStartedAt.Add(codexTitleStartTolerance)) {
 			continue
 		}
@@ -355,7 +405,7 @@ func (s *Store) backfillCodexAuxiliarySessions() error {
 		}
 
 		var titleRequests []RelayRequestLog
-		if err := db.Select("id, token_id, codex_session_id, codex_session_source, session_name, request_body, response_body, duration_ms, created_at").
+		if err := db.Select("id, token_id, codex_session_id, codex_session_source, session_name, request_body, response_body, latency_ms, duration_ms, created_at").
 			Where("created_at >= ? AND codex_session_source = ? AND outcome = ?", cutoff, "prompt_cache_key", RelayOutcomeSuccess).
 			Where("request_parameters_json LIKE ?", `%"text_format":"json_schema"%`).
 			Order("created_at ASC, id ASC").Find(&titleRequests).Error; err != nil {
@@ -371,15 +421,15 @@ func (s *Store) backfillCodexAuxiliarySessions() error {
 				continue
 			}
 			var possibleMainRequests []RelayRequestLog
-			if err := db.Select("id, token_id, codex_session_id, codex_session_source, request_body, duration_ms, created_at").
+			if err := db.Select("id, token_id, codex_session_id, codex_session_source, request_body, latency_ms, duration_ms, created_at").
 				Where("token_id = ? AND codex_session_id <> ? AND codex_session_id <> '' AND codex_session_source = ?", titleRequest.TokenID, titleRequest.CodexSessionID, "prompt_cache_key").
 				Where("created_at >= ? AND created_at <= ?", titleRequest.CreatedAt.Add(-codexTitleMatchWindow), titleRequest.CreatedAt.Add(codexTitleMatchWindow)).
 				Order("created_at ASC, id ASC").Limit(20).Find(&possibleMainRequests).Error; err != nil {
 				return err
 			}
-			titleStartedAt := titleRequest.CreatedAt.Add(-time.Duration(max(titleRequest.DurationMS, 0)) * time.Millisecond)
+			titleStartedAt := titleRequest.CreatedAt.Add(-relayRequestElapsedDuration(titleRequest))
 			for _, mainRequest := range possibleMainRequests {
-				mainStartedAt := mainRequest.CreatedAt.Add(-time.Duration(max(mainRequest.DurationMS, 0)) * time.Millisecond)
+				mainStartedAt := mainRequest.CreatedAt.Add(-relayRequestElapsedDuration(mainRequest))
 				if mainStartedAt.Before(titleStartedAt.Add(-codexTitleStartTolerance)) || mainStartedAt.After(titleStartedAt.Add(codexTitleStartTolerance)) {
 					continue
 				}
@@ -400,4 +450,67 @@ func (s *Store) backfillCodexAuxiliarySessions() error {
 		}
 		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
 	})
+}
+
+func (s *Store) backfillCodexThreadSources() error {
+	const migrationName = "codex_thread_sources_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		var logs []RelayRequestLog
+		if err := db.Select("token_id, codex_session_id, request_body").
+			Where("codex_session_id <> '' AND request_body <> ''").Find(&logs).Error; err != nil {
+			return err
+		}
+		type sessionIdentity struct {
+			tokenID   uint64
+			sessionID string
+		}
+		sources := make(map[sessionIdentity]string)
+		for _, log := range logs {
+			source := codexThreadSourceFromBody([]byte(decompressStoredPayload(log.RequestBody)))
+			if source == "" {
+				continue
+			}
+			identity := sessionIdentity{tokenID: log.TokenID, sessionID: log.CodexSessionID}
+			sources[identity] = preferredCodexThreadSource(sources[identity], source)
+		}
+		now := time.Now().UTC()
+		for identity, source := range sources {
+			var state RelaySessionState
+			err := db.Where("token_id = ? AND session_id = ?", identity.tokenID, identity.sessionID).First(&state).Error
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				if err := db.Create(&RelaySessionState{
+					TokenID: identity.tokenID, SessionID: identity.sessionID, ThreadSource: source,
+					CreatedAt: now, UpdatedAt: now,
+				}).Error; err != nil {
+					return err
+				}
+				continue
+			}
+			if err != nil {
+				return err
+			}
+			preferred := preferredCodexThreadSource(state.ThreadSource, source)
+			if preferred != state.ThreadSource {
+				if err := db.Model(&RelaySessionState{}).
+					Where("token_id = ? AND session_id = ?", identity.tokenID, identity.sessionID).
+					Update("thread_source", preferred).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: now}).Error
+	})
+}
+
+func relayRequestElapsedDuration(log RelayRequestLog) time.Duration {
+	return time.Duration(max(log.LatencyMS, 0)+max(log.DurationMS, 0)) * time.Millisecond
 }

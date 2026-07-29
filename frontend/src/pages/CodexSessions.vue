@@ -38,15 +38,27 @@ function formatTiming(value: number, samples: number): string {
   return samples > 0 ? formatDuration(value) : '--'
 }
 
-function requestCountStyle(count: number): CSSProperties {
-  const normalizedCount = Math.max(1, count)
-  const logCount = Math.log10(normalizedCount)
-  const lowToMedium = Math.min(1, Math.max(0, logCount - 1))
-  const mediumToHigh = Math.min(1, Math.max(0, (normalizedCount - 100) / 200))
-  const color = normalizedCount <= 100
-    ? `color-mix(in srgb, var(--supos-success) ${(1 - lowToMedium) * 100}%, var(--supos-warning))`
-    : `color-mix(in srgb, var(--supos-warning) ${(1 - mediumToHigh) * 100}%, var(--supos-danger))`
-  return { '--request-count-color': color } as CSSProperties
+function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
+  const completedRequests = Math.max(0, row.requestCount - row.canceledCount)
+  const successRate = Math.min(1, Math.max(0, row.successRate))
+  const volumeRisk = Math.min(1, Math.max(0, row.requestCount) / 300)
+  const risk = Math.min(1, volumeRisk + (1 - successRate) * (1 - volumeRisk) * 0.6)
+  let tone = 'var(--rose-text-subtle)'
+  if (completedRequests > 0) {
+    if (risk <= 0.5) {
+      const warningWeight = Math.round(risk * 200)
+      tone = `color-mix(in srgb, var(--rose-success) ${100 - warningWeight}%, var(--rose-warning))`
+    } else {
+      const dangerWeight = Math.round((risk - 0.5) * 200)
+      tone = `color-mix(in srgb, var(--rose-warning) ${100 - dangerWeight}%, var(--rose-danger))`
+    }
+  }
+  const tint = Math.round(6 + risk * 6)
+  return {
+    '--session-row-tone': tone,
+    '--session-row-fill': `color-mix(in srgb, var(--rose-surface) ${100 - tint}%, ${tone})`,
+    '--session-row-fill-hover': `color-mix(in srgb, var(--rose-surface) ${Math.max(0, 96 - tint)}%, ${tone})`,
+  } as CSSProperties
 }
 
 function sessionSourceLabel(value: string): string {
@@ -54,6 +66,13 @@ function sessionSourceLabel(value: string): string {
   if (value.includes('session_id')) return '客户端会话 ID'
   if (value.includes('thread_id')) return '客户端任务 ID'
   return '未识别'
+}
+
+function threadSourceBadge(value: string): { label: string; type: 'primary' | 'warning' | 'info' } {
+  if (value === 'user') return { label: '用户会话', type: 'primary' }
+  if (value === 'ambient_suggestions') return { label: '环境建议', type: 'warning' }
+  if (!value || value === 'unavailable') return { label: '来源未知', type: 'info' }
+  return { label: value.replaceAll('_', ' '), type: 'info' }
 }
 
 function channelState(session: CodexSessionSummary): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
@@ -210,12 +229,15 @@ onMounted(async () => {
     </section>
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
-    <section v-else class="surface-panel table-panel">
-      <el-table v-loading="loading" :data="sessions" :row-key="sessionRowKey" max-height="var(--log-table-max-height)" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
+    <section v-else class="surface-panel table-panel log-table-panel">
+      <el-table v-loading="loading" class="session-table" :data="sessions" :row-key="sessionRowKey" :row-style="sessionRowStyle" height="100%" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
         <el-table-column label="会话" min-width="240">
           <template #default="scope">
             <div class="session-identity">
-              <div><el-tag :type="scope.row.identified ? 'success' : 'info'" effect="plain">{{ sessionSourceLabel(scope.row.sessionSource) }}</el-tag><strong>{{ scope.row.sessionName || '未命名会话' }}</strong></div>
+              <div class="session-heading">
+                <div class="session-title"><el-tag :type="scope.row.identified ? 'success' : 'info'" effect="plain">{{ sessionSourceLabel(scope.row.sessionSource) }}</el-tag><strong>{{ scope.row.sessionName || '未命名会话' }}</strong></div>
+                <el-tag class="session-thread-source" :type="threadSourceBadge(scope.row.threadSource).type" effect="plain" :title="scope.row.threadSource || 'unavailable'">{{ threadSourceBadge(scope.row.threadSource).label }}</el-tag>
+              </div>
               <small><code>{{ scope.row.identified ? scope.row.sessionId : scope.row.fallbackRequestId }}</code></small>
             </div>
           </template>
@@ -227,7 +249,7 @@ onMounted(async () => {
           </template>
         </el-table-column>
         <el-table-column label="模型 / 调用令牌" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.latestModel }}</strong><small>{{ scope.row.tokenName || `令牌 #${scope.row.tokenId}` }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
-        <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong class="request-count" :style="requestCountStyle(scope.row.requestCount)">{{ formatCompactNumber(scope.row.requestCount) }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ formatCompactNumber(scope.row.attemptCount) }} 次尝试</small></div></template></el-table-column>
+        <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong class="request-count">{{ formatCompactNumber(scope.row.requestCount) }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ formatCompactNumber(scope.row.attemptCount) }} 次尝试</small></div></template></el-table-column>
         <el-table-column label="Token 明细" min-width="280">
           <template #default="scope">
             <div class="session-tokens">
@@ -247,27 +269,37 @@ onMounted(async () => {
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
     </section>
 
-    <SessionLogDrawer v-model="drawerOpen" :summary="selectedSession" />
+    <SessionLogDrawer v-model="drawerOpen" :summary="selectedSession" @closed="loadSessions" />
   </div>
 </template>
 
 <style scoped>
-.log-page { --log-table-max-height: max(240px, calc(100dvh - 520px)); }
+.log-page { padding-bottom: 16px; }
+.log-table-panel { display: flex; min-width: 0; flex-direction: column; }
+.log-table-panel :deep(.el-table__inner-wrapper::before) { display: none; }
+.log-table-panel .table-pagination { flex: none; min-height: 56px; align-items: center; background: var(--rose-surface); }
 .session-identity { display: grid; min-width: 0; gap: 5px; }
-.session-identity > div, .channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.session-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; min-width: 0; }
+.session-title, .channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.session-thread-source { max-width: 96px; }
 .session-identity strong, .channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-identity small { overflow: hidden; color: var(--rose-text-muted); text-overflow: ellipsis; white-space: nowrap; }
 .numeric-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
 .numeric-cell strong { color: var(--rose-text); }
 .numeric-cell small { color: var(--rose-text-muted); font-size: 11px; }
-.numeric-cell .request-count { color: var(--request-count-color); }
+.numeric-cell .request-count { color: var(--session-row-tone); }
+.session-table :deep(.el-table__body tr > td.el-table__cell) { background-color: var(--session-row-fill); transition: background-color 140ms ease; }
+.session-table :deep(.el-table__body tr:hover > td.el-table__cell) { background-color: var(--session-row-fill-hover) !important; }
+.session-table :deep(.el-table__body tr > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--session-row-tone); }
 .session-tokens { display: grid; grid-template-columns: repeat(4, minmax(52px, 1fr)); gap: 4px 9px; font-variant-numeric: tabular-nums; }
 .session-tokens > span { display: grid; gap: 1px; }
 .session-tokens small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
 .session-tokens strong { color: var(--rose-text); font-size: 12px; }
 .session-sent { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
 @media (min-width: 961px) {
-  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; }
+  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
+  .log-table-panel { min-height: 0; }
+  .log-table-panel > .el-table { min-height: 0; flex: 1 1 0; }
   .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }
   .log-page .metric-cell { min-height: 80px; padding-block: 10px; border-right: 1px solid var(--rose-border); border-bottom: 0; }
   .log-page .metric-cell:nth-child(3) { border-right: 1px solid var(--rose-border); }
@@ -275,14 +307,9 @@ onMounted(async () => {
   .log-page .metric-cell:last-child { border-right: 0; }
   .log-page .metric-cell strong { margin-top: 5px; font-size: 17px; }
   .log-page .metric-cell small { margin-top: 3px; }
-  .table-panel { display: flex; flex-direction: column; min-height: 0; }
-  .table-panel > .el-table { flex: 1; min-height: 0; }
-  .table-pagination { flex: none; }
 }
 @media (min-width: 961px) and (max-width: 1360px) {
   .log-page .filter-bar { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .log-page .filter-bar .el-date-editor { grid-column: span 3; }
 }
-@media (max-width: 1360px) { .log-page { --log-table-max-height: max(240px, calc(100dvh - 680px)); } }
-@media (max-width: 720px) { .log-page { --log-table-max-height: 420px; } }
 </style>

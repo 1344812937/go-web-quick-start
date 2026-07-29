@@ -73,6 +73,9 @@ func (s *Store) migrate() error {
 	if err := s.backfillTokenDailyStats(); err != nil {
 		return err
 	}
+	if err := s.backfillCircuitLevels(); err != nil {
+		return err
+	}
 	if err := s.backfillTokenLogFields(); err != nil {
 		return err
 	}
@@ -88,13 +91,39 @@ func (s *Store) migrate() error {
 	if err := s.backfillRequestStatisticsFromFinalAttempts(); err != nil {
 		return err
 	}
+	if err := s.backfillResponsePhaseTimings(); err != nil {
+		return err
+	}
 	if err := s.compressDetailedPayloads(); err != nil {
 		return err
 	}
 	if err := s.backfillCodexAuxiliarySessions(); err != nil {
 		return err
 	}
+	if err := s.backfillCodexThreadSources(); err != nil {
+		return err
+	}
 	return s.reclaimSQLiteSpaceOnce()
+}
+
+func (s *Store) backfillCircuitLevels() error {
+	const migrationName = "channel_circuit_levels_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := db.Model(&Channel{}).
+			Where("circuit_level = ? AND circuit_open_until IS NOT NULL", CircuitLevelClosed).
+			Update("circuit_level", CircuitLevelTemporary).Error; err != nil {
+			return err
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now()}).Error
+	})
 }
 
 func (s *Store) reclaimSQLiteSpaceOnce() error {

@@ -113,7 +113,6 @@ func (a *OpenAIRelayApi) handleRelay(c *gin.Context, endpoint string) {
 		writeOpenAIError(c, &gateway.PublicError{Status: http.StatusBadRequest, Message: err.Error(), Type: "invalid_request_error", Code: "invalid_request"})
 		return
 	}
-	a.access.Touch(contextWithoutCancel(c), token.ID)
 	publicErr = a.relay.Relay(c.Request.Context(), c.Writer, c.Request.Header, c.Request.URL.RawQuery, endpoint, token, payload, body)
 	if publicErr != nil && !c.Writer.Written() {
 		writeOpenAIError(c, publicErr)

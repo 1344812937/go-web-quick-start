@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { Check, Link, Refresh } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import projectMeta from '@/config/project.generated.js'
@@ -21,6 +21,9 @@ const payloadLogDetailDescriptions: Record<PayloadLogDetail, string> = {
   summary: '保留 JSON 结构、短文本预览及首尾数组项，单段不超过 64 KiB。',
   none: '不保存请求参数和响应正文，仅保留状态、用量、耗时与路由结果。',
 }
+const defaultRoutingPriceWeightPercent = 45
+const defaultRoutingEfficiencyWeightPercent = 45
+const defaultCommonModelNames = ['gpt-image-2', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini', 'codex-auto-review']
 const form = reactive<ApplicationSettings>({
   webConfig: { host: '', port: '' },
   nodeConfig: { sharedToken: '' },
@@ -29,16 +32,27 @@ const form = reactive<ApplicationSettings>({
     requestBodyLimitMB: 32,
     responseHeaderTimeoutSeconds: 120,
     streamIdleTimeoutSeconds: 300,
+    routingPriceWeightPercent: defaultRoutingPriceWeightPercent,
+    routingEfficiencyWeightPercent: defaultRoutingEfficiencyWeightPercent,
     sessionTTLHours: 12,
     secureCookie: false,
     payloadLogDetail: 'default',
+    commonModelNames: [...defaultCommonModelNames],
   },
 })
+const routingQualityWeightPercent = computed(() => 100 - form.gatewayConfig.routingPriceWeightPercent - form.gatewayConfig.routingEfficiencyWeightPercent)
+const routingPriceWeightMax = computed(() => 100 - form.gatewayConfig.routingEfficiencyWeightPercent)
+const routingEfficiencyWeightMax = computed(() => 100 - form.gatewayConfig.routingPriceWeightPercent)
 
 function applySettings(payload: ApplicationSettings) {
   form.webConfig = { ...payload.webConfig }
   form.nodeConfig = { ...payload.nodeConfig }
-  form.gatewayConfig = { ...payload.gatewayConfig }
+  form.gatewayConfig = {
+    ...payload.gatewayConfig,
+    routingPriceWeightPercent: payload.gatewayConfig.routingPriceWeightPercent ?? defaultRoutingPriceWeightPercent,
+    routingEfficiencyWeightPercent: payload.gatewayConfig.routingEfficiencyWeightPercent ?? defaultRoutingEfficiencyWeightPercent,
+    commonModelNames: payload.gatewayConfig.commonModelNames?.length ? [...payload.gatewayConfig.commonModelNames] : [...defaultCommonModelNames],
+  }
 }
 
 async function loadSettings() {
@@ -54,6 +68,10 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
+  if (routingQualityWeightPercent.value < 0) {
+    ElMessage.error('价格与效率占比合计不能超过 100%')
+    return
+  }
   saving.value = true
   try {
     applySettings(await request<ApplicationSettings>('/settings', { method: 'PUT', body: JSON.stringify(form) }))
@@ -71,7 +89,7 @@ onMounted(loadSettings)
 <template>
   <div class="page-stack settings-page">
     <header class="page-heading">
-      <div><h1>系统设置</h1><p>调整监听地址、请求限制、超时和管理会话</p></div>
+      <div><h1>系统设置</h1><p>调整监听地址、请求限制、路由决策、超时和管理会话</p></div>
       <el-button :icon="Refresh" :loading="loading" @click="loadSettings">重新加载</el-button>
     </header>
 
@@ -84,6 +102,39 @@ onMounted(loadSettings)
           <el-form-item label="监听主机"><el-input v-model="form.webConfig.host" placeholder="0.0.0.0" /></el-form-item>
           <el-form-item label="监听端口"><el-input v-model="form.webConfig.port" placeholder="8888" /></el-form-item>
         </div>
+      </section>
+
+      <section class="surface-panel settings-section routing-settings-section">
+        <header class="panel-heading"><div><h2>路由决策</h2><p>保存后立即作用于新进入的非固定渠道请求</p></div></header>
+        <div class="routing-weight-overview" aria-label="路由决策占比">
+          <div><span>价格</span><strong>{{ form.gatewayConfig.routingPriceWeightPercent }}%</strong></div>
+          <div><span>效率</span><strong>{{ form.gatewayConfig.routingEfficiencyWeightPercent }}%</strong></div>
+          <div><span>质量与均衡</span><strong>{{ routingQualityWeightPercent }}%</strong></div>
+        </div>
+        <div class="routing-weight-bar" aria-hidden="true">
+          <i class="is-price" :style="{ flexGrow: form.gatewayConfig.routingPriceWeightPercent }" />
+          <i class="is-efficiency" :style="{ flexGrow: form.gatewayConfig.routingEfficiencyWeightPercent }" />
+          <i class="is-quality" :style="{ flexGrow: routingQualityWeightPercent }" />
+        </div>
+        <div class="settings-fields routing-weight-fields">
+          <el-form-item label="价格占比">
+            <div class="weight-control">
+              <el-slider v-model="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="routingPriceWeightMax" :step="5" show-stops aria-label="价格决策占比" />
+              <el-input-number v-model="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="routingPriceWeightMax" :step="5" controls-position="right" aria-label="价格决策占比百分比" />
+            </div>
+          </el-form-item>
+          <el-form-item label="效率占比">
+            <div class="weight-control">
+              <el-slider v-model="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="routingEfficiencyWeightMax" :step="5" show-stops aria-label="效率决策占比" />
+              <el-input-number v-model="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="routingEfficiencyWeightMax" :step="5" controls-position="right" aria-label="效率决策占比百分比" />
+            </div>
+          </el-form-item>
+        </div>
+        <dl class="routing-formula">
+          <div><dt>价格</dt><dd>按本次预计费用相对最低费用归一化，价格越低得分越高。</dd></div>
+          <div><dt>效率</dt><dd>首 token 45% + 响应头延迟 20% + 输出吞吐 35%，使用近 30 分钟成功样本。</dd></div>
+          <div><dt>质量与均衡</dt><dd>使用剩余占比计算成功率、缓存表现和近期流量均衡。</dd></div>
+        </dl>
       </section>
 
       <section class="surface-panel settings-section">
@@ -105,6 +156,14 @@ onMounted(loadSettings)
             <div class="payload-detail-control">
               <el-segmented v-model="form.gatewayConfig.payloadLogDetail" :options="payloadLogDetailOptions" aria-label="调用日志参数和返回记录细节" />
               <small>{{ payloadLogDetailDescriptions[form.gatewayConfig.payloadLogDetail] }} 保存后立即作用于新进入的调用。</small>
+            </div>
+          </el-form-item>
+          <el-form-item label="首次渠道配置自动启用模型" class="payload-detail-field">
+            <div class="common-model-control">
+              <el-select v-model="form.gatewayConfig.commonModelNames" multiple filterable allow-create default-first-option placeholder="输入模型名称后回车" aria-label="首次配置自动启用的常用模型">
+                <el-option v-for="modelName in form.gatewayConfig.commonModelNames" :key="modelName" :label="modelName" :value="modelName" />
+              </el-select>
+              <small>新建渠道首次获取上游模型时，精确匹配这些名称的新增映射会自动启用。</small>
             </div>
           </el-form-item>
         </div>
@@ -136,9 +195,29 @@ onMounted(loadSettings)
 .settings-fields { padding: 20px 22px 8px; }
 .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 18px; }
 .settings-actions { display: flex; justify-content: flex-end; position: sticky; bottom: 12px; padding: 10px; border: 1px solid var(--rose-border); background: var(--rose-surface); }
+.routing-weight-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--rose-border); }
+.routing-weight-overview > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 14px 22px; border-right: 1px solid var(--rose-border); }
+.routing-weight-overview > div:last-child { border-right: 0; }
+.routing-weight-overview span { color: var(--rose-text-muted); font-size: 11px; }
+.routing-weight-overview strong { color: var(--rose-text); font-family: var(--rose-font-mono); font-size: 18px; font-weight: 650; }
+.routing-weight-bar { display: flex; height: 4px; background: var(--rose-surface-muted); }
+.routing-weight-bar i { min-width: 0; }
+.routing-weight-bar .is-price { background: var(--rose-primary); }
+.routing-weight-bar .is-efficiency { background: var(--rose-success); }
+.routing-weight-bar .is-quality { background: var(--rose-warning); }
+.routing-weight-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; padding-bottom: 0; }
+.weight-control { display: grid; grid-template-columns: minmax(120px, 1fr) 118px; align-items: center; gap: 20px; width: 100%; }
+.weight-control :deep(.el-input-number) { width: 118px; }
+.routing-formula { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 4px 22px 20px; }
+.routing-formula > div { min-width: 0; padding: 10px 14px; border-left: 2px solid var(--rose-border-strong); }
+.routing-formula dt { color: var(--rose-text); font-size: 11px; font-weight: 650; }
+.routing-formula dd { margin: 5px 0 0; color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
 .payload-detail-field { grid-column: 1 / -1; }
 .payload-detail-control { display: grid; justify-items: start; gap: 8px; }
 .payload-detail-control small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
+.common-model-control { display: grid; gap: 8px; width: 100%; }
+.common-model-control .el-select { width: 100%; }
+.common-model-control small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
 .project-section { margin-top: 16px; }
 .project-metadata { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; margin: 0; padding: 20px 22px; }
 .project-metadata > div { min-width: 0; }
@@ -151,9 +230,15 @@ onMounted(loadSettings)
 .disclaimer { margin: 0 22px 22px; padding: 14px 16px; border-left: 3px solid var(--rose-warning); background: var(--rose-surface-muted); color: var(--rose-text-muted); }
 .disclaimer strong { display: block; margin-bottom: 5px; color: var(--rose-text); font-size: 12px; }
 .disclaimer p { margin: 0; font-size: 12px; line-height: 1.7; }
-@media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 800px) {
+  .settings-grid, .routing-weight-fields { grid-template-columns: 1fr 1fr; }
+  .weight-control { grid-template-columns: 1fr; gap: 8px; }
+  .routing-formula { grid-template-columns: 1fr; gap: 8px; }
+}
 @media (max-width: 520px) {
-  .settings-grid, .project-metadata { grid-template-columns: 1fr; }
+  .settings-grid, .routing-weight-fields, .routing-weight-overview, .project-metadata { grid-template-columns: 1fr; }
+  .routing-weight-overview > div { border-right: 0; border-bottom: 1px solid var(--rose-border); }
+  .routing-weight-overview > div:last-child { border-bottom: 0; }
   .repository-row { grid-column: auto; }
   .project-metadata { gap: 14px; padding: 18px; }
   .disclaimer { margin: 0 18px 18px; }

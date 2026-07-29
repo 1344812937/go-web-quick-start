@@ -14,6 +14,7 @@ type RelayPayload struct {
 	PreviousResponseID    string
 	SessionKey            string
 	SessionSource         string
+	ThreadSource          string
 	RequestParametersJSON string
 	DeclaredMaxOutput     int64
 }
@@ -71,6 +72,7 @@ func ParseRelayPayload(data []byte) (*RelayPayload, error) {
 	if payload.SessionKey == "" {
 		payload.SessionSource = "unavailable"
 	}
+	payload.ThreadSource = codexThreadSourceFromPayload(values)
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		if value, ok := values[key].(json.Number); ok {
 			parsed, _ := value.Int64()

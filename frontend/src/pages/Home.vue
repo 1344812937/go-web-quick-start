@@ -30,6 +30,12 @@ const timeRangeOptions: Array<{ label: string; value: DashboardRangeDays }> = [
 ]
 
 const totalTokens = computed(() => (dashboard.value?.inputTokens ?? 0) + (dashboard.value?.outputTokens ?? 0))
+const topTokenModels = computed(() => [...(dashboard.value?.models ?? [])]
+  .sort((left, right) => (right.inputTokens + right.outputTokens) - (left.inputTokens + left.outputTokens)
+    || right.requests - left.requests
+    || left.name.localeCompare(right.name))
+  .slice(0, 4))
+const topCostModels = computed(() => (dashboard.value?.models ?? []).slice(0, 5))
 const selectedRangeLabel = computed(() => timeRangeOptions.find((option) => option.value === selectedRangeDays.value)?.label ?? '当前')
 const availableChannels = computed(() => channels.value.filter((channel) => (
   channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())
@@ -60,6 +66,10 @@ function formatUSD(micros: number): string {
 
 function formatPercent(value: number): string {
   return `${(value * 100).toFixed(1)}%`
+}
+
+function formatRatio(value: number): string {
+  return `${value.toFixed(2)}x`
 }
 
 function formatDate(value: string): string {
@@ -155,17 +165,53 @@ onMounted(loadDashboard)
           <el-skeleton v-else :rows="1" animated />
           <small>最终状态为 2xx</small>
         </article>
+        <el-tooltip placement="bottom" :disabled="loading || topTokenModels.length === 0" popper-class="dashboard-metric-popper">
+          <template #content>
+            <div class="metric-tooltip" aria-label="Token 用量最高的四个模型">
+              <header><strong>模型 Token 用量</strong><span>按输入与输出合计降序</span></header>
+              <ol>
+                <li v-for="(model, index) in topTokenModels" :key="model.name">
+                  <span class="metric-tooltip-rank">{{ index + 1 }}</span>
+                  <code>{{ model.name }}</code>
+                  <div>
+                    <strong>{{ formatCompactNumber(model.inputTokens + model.outputTokens) }}</strong>
+                    <small>输入 {{ formatCompactNumber(model.inputTokens) }} · 输出 {{ formatCompactNumber(model.outputTokens) }}</small>
+                  </div>
+                </li>
+              </ol>
+            </div>
+          </template>
+          <article class="metric-cell metric-cell-tooltip" tabindex="0">
+            <span><Coin />Token</span>
+            <strong v-if="!loading">{{ formatCompactNumber(totalTokens) }}</strong>
+            <el-skeleton v-else :rows="1" animated />
+            <small>悬浮查看模型用量前四</small>
+          </article>
+        </el-tooltip>
         <article class="metric-cell">
-          <span><Coin />Token</span>
-          <strong v-if="!loading">{{ formatCompactNumber(totalTokens) }}</strong>
+          <span><DataLine />缓存命中率</span>
+          <strong v-if="!loading">{{ formatPercent(dashboard?.cacheHitRate ?? 0) }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>输入与输出合计</small>
+          <small>缓存读 {{ formatCompactNumber(dashboard?.cachedTokens ?? 0) }} · 写 {{ formatCompactNumber(dashboard?.cacheWriteTokens ?? 0) }}</small>
         </article>
+        <el-tooltip placement="bottom" :disabled="loading || topCostModels.length === 0" popper-class="dashboard-metric-popper">
+          <template #content>
+            <div class="cost-tooltip-list" role="list" aria-label="费用最高的五个模型">
+              <div v-for="model in topCostModels" :key="model.name" role="listitem"><code>{{ model.name }}</code><strong>{{ formatUSD(model.upstreamCostMicros) }}</strong></div>
+            </div>
+          </template>
+          <article class="metric-cell metric-cell-tooltip" tabindex="0">
+            <span><Coin />上游费用</span>
+            <strong v-if="!loading">{{ formatUSD(dashboard?.upstreamCostMicros ?? 0) }}</strong>
+            <el-skeleton v-else :rows="1" animated />
+            <small>悬浮查看费用最高的模型</small>
+          </article>
+        </el-tooltip>
         <article class="metric-cell">
-          <span><Coin />上游费用</span>
-          <strong v-if="!loading">{{ formatUSD(dashboard?.upstreamCostMicros ?? 0) }}</strong>
+          <span><Coin />费用倍率</span>
+          <strong v-if="!loading">{{ formatRatio(dashboard?.upstreamCostRatio ?? 0) }}</strong>
           <el-skeleton v-else :rows="1" animated />
-          <small>自行估算 {{ formatUSD(dashboard?.estimatedCostMicros ?? 0) }}</small>
+          <small>预估 {{ formatRatio(dashboard?.estimatedCostRatio ?? 0) }} · 官方基准 {{ formatUSD(dashboard?.officialCostMicros ?? 0) }}</small>
         </article>
         <article class="metric-cell">
           <span><Timer />平均首 Token</span>
@@ -252,7 +298,13 @@ onMounted(loadDashboard)
             <header class="panel-heading"><div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，每个请求按最终渠道统计一次</p></div></header>
             <el-table :data="dashboard?.channels ?? []" empty-text="暂无渠道调用">
               <el-table-column prop="name" label="渠道" min-width="140" />
-              <el-table-column label="请求" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
+              <el-table-column label="请求" width="78" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
+              <el-table-column label="Token" min-width="142" align="right">
+                <template #default="scope"><div class="usage-cell"><strong>{{ formatCompactNumber(scope.row.inputTokens + scope.row.outputTokens) }}</strong><small>输入 {{ formatCompactNumber(scope.row.inputTokens) }} · 输出 {{ formatCompactNumber(scope.row.outputTokens) }}</small></div></template>
+              </el-table-column>
+              <el-table-column label="成功率" width="112" align="right">
+                <template #default="scope"><div class="success-cell"><strong>{{ formatPercent(scope.row.successRate) }}</strong><small>{{ formatCompactNumber(scope.row.successes) }} / {{ formatCompactNumber(Math.max(0, scope.row.requests - scope.row.canceledCount)) }} 完成</small></div></template>
+              </el-table-column>
               <el-table-column label="费用" width="150" align="right">
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>
@@ -262,7 +314,13 @@ onMounted(loadDashboard)
             <header class="panel-heading"><div><h2>模型分布</h2><p>{{ selectedRangeLabel }}，按公开模型统计</p></div></header>
             <el-table :data="dashboard?.models ?? []" empty-text="暂无模型调用">
               <el-table-column prop="name" label="模型" min-width="140" />
-              <el-table-column label="请求" width="92" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
+              <el-table-column label="请求" width="78" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
+              <el-table-column label="Token" min-width="142" align="right">
+                <template #default="scope"><div class="usage-cell"><strong>{{ formatCompactNumber(scope.row.inputTokens + scope.row.outputTokens) }}</strong><small>输入 {{ formatCompactNumber(scope.row.inputTokens) }} · 输出 {{ formatCompactNumber(scope.row.outputTokens) }}</small></div></template>
+              </el-table-column>
+              <el-table-column label="成功率" width="112" align="right">
+                <template #default="scope"><div class="success-cell"><strong>{{ formatPercent(scope.row.successRate) }}</strong><small>{{ formatCompactNumber(scope.row.successes) }} / {{ formatCompactNumber(Math.max(0, scope.row.requests - scope.row.canceledCount)) }} 完成</small></div></template>
+              </el-table-column>
               <el-table-column label="费用" width="150" align="right">
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>
@@ -278,6 +336,24 @@ onMounted(loadDashboard)
 .dashboard-page { min-width: 0; }
 .usage-panel { min-height: 300px; }
 .historical-cost-note { margin: -8px 0 0; color: var(--rose-text-subtle); font-size: 11px; }
+.metric-cell-tooltip { cursor: help; }
+:global(.dashboard-metric-popper) { max-width: min(440px, 90vw); }
+.metric-tooltip { width: min(360px, 82vw); }
+.metric-tooltip > header { display: grid; gap: 2px; padding: 3px 4px 8px; border-bottom: 1px solid rgb(255 255 255 / 16%); }
+.metric-tooltip > header strong { font-size: 12px; }
+.metric-tooltip > header span { color: rgb(255 255 255 / 70%); font-size: 10px; }
+.metric-tooltip ol { display: grid; max-height: 244px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.metric-tooltip li { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 8px 4px; border-bottom: 1px solid rgb(255 255 255 / 16%); }
+.metric-tooltip li:last-child { border-bottom: 0; }
+.metric-tooltip-rank { display: grid; width: 18px; height: 18px; place-items: center; border: 1px solid rgb(255 255 255 / 24%); border-radius: 3px; font: 600 10px/1 var(--rose-font-mono); }
+.metric-tooltip code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.metric-tooltip li > div { display: grid; justify-items: end; gap: 1px; font-variant-numeric: tabular-nums; }
+.metric-tooltip li small { color: rgb(255 255 255 / 70%); font-size: 9px; white-space: nowrap; }
+.cost-tooltip-list { display: grid; min-width: 260px; max-height: 220px; overflow-y: auto; }
+.cost-tooltip-list > div { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; padding: 8px 4px; border-bottom: 1px solid rgb(255 255 255 / 16%); }
+.cost-tooltip-list > div:last-child { border-bottom: 0; }
+.cost-tooltip-list code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cost-tooltip-list strong { font-variant-numeric: tabular-nums; }
 .quick-start-panel { overflow: hidden; }
 .readiness-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-block: 1px solid var(--rose-border); }
 .readiness-strip > div { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 4px 12px; padding: 12px 16px; border-right: 1px solid var(--rose-border); }
@@ -295,9 +371,9 @@ onMounted(loadDashboard)
 .token-safety code { color: var(--rose-text); }
 .token-safety span { grid-column: 1 / -1; }
 .quick-start-body pre { min-height: 220px; margin: 0; padding: 15px; overflow: auto; border: 1px solid var(--rose-border); background: var(--rose-surface-muted); color: var(--rose-text); font: 12px/1.65 var(--rose-font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
-.cost-cell { display: grid; gap: 2px; }
-.cost-cell strong { color: var(--rose-text); font-weight: 650; }
-.cost-cell small { color: var(--rose-text-muted); font-size: 10px; }
+.cost-cell, .usage-cell, .success-cell { display: grid; gap: 2px; font-variant-numeric: tabular-nums; }
+.cost-cell strong, .usage-cell strong, .success-cell strong { color: var(--rose-text); font-weight: 650; }
+.cost-cell small, .usage-cell small, .success-cell small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
 .chart-skeleton { padding: 24px; }
 .bar-chart { display: grid; align-items: end; justify-content: space-around; gap: 8px; height: 210px; padding: 20px 22px 12px; overflow-x: auto; }
 .bar-column { display: grid; grid-template-rows: 160px 22px; align-items: end; gap: 8px; min-width: 24px; text-align: center; }

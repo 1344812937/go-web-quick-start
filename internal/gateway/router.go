@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/1344812937/go-web-quick-start/internal/config"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -21,21 +22,23 @@ var (
 )
 
 type RouteCandidate struct {
-	Channel            Channel
-	Mapping            ChannelModel
-	Cost               int64
-	RecentSuccessRate  float64
-	RecentSuccessCount int64
-	RecentAttemptCount int64
-	RecentLatencyMS    float64
-	RecentCacheHitRate float64
-	RecentCacheSamples int64
-	RecentCacheRate    float64
-	RecentCacheTokens  int64
-	RecentRouteCount   int64
-	RecentRouteShare   float64
-	RouteSampleSize    int64
-	MetricsLoaded      bool
+	Channel               Channel
+	Mapping               ChannelModel
+	Cost                  int64
+	RecentSuccessRate     float64
+	RecentSuccessCount    int64
+	RecentAttemptCount    int64
+	RecentLatencyMS       float64
+	RecentFirstTokenMS    float64
+	RecentTokensPerSecond float64
+	RecentCacheHitRate    float64
+	RecentCacheSamples    int64
+	RecentCacheRate       float64
+	RecentCacheTokens     int64
+	RecentRouteCount      int64
+	RecentRouteShare      float64
+	RouteSampleSize       int64
+	MetricsLoaded         bool
 }
 
 type RouteDecisionCandidate struct {
@@ -48,6 +51,11 @@ type RouteDecisionCandidate struct {
 	ExpectedCostMicros int64   `json:"expectedCostMicros"`
 	SuccessRate        float64 `json:"successRate"`
 	LatencyMS          float64 `json:"latencyMs"`
+	FirstTokenMS       float64 `json:"firstTokenMs"`
+	TokensPerSecond    float64 `json:"tokensPerSecond"`
+	PriceScore         float64 `json:"priceScore"`
+	EfficiencyScore    float64 `json:"efficiencyScore"`
+	QualityScore       float64 `json:"qualityScore"`
 	CacheHitRate       float64 `json:"cacheHitRate"`
 	CacheSampleCount   int64   `json:"cacheSampleCount"`
 	CacheRate          float64 `json:"cacheRate"`
@@ -63,7 +71,14 @@ type RouteDecisionCandidate struct {
 type RouteDecision struct {
 	Strategy   string                   `json:"strategy"`
 	Mode       string                   `json:"mode"`
+	Weights    RouteDecisionWeights     `json:"weights"`
 	Candidates []RouteDecisionCandidate `json:"candidates"`
+}
+
+type RouteDecisionWeights struct {
+	Price      float64 `json:"price"`
+	Efficiency float64 `json:"efficiency"`
+	Quality    float64 `json:"quality"`
 }
 
 type RoutePlan struct {
@@ -96,18 +111,23 @@ type weightedPriorityState struct {
 type Router struct {
 	store          *Store
 	access         *ClientAccessService
+	configProvider func() *config.ApplicationConfig
 	random         func(int) int
 	weightedMu     sync.Mutex
 	weightedStates map[weightedPriorityKey]*weightedPriorityState
 }
 
-func NewRouter(store *Store, access *ClientAccessService) *Router {
-	return &Router{
+func NewRouter(store *Store, access *ClientAccessService, configManager *config.ApplicationConfigManager) *Router {
+	router := &Router{
 		store:          store,
 		access:         access,
 		random:         secureIntn,
 		weightedStates: make(map[weightedPriorityKey]*weightedPriorityState),
 	}
+	if configManager != nil {
+		router.configProvider = configManager.GetConfig
+	}
+	return router
 }
 
 func secureIntn(limit int) int {
@@ -224,7 +244,7 @@ func (r *Router) sessionAffinity(ctx context.Context, tokenID uint64, modelID ui
 	var affinity SessionAffinity
 	err := r.store.db.WithContext(ctx).Where(
 		"token_id = ? AND model_id = ? AND session_hash = ? AND expires_at > ?",
-			tokenID, modelID, hashSecret(sessionKey), time.Now(),
+		tokenID, modelID, hashSecret(sessionKey), time.Now(),
 	).First(&affinity).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
@@ -299,21 +319,23 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 		expectedCachedTokens := int64(math.Round(float64(max(inputTokens, 0)) * routingMetric.CacheRate))
 		usage := Usage{InputTokens: inputTokens, OutputTokens: outputTokens, CachedTokens: expectedCachedTokens}
 		candidates = append(candidates, RouteCandidate{
-			Channel:            channel,
-			Mapping:            mapping,
-			Cost:               CalculateCostMicros(mapping, usage),
-			RecentSuccessRate:  metric.rate(),
-			RecentSuccessCount: metric.Successes,
-			RecentAttemptCount: metric.Attempts,
-			RecentLatencyMS:    routingMetric.LatencyMS,
-			RecentCacheHitRate: routingMetric.CacheHitRate,
-			RecentCacheSamples: routingMetric.CacheSampleCount,
-			RecentCacheRate:    routingMetric.CacheRate,
-			RecentCacheTokens:  routingMetric.CacheTokenCount,
-			RecentRouteCount:   routingMetric.RouteCount,
-			RecentRouteShare:   routingMetric.RouteShare,
-			RouteSampleSize:    routingMetric.RouteSampleSize,
-			MetricsLoaded:      true,
+			Channel:               channel,
+			Mapping:               mapping,
+			Cost:                  CalculateCostMicros(mapping, usage),
+			RecentSuccessRate:     metric.rate(),
+			RecentSuccessCount:    metric.Successes,
+			RecentAttemptCount:    metric.Attempts,
+			RecentLatencyMS:       routingMetric.LatencyMS,
+			RecentFirstTokenMS:    routingMetric.FirstTokenMS,
+			RecentTokensPerSecond: routingMetric.TokensPerSecond,
+			RecentCacheHitRate:    routingMetric.CacheHitRate,
+			RecentCacheSamples:    routingMetric.CacheSampleCount,
+			RecentCacheRate:       routingMetric.CacheRate,
+			RecentCacheTokens:     routingMetric.CacheTokenCount,
+			RecentRouteCount:      routingMetric.RouteCount,
+			RecentRouteShare:      routingMetric.RouteShare,
+			RouteSampleSize:       routingMetric.RouteSampleSize,
+			MetricsLoaded:         true,
 		})
 	}
 	return candidates, nil
@@ -370,6 +392,17 @@ func (r *Router) orderCandidates(strategy string, candidates []RouteCandidate) *
 }
 
 func (r *Router) orderCandidatesWithoutWeightedAdvance(strategy string, candidates []RouteCandidate) {
+	if len(candidates) > 0 && candidates[0].MetricsLoaded {
+		decision, _ := r.scoredRouteDecision(strategy, candidates)
+		expectations := make(map[uint64]float64, len(decision.Candidates))
+		for _, candidate := range decision.Candidates {
+			expectations[candidate.ChannelModelID] = candidate.Expectation
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			return expectations[candidates[i].Mapping.ID] > expectations[candidates[j].Mapping.ID]
+		})
+		return
+	}
 	switch strategy {
 	case RoutingLowestCost:
 		sortCandidatesByCost(candidates)

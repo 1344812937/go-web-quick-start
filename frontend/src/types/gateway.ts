@@ -60,7 +60,7 @@ export interface ChannelMetrics {
   latencySeries: ChannelLatencyPoint[]
   /** Most recent successful upstream latency in milliseconds, or zero without a sample. */
   latestLatencyMs: number
-  /** Mean time to the first generated output token across sampled successful streaming attempts. */
+  /** Mean time from response headers to the first generated output token across sampled successful streaming attempts. */
   averageFirstTokenMs: number
   /** Successful streaming attempts with a recorded first output token within five days. */
   firstTokenSampleCount: number
@@ -68,7 +68,7 @@ export interface ChannelMetrics {
   averageLatencyMs: number
   /** Total successful attempts with a positive latency sample within five days. */
   latencySampleCount: number
-  /** Mean time to consume the full upstream response across sampled successful attempts. */
+  /** Mean response-body duration after response-header latency is excluded across sampled successful attempts. */
   averageDurationMs: number
   /** Successful attempts with a recorded full-response duration within five days. */
   durationSampleCount: number
@@ -101,6 +101,8 @@ export interface Channel {
   priceMultiplierBasisPoints: number
   /** Number of consecutive retryable failures. */
   consecutiveFailures: number
+  /** Circuit escalation level: 0 closed, 1 temporary, 2 extended, 3 manually recoverable. */
+  circuitLevel: number
   /** Circuit reopening timestamp, or null when the circuit is closed. */
   circuitOpenUntil: string | null
   /** Successful request latency EWMA in milliseconds. */
@@ -188,6 +190,8 @@ export interface GatewayModel {
   routingStrategy: RoutingStrategy
   /** Whether the model is listed and accepts requests. */
   enabled: boolean
+  /** Total public requests recorded for this model across the whole site. */
+  requestCount: number
   /** Model creation timestamp in RFC 3339 format. */
   createdAt: string
   /** Model update timestamp in RFC 3339 format. */
@@ -242,7 +246,7 @@ export interface TokenStatistics {
   estimatedCostMicros: number
   /** Total upstream-reported cost in micro-USD, with estimate fallback when the upstream omits cost. */
   upstreamCostMicros: number
-  /** Mean time to the first generated output token in milliseconds. */
+  /** Mean time from final upstream response headers to the first generated output token in milliseconds. */
   averageFirstTokenMs: number
   /** Requests with an observed first output token. */
   firstTokenSampleCount: number
@@ -250,7 +254,7 @@ export interface TokenStatistics {
   averageLatencyMs: number
   /** Requests with an observed final upstream response header. */
   latencySampleCount: number
-  /** Mean end-to-end request duration in milliseconds. */
+  /** Mean response-body duration after final response-header latency is excluded in milliseconds. */
   averageDurationMs: number
   /** Requests included in the duration average. */
   durationSampleCount: number
@@ -282,7 +286,7 @@ export interface DashboardDaily {
   estimatedCostMicros: number
   /** Upstream cost in micro-USD, with estimate fallback when the upstream omits cost. */
   upstreamCostMicros: number
-  /** Mean time to the first generated output token for sampled requests on the date. */
+  /** Mean time from response headers to the first generated output token for sampled requests on the date. */
   averageFirstTokenMs: number
   /** Requests with an observed first output token on the date. */
   firstTokenSampleCount: number
@@ -290,7 +294,7 @@ export interface DashboardDaily {
   averageLatencyMs: number
   /** Requests with an observed final upstream response header on the date. */
   latencySampleCount: number
-  /** Mean end-to-end request duration on the date. */
+  /** Mean response-body duration after response-header latency is excluded on the date. */
   averageDurationMs: number
   /** Requests included in the duration average on the date. */
   durationSampleCount: number
@@ -301,6 +305,16 @@ export interface DashboardBreakdown {
   name: string
   /** Request-level records represented by this row; retries never add another count. */
   requests: number
+  /** Requests that completed successfully within this breakdown row. */
+  successes: number
+  /** Requests canceled by downstream clients within this breakdown row. */
+  canceledCount: number
+  /** Successful requests divided by completed non-canceled requests. */
+  successRate: number
+  /** Input tokens attributed to this channel or public model. */
+  inputTokens: number
+  /** Output tokens attributed to this channel or public model. */
+  outputTokens: number
   /** Estimated cost in micro-USD. */
   estimatedCostMicros: number
   /** Upstream cost in micro-USD, with estimate fallback when the upstream omits cost. */
@@ -318,11 +332,25 @@ export interface DashboardSummary {
   inputTokens: number
   /** Total output tokens in the selected natural-day range. */
   outputTokens: number
+  /** Non-cached input tokens in the selected range. */
+  normalInputTokens: number
+  /** Cached input tokens in the selected range. */
+  cachedTokens: number
+  /** Cache-write input tokens in the selected range. */
+  cacheWriteTokens: number
+  /** Cached input divided by total input, or zero without usage data. */
+  cacheHitRate: number
   /** Total estimated cost in micro-USD. */
   estimatedCostMicros: number
   /** Primary total cost in micro-USD, reported by upstream or estimated when absent. */
   upstreamCostMicros: number
-  /** Mean time to the first generated output token in milliseconds. */
+  /** Cost calculated from the embedded official OpenAI catalog for the selected usage. */
+  officialCostMicros: number
+  /** Estimated cost divided by official catalog cost, or zero without a catalog match. */
+  estimatedCostRatio: number
+  /** Upstream cost divided by official catalog cost, or zero without a catalog match. */
+  upstreamCostRatio: number
+  /** Mean time from response headers to the first generated output token in milliseconds. */
   averageFirstTokenMs: number
   /** Requests with an observed first output token. */
   firstTokenSampleCount: number
@@ -330,7 +358,7 @@ export interface DashboardSummary {
   averageLatencyMs: number
   /** Requests with an observed final upstream response header. */
   latencySampleCount: number
-  /** Mean end-to-end request duration in milliseconds. */
+  /** Mean response-body duration after response-header latency is excluded in milliseconds. */
   averageDurationMs: number
   /** Requests included in the duration average. */
   durationSampleCount: number
@@ -377,6 +405,16 @@ export interface RouteDecisionCandidate {
   successRate: number
   /** Recent mean response-header latency in milliseconds. */
   latencyMs: number
+  /** Recent mean time from response headers to the first generated output token in milliseconds. */
+  firstTokenMs: number
+  /** Recent aggregate generated output tokens per second after the first token. */
+  tokensPerSecond: number
+  /** Normalized price advantage score used by this decision. */
+  priceScore: number
+  /** Composite first-token, response-latency, and throughput score used by this decision. */
+  efficiencyScore: number
+  /** Composite success, cache, and recent-route balance score used by this decision. */
+  qualityScore: number
   /** Recent calls with cached input divided by calls with reported input usage. */
   cacheHitRate: number
   /** Recent calls with reported input usage used for cache-hit calculation. */
@@ -399,11 +437,22 @@ export interface RouteDecisionCandidate {
   selected: boolean
 }
 
+export interface RouteDecisionWeights {
+  /** Price contribution applied to the composite route score, from zero to one. */
+  price: number
+  /** Efficiency contribution applied to the composite route score, from zero to one. */
+  efficiency: number
+  /** Residual success, cache, and route-balance contribution, from zero to one. */
+  quality: number
+}
+
 export interface RouteDecision {
   /** Model routing strategy active for this decision. */
   strategy: RoutingStrategy
   /** Probability draw or deterministic affinity mode. */
   mode: 'probability' | 'session_affinity' | 'response_affinity'
+  /** Runtime scoring proportions captured with this decision. */
+  weights: RouteDecisionWeights
   /** Eligible candidates and the exact inputs used by the decision. */
   candidates: RouteDecisionCandidate[]
 }
@@ -469,11 +518,11 @@ export interface RelayAttemptLog {
   costSource: CostSource
   /** upstream, estimated_tiktoken, mixed, or empty when unknown. */
   usageSource: string
-  /** Time from sending the upstream request to the first generated output token, or zero without a sample. */
+  /** Time from upstream response headers to the first generated output token, or zero without a sample. */
   firstTokenMs: number
   /** Time to upstream response headers in milliseconds. */
   latencyMs: number
-  /** Time from sending the upstream request until its response body ended. */
+  /** Time from upstream response headers until its response body ended. */
   durationMs: number
   /** Compatibility success flag; outcome carries the three-state result. */
   success: boolean
@@ -544,11 +593,11 @@ export interface RelayRequestLog {
   usageSource: string
   /** Number of upstream attempts made. */
   attemptCount: number
-  /** Time from gateway ingress to the first generated output token, or zero without a sample. */
+  /** Time from final upstream response headers to the first generated output token, or zero without a sample. */
   firstTokenMs: number
   /** Time from gateway ingress to the final upstream response headers, or zero without a sample. */
   latencyMs: number
-  /** End-to-end request duration in milliseconds. */
+  /** Time from final upstream response headers until the response body ended. */
   durationMs: number
   /** Whether the client requested an SSE response. */
   stream: boolean
@@ -587,7 +636,7 @@ export interface LogAggregateSummary {
   estimatedCostMicros: number
   /** Upstream cost for matching requests in micro-USD, with estimate fallback. */
   upstreamCostMicros: number
-  /** Mean time to the first generated output token in milliseconds. */
+  /** Mean time from final upstream response headers to the first generated output token in milliseconds. */
   averageFirstTokenMs: number
   /** Matching requests with an observed first output token. */
   firstTokenSampleCount: number
@@ -595,7 +644,7 @@ export interface LogAggregateSummary {
   averageLatencyMs: number
   /** Matching requests with an observed final upstream response header. */
   latencySampleCount: number
-  /** Mean end-to-end request duration in milliseconds. */
+  /** Mean response-body duration after final response-header latency is excluded in milliseconds. */
   averageDurationMs: number
   /** Matching requests included in the duration average. */
   durationSampleCount: number
@@ -674,6 +723,8 @@ export interface CodexSessionSummary {
   sessionName: string
   /** Payload field used to identify the session, or unavailable. */
   sessionSource: string
+  /** Codex thread origin such as user or ambient_suggestions, or unavailable for legacy and generic clients. */
+  threadSource: string
   /** Whether multiple requests can be reliably grouped into this session. */
   identified: boolean
   /** Request identifier used as the conservative group key when no session ID exists. */
@@ -716,7 +767,7 @@ export interface CodexSessionSummary {
   estimatedCostMicros: number
   /** Total upstream cost in micro-USD, with estimate fallback when absent. */
   upstreamCostMicros: number
-  /** Mean time to the first generated output token in milliseconds. */
+  /** Mean time from final upstream response headers to the first generated output token in milliseconds. */
   averageFirstTokenMs: number
   /** Retained requests with an observed first output token. */
   firstTokenSampleCount: number
@@ -724,7 +775,7 @@ export interface CodexSessionSummary {
   averageLatencyMs: number
   /** Retained requests with an observed final upstream response header. */
   latencySampleCount: number
-  /** Mean end-to-end request duration in milliseconds. */
+  /** Mean response-body duration after final response-header latency is excluded in milliseconds. */
   averageDurationMs: number
   /** Retained requests included in the duration average. */
   durationSampleCount: number
@@ -764,18 +815,38 @@ export interface CodexSessionDetail {
 
 export interface ApplicationSettings {
   /** HTTP listener configuration. */
-  webConfig: { host: string; port: string }
+  webConfig: {
+    /** Address bound by the HTTP server after restart. */
+    host: string
+    /** TCP port bound by the HTTP server after restart. */
+    port: string
+  }
   /** Legacy node configuration preserved when settings are saved. */
-  nodeConfig: { sharedToken: string }
+  nodeConfig: {
+    /** Shared node token preserved for backward-compatible deployments. */
+    sharedToken: string
+  }
   /** Runtime gateway limits and retention configuration. */
   gatewayConfig: {
+    /** Maximum upstream channel attempts per public request, capped at three. */
     maxAttempts: number
+    /** Maximum accepted public request body size in MiB. */
     requestBodyLimitMB: number
+    /** Maximum wait for upstream response headers in seconds. */
     responseHeaderTimeoutSeconds: number
+    /** Maximum idle interval between upstream stream reads in seconds. */
     streamIdleTimeoutSeconds: number
+    /** Price contribution percentage used for new routing decisions. */
+    routingPriceWeightPercent: number
+    /** Efficiency contribution percentage used for new routing decisions. */
+    routingEfficiencyWeightPercent: number
+    /** Administrator login session lifetime in hours. */
     sessionTTLHours: number
+    /** Whether the administrator cookie is restricted to HTTPS. */
     secureCookie: boolean
     /** Detail retained for request parameters and responses on newly entering calls. */
     payloadLogDetail: PayloadLogDetail
+    /** Upstream model IDs enabled automatically when a new channel is discovered. */
+    commonModelNames: string[]
   }
 }
