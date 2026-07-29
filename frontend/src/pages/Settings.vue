@@ -23,6 +23,8 @@ const payloadLogDetailDescriptions: Record<PayloadLogDetail, string> = {
 }
 const defaultRoutingPriceWeightPercent = 45
 const defaultRoutingEfficiencyWeightPercent = 45
+const minimumRoutingQualityWeightPercent = 5
+const maximumPrimaryRoutingWeightPercent = 100 - minimumRoutingQualityWeightPercent
 const defaultCommonModelNames = ['gpt-image-2', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini', 'codex-auto-review']
 const form = reactive<ApplicationSettings>({
   webConfig: { host: '', port: '' },
@@ -41,16 +43,43 @@ const form = reactive<ApplicationSettings>({
   },
 })
 const routingQualityWeightPercent = computed(() => 100 - form.gatewayConfig.routingPriceWeightPercent - form.gatewayConfig.routingEfficiencyWeightPercent)
-const routingPriceWeightMax = computed(() => 100 - form.gatewayConfig.routingEfficiencyWeightPercent)
-const routingEfficiencyWeightMax = computed(() => 100 - form.gatewayConfig.routingPriceWeightPercent)
+
+function clampRoutingWeight(value: number, maximum: number): number {
+  if (!Number.isFinite(value)) return 0
+  return Math.min(Math.max(Math.round(value), 0), Math.max(maximum, 0))
+}
+
+function updateRoutingPriceWeight(value: number | number[] | undefined) {
+  if (value === undefined) return
+  const next = Array.isArray(value) ? value[0] : value
+  const availableWeight = maximumPrimaryRoutingWeightPercent - form.gatewayConfig.routingEfficiencyWeightPercent
+  form.gatewayConfig.routingPriceWeightPercent = clampRoutingWeight(next, availableWeight)
+}
+
+function updateRoutingEfficiencyWeight(value: number | number[] | undefined) {
+  if (value === undefined) return
+  const next = Array.isArray(value) ? value[0] : value
+  const availableWeight = maximumPrimaryRoutingWeightPercent - form.gatewayConfig.routingPriceWeightPercent
+  form.gatewayConfig.routingEfficiencyWeightPercent = clampRoutingWeight(next, availableWeight)
+}
+
+function normalizedRoutingWeights(priceValue: number | undefined, efficiencyValue: number | undefined) {
+  const price = clampRoutingWeight(priceValue ?? defaultRoutingPriceWeightPercent, maximumPrimaryRoutingWeightPercent)
+  const efficiency = clampRoutingWeight(efficiencyValue ?? defaultRoutingEfficiencyWeightPercent, maximumPrimaryRoutingWeightPercent - price)
+  return { price, efficiency }
+}
 
 function applySettings(payload: ApplicationSettings) {
+  const routingWeights = normalizedRoutingWeights(
+    payload.gatewayConfig.routingPriceWeightPercent,
+    payload.gatewayConfig.routingEfficiencyWeightPercent,
+  )
   form.webConfig = { ...payload.webConfig }
   form.nodeConfig = { ...payload.nodeConfig }
   form.gatewayConfig = {
     ...payload.gatewayConfig,
-    routingPriceWeightPercent: payload.gatewayConfig.routingPriceWeightPercent ?? defaultRoutingPriceWeightPercent,
-    routingEfficiencyWeightPercent: payload.gatewayConfig.routingEfficiencyWeightPercent ?? defaultRoutingEfficiencyWeightPercent,
+    routingPriceWeightPercent: routingWeights.price,
+    routingEfficiencyWeightPercent: routingWeights.efficiency,
     commonModelNames: payload.gatewayConfig.commonModelNames?.length ? [...payload.gatewayConfig.commonModelNames] : [...defaultCommonModelNames],
   }
 }
@@ -68,8 +97,8 @@ async function loadSettings() {
 }
 
 async function saveSettings() {
-  if (routingQualityWeightPercent.value < 0) {
-    ElMessage.error('价格与效率占比合计不能超过 100%')
+  if (routingQualityWeightPercent.value < minimumRoutingQualityWeightPercent) {
+    ElMessage.error(`质量与均衡占比不能低于 ${minimumRoutingQualityWeightPercent}%`)
     return
   }
   saving.value = true
@@ -119,21 +148,21 @@ onMounted(loadSettings)
         <div class="settings-fields routing-weight-fields">
           <el-form-item label="价格占比">
             <div class="weight-control">
-              <el-slider v-model="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="routingPriceWeightMax" :step="5" show-stops aria-label="价格决策占比" />
-              <el-input-number v-model="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="routingPriceWeightMax" :step="5" controls-position="right" aria-label="价格决策占比百分比" />
+              <el-slider :model-value="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :step="5" show-stops aria-label="价格决策占比" @update:model-value="updateRoutingPriceWeight" />
+              <el-input-number :model-value="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :precision="0" :step="5" controls-position="right" aria-label="价格决策占比百分比" @update:model-value="updateRoutingPriceWeight" />
             </div>
           </el-form-item>
           <el-form-item label="效率占比">
             <div class="weight-control">
-              <el-slider v-model="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="routingEfficiencyWeightMax" :step="5" show-stops aria-label="效率决策占比" />
-              <el-input-number v-model="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="routingEfficiencyWeightMax" :step="5" controls-position="right" aria-label="效率决策占比百分比" />
+              <el-slider :model-value="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :step="5" show-stops aria-label="效率决策占比" @update:model-value="updateRoutingEfficiencyWeight" />
+              <el-input-number :model-value="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :precision="0" :step="5" controls-position="right" aria-label="效率决策占比百分比" @update:model-value="updateRoutingEfficiencyWeight" />
             </div>
           </el-form-item>
         </div>
         <dl class="routing-formula">
           <div><dt>价格</dt><dd>按本次预计费用相对最低费用归一化，价格越低得分越高。</dd></div>
           <div><dt>效率</dt><dd>首 token 45% + 响应头延迟 20% + 输出吞吐 35%，使用近 30 分钟成功样本。</dd></div>
-          <div><dt>质量与均衡</dt><dd>使用剩余占比计算成功率、缓存表现和近期流量均衡。</dd></div>
+          <div><dt>质量与均衡</dt><dd>始终使用价格与效率之后的剩余占比，至少保留 {{ minimumRoutingQualityWeightPercent }}%，用于成功率、缓存表现和近期流量均衡。</dd></div>
         </dl>
       </section>
 

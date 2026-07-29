@@ -104,6 +104,25 @@ func TestApplicationConfigManagerSaveUpdatesRoutingWeightsAtRuntime(t *testing.T
 	}
 }
 
+func TestRoutingDecisionWeightsReserveMinimumQualityShare(t *testing.T) {
+	valid := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 35}
+	if err := normalizeRoutingDecisionWeights(&valid); err != nil {
+		t.Fatalf("minimum quality share rejected: %v", err)
+	}
+	invalid := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 36}
+	if err := normalizeRoutingDecisionWeights(&invalid); err == nil {
+		t.Fatal("routing weights below minimum quality share were accepted")
+	}
+
+	legacy := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 40}
+	if !migrateLegacyRoutingDecisionWeights(&legacy) {
+		t.Fatal("legacy routing weights were not migrated")
+	}
+	if legacy.RoutingPriceWeightPercent != 60 || legacy.RoutingEfficiencyWeightPercent != 35 {
+		t.Fatalf("migrated routing weights = %d/%d, want 60/35", legacy.RoutingPriceWeightPercent, legacy.RoutingEfficiencyWeightPercent)
+	}
+}
+
 func TestApplyRuntimeFallbacksUsesDefaultWebAddress(t *testing.T) {
 	cfg := &ApplicationConfig{}
 	plan := startupGuidePlan{

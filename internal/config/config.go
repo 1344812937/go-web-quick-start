@@ -26,6 +26,7 @@ const (
 	DefaultWebPort                        = "8888"
 	DefaultRoutingPriceWeightPercent      = 45
 	DefaultRoutingEfficiencyWeightPercent = 45
+	MinimumRoutingQualityWeightPercent    = 5
 	PayloadLogDetailDefault               = "default"
 	PayloadLogDetailSummary               = "summary"
 	PayloadLogDetailNone                  = "none"
@@ -86,6 +87,7 @@ func (acm *ApplicationConfigManager) Load() {
 	}
 	cfg.GatewayConfig.PayloadLogDetail = payloadLogDetail
 	cfg.GatewayConfig.CommonModelNames = normalizeCommonModelNames(cfg.GatewayConfig.CommonModelNames)
+	routingWeightsMigrated := migrateLegacyRoutingDecisionWeights(&cfg.GatewayConfig)
 	if err := normalizeRoutingDecisionWeights(&cfg.GatewayConfig); err != nil {
 		panic(err)
 	}
@@ -107,6 +109,7 @@ func (acm *ApplicationConfigManager) Load() {
 	if err != nil {
 		panic(fmt.Sprintf("补全启动配置失败: %v", err))
 	}
+	needRewrite = needRewrite || routingWeightsMigrated
 	if firstRun || guidePlan.HasQuestions() || needRewrite {
 		if writeErr := writeConfigFile(configPath, &cfg); writeErr != nil {
 			panic(fmt.Sprintf("写入配置文件失败: %v", writeErr))
@@ -182,10 +185,23 @@ func normalizeRoutingDecisionWeights(gatewayConfig *GatewayConfig) error {
 	}
 	price := gatewayConfig.RoutingPriceWeightPercent
 	efficiency := gatewayConfig.RoutingEfficiencyWeightPercent
-	if price < 0 || price > 100 || efficiency < 0 || efficiency > 100 || price+efficiency > 100 {
-		return fmt.Errorf("路由价格与效率占比必须在 0%% 到 100%% 之间，且合计不能超过 100%%")
+	maximumPrimaryWeight := 100 - MinimumRoutingQualityWeightPercent
+	if price < 0 || price > maximumPrimaryWeight || efficiency < 0 || efficiency > maximumPrimaryWeight || price+efficiency > maximumPrimaryWeight {
+		return fmt.Errorf("路由价格与效率占比必须在 0%% 到 %d%% 之间，且质量与均衡占比不能低于 %d%%", maximumPrimaryWeight, MinimumRoutingQualityWeightPercent)
 	}
 	return nil
+}
+
+func migrateLegacyRoutingDecisionWeights(gatewayConfig *GatewayConfig) bool {
+	price := gatewayConfig.RoutingPriceWeightPercent
+	efficiency := gatewayConfig.RoutingEfficiencyWeightPercent
+	if price < 0 || price > 100 || efficiency < 0 || efficiency > 100 || price+efficiency <= 100-MinimumRoutingQualityWeightPercent || price+efficiency > 100 {
+		return false
+	}
+	maximumPrimaryWeight := 100 - MinimumRoutingQualityWeightPercent
+	gatewayConfig.RoutingPriceWeightPercent = min(price, maximumPrimaryWeight)
+	gatewayConfig.RoutingEfficiencyWeightPercent = min(efficiency, maximumPrimaryWeight-gatewayConfig.RoutingPriceWeightPercent)
+	return true
 }
 
 func normalizeCommonModelNames(values []string) []string {
