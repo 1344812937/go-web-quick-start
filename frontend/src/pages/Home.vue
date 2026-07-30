@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { ArrowDown, Clock, Coin, Connection, CopyDocument, DataLine, Odometer, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
+import { ArrowDown, Clock, Coin, Connection, CopyDocument, DataLine, List, Odometer, PieChart, Refresh, Tickets, Timer } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
+import ChannelDistributionChart from '@/pages/home/ChannelDistributionChart.vue'
+import type { ChannelShareMetric } from '@/pages/home/ChannelDistributionChart.vue'
 import RequestTrendChart from '@/pages/home/RequestTrendChart.vue'
 import type { Channel, ClientToken, DashboardSummary, GatewayModel } from '@/types/gateway'
 import { request } from '@/utils/api'
@@ -23,9 +25,12 @@ const quickStartExpanded = ref(false)
 
 type DashboardRangeDays = 1 | 2 | 3 | 5
 type TrendDimension = 'hour' | 'day'
+type ChannelDistributionView = 'list' | 'pie'
 
 const selectedRangeDays = ref<DashboardRangeDays>(1)
 const trendDimension = ref<TrendDimension>('hour')
+const channelDistributionView = ref<ChannelDistributionView>('list')
+const channelShareMetric = ref<ChannelShareMetric>('requests')
 const timeRangeOptions: Array<{ label: string; value: DashboardRangeDays }> = [
   { label: '当前', value: 1 },
   { label: '最近两天', value: 2 },
@@ -49,6 +54,10 @@ const trendDimensionOptions: Array<{ label: string; value: TrendDimension }> = [
   { label: '小时', value: 'hour' },
   { label: '天', value: 'day' },
 ]
+const channelShareMetricOptions: Array<{ label: string; value: ChannelShareMetric }> = [
+  { label: '请求次数', value: 'requests' },
+  { label: '总费用', value: 'cost' },
+]
 const requestTrendPoints = computed(() => trendDimension.value === 'hour'
   ? (dashboard.value?.hourly ?? []).map((hour) => ({
       key: hour.hour,
@@ -63,6 +72,7 @@ const requestTrendPoints = computed(() => trendDimension.value === 'hour'
       successes: day.successes,
     })))
 const requestTrendAriaLabel = computed(() => `${selectedRangeLabel.value}请求${trendDimension.value === 'hour' ? '小时' : '天'}维度折线图`)
+const channelDistributionAriaLabel = computed(() => `${selectedRangeLabel.value}渠道${channelShareMetric.value === 'requests' ? '请求次数' : '总费用'}占比饼图`)
 const readyChannels = computed(() => channels.value.filter((channel) => channel.enabled && (!channel.circuitOpenUntil || Date.parse(channel.circuitOpenUntil) <= Date.now())))
 const readyModels = computed(() => models.value.filter((model) => model.enabled && readyChannels.value.some((channel) => channel.models.some((mapping) => mapping.enabled && mapping.modelId === model.id))))
 const readyTokens = computed(() => tokens.value.filter((token) => token.enabled))
@@ -341,9 +351,28 @@ onMounted(loadDashboard)
         </section>
 
         <div class="dashboard-tables">
-          <section class="surface-panel">
-            <header class="panel-heading"><div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，每个请求按最终渠道统计一次</p></div></header>
-            <el-table :data="dashboard?.channels ?? []" empty-text="暂无渠道调用">
+          <section class="surface-panel channel-distribution-panel">
+            <header class="panel-heading channel-distribution-heading">
+              <div><h2>渠道分布</h2><p>{{ selectedRangeLabel }}，每个请求按最终渠道统计一次</p></div>
+              <div class="channel-distribution-actions">
+                <el-segmented
+                  v-if="channelDistributionView === 'pie'"
+                  v-model="channelShareMetric"
+                  :options="channelShareMetricOptions"
+                  size="small"
+                  aria-label="渠道占比统计方式"
+                />
+                <el-tooltip :content="channelDistributionView === 'list' ? '切换为饼图' : '切换为列表'" placement="top">
+                  <el-button
+                    class="distribution-view-button"
+                    :icon="channelDistributionView === 'list' ? PieChart : List"
+                    :aria-label="channelDistributionView === 'list' ? '切换为饼图' : '切换为列表'"
+                    @click="channelDistributionView = channelDistributionView === 'list' ? 'pie' : 'list'"
+                  />
+                </el-tooltip>
+              </div>
+            </header>
+            <el-table v-if="channelDistributionView === 'list'" :data="dashboard?.channels ?? []" empty-text="暂无渠道调用">
               <el-table-column prop="name" label="渠道" min-width="140" />
               <el-table-column label="请求" width="78" align="right"><template #default="scope">{{ formatCompactNumber(scope.row.requests) }}</template></el-table-column>
               <el-table-column label="Token" min-width="142" align="right">
@@ -356,6 +385,12 @@ onMounted(loadDashboard)
                 <template #default="scope"><div class="cost-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template>
               </el-table-column>
             </el-table>
+            <ChannelDistributionChart
+              v-else
+              :items="dashboard?.channels ?? []"
+              :metric="channelShareMetric"
+              :aria-label="channelDistributionAriaLabel"
+            />
           </section>
           <section class="surface-panel">
             <header class="panel-heading"><div><h2>模型分布</h2><p>{{ selectedRangeLabel }}，按公开模型统计</p></div></header>
@@ -435,10 +470,13 @@ onMounted(loadDashboard)
 .chart-legend i { width: 10px; height: 10px; }
 .legend-total { background: var(--rose-primary); }
 .legend-success { background: var(--rose-success); }
+.channel-distribution-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+.distribution-view-button { width: 32px; height: 32px; padding: 0; }
 .dashboard-tables { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 @media (max-width: 860px) {
   .dashboard-tables { grid-template-columns: 1fr; }
   .quick-start-body { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) { .readiness-strip { grid-template-columns: 1fr; } .readiness-strip > div { border-right: 0; border-bottom: 1px solid var(--rose-border); } .readiness-strip > div:last-child { border-bottom: 0; } .quick-start-body { padding: 12px; } }
+@media (max-width: 480px) { .channel-distribution-heading { align-items: flex-start; flex-direction: column; } .channel-distribution-actions { width: 100%; justify-content: space-between; } }
 </style>
