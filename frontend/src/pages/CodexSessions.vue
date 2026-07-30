@@ -63,6 +63,8 @@ function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
 
 function sessionSourceLabel(value: string): string {
   if (value === 'prompt_cache_key') return '缓存键'
+  if (value === 'copilot_chat_history') return 'Copilot 历史链'
+  if (value === 'copilot_header.session_id') return 'Copilot 会话 ID'
   if (value.includes('session_id')) return '客户端会话 ID'
   if (value.includes('thread_id')) return '客户端任务 ID'
   return '未识别'

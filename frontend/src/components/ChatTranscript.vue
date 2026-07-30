@@ -3,27 +3,36 @@ import { computed, ref, useId, watch } from 'vue'
 import { ArrowRight, ChatDotRound, Setting, Tools, User } from '@element-plus/icons-vue'
 import MarkdownIt from 'markdown-it'
 import type { ConversationMessage } from '@/utils/conversation'
+import { request } from '@/utils/api'
+import { formatCompactNumber } from '@/utils/formatters'
 
 interface ChatTranscriptProps {
   /** Ordered user, system, tool, and assistant messages to render. */
   messages: ConversationMessage[]
 }
 
+interface TokenCountResponse {
+  /** O200k token count for each submitted message, preserving request order. */
+  counts: number[]
+}
+
 const { messages } = defineProps<ChatTranscriptProps>()
 const markdown = new MarkdownIt({ html: false, breaks: true, linkify: true, typographer: false })
 const transcriptId = useId()
 const expandedMessageKeys = ref<Set<string>>(new Set())
+const messageTokenCounts = ref<number[]>([])
+let tokenCountRequest = 0
 markdown.renderer.rules.link_open = (tokens, index, options, _env, self) => {
   tokens[index].attrSet('target', '_blank')
   tokens[index].attrSet('rel', 'noreferrer noopener')
   return self.renderToken(tokens, index, options)
 }
 
-const renderedMessages = computed(() => messages.map((message) => ({
+const renderedMessages = computed(() => messages.map((message, index) => ({
   ...message,
   html: markdown.render(message.content),
   preview: messagePreview(message.content),
-  characterCount: [...message.content].length,
+  tokenCount: messageTokenCounts.value[index],
 })))
 
 function messageKey(message: ConversationMessage, index: number): string {
@@ -67,9 +76,21 @@ function roleIcon(role: ConversationMessage['role']) {
   return ChatDotRound
 }
 
-watch(() => messages, () => {
+watch(() => messages, async (currentMessages) => {
   expandedMessageKeys.value = new Set()
-})
+  messageTokenCounts.value = []
+  const currentRequest = ++tokenCountRequest
+  if (currentMessages.length === 0) return
+  try {
+    const result = await request<TokenCountResponse>('/admin/gateway/token-counts', {
+      method: 'POST',
+      body: JSON.stringify({ texts: currentMessages.map((message) => message.content) }),
+    })
+    if (currentRequest === tokenCountRequest) messageTokenCounts.value = result.counts
+  } catch {
+    if (currentRequest === tokenCountRequest) messageTokenCounts.value = []
+  }
+}, { immediate: true })
 </script>
 
 <template>
@@ -91,7 +112,7 @@ watch(() => messages, () => {
         <el-icon class="message-role-icon"><component :is="roleIcon(message.role)" /></el-icon>
         <strong>{{ message.label }}</strong>
         <span>{{ message.preview || '无文本内容' }}</span>
-        <small>{{ message.characterCount }} 字</small>
+        <small>{{ message.tokenCount === undefined ? '--' : formatCompactNumber(message.tokenCount) }} Token</small>
       </button>
       <div
         v-if="isMessageExpanded(message, index)"

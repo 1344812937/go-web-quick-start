@@ -452,6 +452,7 @@ export type AttemptSelectionReason =
   | 'initial_route'
   | 'response_affinity'
   | 'session_affinity'
+  | 'model_switch'
   | 'channel_disabled'
   | 'mapping_disabled'
   | 'circuit_open'

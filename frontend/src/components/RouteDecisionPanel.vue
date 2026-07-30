@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
+import { Right } from '@element-plus/icons-vue'
 import type { RouteDecision, RouteDecisionCandidate } from '@/types/gateway'
 import { formatDuration } from '@/utils/formatters'
 
@@ -9,8 +10,14 @@ interface RouteDecisionPanelProps {
 }
 
 const { decision } = defineProps<RouteDecisionPanelProps>()
-const candidates = computed(() => [...decision.candidates].sort((left, right) => right.probability - left.probability))
+const expanded = ref(false)
+const sortedCandidates = computed(() => [...decision.candidates].sort((left, right) => right.probability - left.probability))
 const isAffinityDecision = computed(() => decision.mode === 'session_affinity' || decision.mode === 'response_affinity')
+const selectedCandidate = computed(() => sortedCandidates.value.find((candidate) => candidate.selected) ?? null)
+const candidates = computed(() => {
+  if (!isAffinityDecision.value) return sortedCandidates.value
+  return sortedCandidates.value.filter((candidate) => candidate.selected)
+})
 const hasScoringWeights = computed(() => !isAffinityDecision.value && decision.weights && decision.weights.price + decision.weights.efficiency + decision.weights.quality > 0)
 
 function formatPercent(value: number): string {
@@ -69,14 +76,28 @@ function modeLabel(): string {
 
 <template>
   <section class="route-decision" :class="{ affinity: isAffinityDecision }" aria-label="路由决策参数">
-    <header>
-      <div><h4>路由决策</h4><p>{{ strategyLabel() }} · {{ modeLabel() }}</p></div>
+    <header
+      class="decision-header"
+      role="button"
+      tabindex="0"
+      :aria-expanded="expanded"
+      @click="expanded = !expanded"
+      @keydown.enter.prevent="expanded = !expanded"
+      @keydown.space.prevent="expanded = !expanded"
+    >
+      <div class="decision-title">
+        <el-icon class="decision-expand-icon" :class="{ 'is-expanded': expanded }"><Right /></el-icon>
+        <div><h4>路由策略</h4><p v-show="expanded">{{ strategyLabel() }} · {{ modeLabel() }}</p></div>
+      </div>
       <div class="decision-summary">
-        <span v-if="hasScoringWeights">价格 {{ formatPercent(decision.weights.price) }} · 效率 {{ formatPercent(decision.weights.efficiency) }} · 质量 {{ formatPercent(decision.weights.quality) }}</span>
-        <span>{{ candidates.length }} 个候选渠道</span>
+        <strong v-if="selectedCandidate"><span>命中模型</span><code>{{ selectedCandidate.upstreamModel }}</code></strong>
+        <span v-if="selectedCandidate">{{ selectedCandidate.channelName }} · {{ isAffinityDecision ? '沿用' : '已命中' }}</span>
+        <span v-else>未记录命中模型</span>
+        <span v-if="expanded && hasScoringWeights">价格 {{ formatPercent(decision.weights.price) }} · 效率 {{ formatPercent(decision.weights.efficiency) }} · 质量 {{ formatPercent(decision.weights.quality) }}</span>
+        <span v-if="expanded">{{ candidates.length }} 个候选渠道</span>
       </div>
     </header>
-    <div class="decision-table-wrap">
+    <div v-show="expanded" class="decision-table-wrap">
       <table>
         <colgroup>
           <col class="channel-column">
@@ -103,16 +124,25 @@ function modeLabel(): string {
         </tbody>
       </table>
     </div>
-    <p class="decision-note">效率分使用近 30 分钟成功样本：首 token 45% + 响应头延迟 20% + 输出吞吐 35%。价格分、效率分和质量分按当时系统配置合成，历史快照不会随后续配置变化。</p>
+    <p v-show="expanded" class="decision-note">效率分使用近 30 分钟成功样本：首 token 45% + 响应头延迟 20% + 输出吞吐 35%。价格分、效率分和质量分按当时系统配置合成，历史快照不会随后续配置变化。</p>
   </section>
 </template>
 
 <style scoped>
 .route-decision { min-width: 0; border: 1px solid var(--rose-border); background: var(--rose-surface); }
-.route-decision > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 12px 14px; border-bottom: 1px solid var(--rose-border); }
+.decision-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 12px 14px; cursor: pointer; }
+.decision-header:hover, .decision-header:focus-visible { background: var(--rose-surface-muted); outline: none; }
+.decision-header[aria-expanded="true"] { border-bottom: 1px solid var(--rose-border); }
+.decision-header:focus-visible { box-shadow: inset 0 0 0 2px var(--rose-primary); }
+.decision-title { display: flex; align-items: flex-start; gap: 9px; min-width: 0; }
+.decision-expand-icon { flex: 0 0 auto; margin-top: 2px; color: var(--rose-text-subtle); transition: transform 150ms ease; }
+.decision-expand-icon.is-expanded { transform: rotate(90deg); }
 .route-decision h4 { color: var(--rose-text); font-size: 13px; }
 .route-decision header p, .decision-note { margin-top: 3px; color: var(--rose-text-muted); font-size: 10px; }
 .decision-summary { display: grid; justify-items: end; gap: 4px; color: var(--rose-text-muted); font-size: 10px; }
+.decision-summary strong { display: flex; align-items: baseline; gap: 7px; color: var(--rose-text); font-size: 11px; }
+.decision-summary strong span { color: var(--rose-text-subtle); font-size: 9px; font-weight: 500; }
+.decision-summary code { color: var(--rose-primary-hover); overflow-wrap: anywhere; }
 .decision-table-wrap { overflow-x: auto; }
 table { width: 100%; min-width: 1180px; table-layout: fixed; border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
 .channel-column { width: 190px; }
@@ -145,7 +175,7 @@ td > small { display: block; margin-top: 4px; color: var(--rose-text-subtle); fo
 .affinity .selected .probability { color: var(--rose-success); }
 .decision-note { margin: 0; padding: 9px 14px; border-top: 1px solid var(--rose-border); line-height: 1.5; }
 @media (max-width: 560px) {
-  .route-decision > header { flex-direction: column; gap: 5px; }
+  .decision-header { flex-direction: column; gap: 8px; }
   .decision-summary { justify-items: start; }
 }
 </style>

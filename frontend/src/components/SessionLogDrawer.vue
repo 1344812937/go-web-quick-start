@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
-import { ArrowDown, ArrowUp, EditPen, Refresh, Right, View } from '@element-plus/icons-vue'
+import { ArrowDown, ArrowUp, EditPen, FullScreen, Refresh, Right, View } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import RouteDecisionPanel from '@/components/RouteDecisionPanel.vue'
@@ -21,6 +21,12 @@ interface ChannelSwitch {
   detail: string
 }
 
+interface RequestRouteSummary {
+  strategy: string
+  result: string
+  kind: 'reuse' | 'hit' | 'unavailable'
+}
+
 type SessionDetailStatus = 'all' | 'success' | 'canceled' | 'failure'
 
 const { summary } = defineProps<SessionLogDrawerProps>()
@@ -37,9 +43,11 @@ const timelineErrorMessage = ref('')
 const detail = ref<CodexSessionDetail | null>(null)
 const pagination = ref({ page: 1, pageSize: 25 })
 const payloadDialogOpen = ref(false)
+const timelineDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
 const detailStatus = ref<SessionDetailStatus>('all')
+const currentChannelExpanded = ref(false)
 const expandedRequestIds = ref<Set<string>>(new Set())
 const timelineScroller = useTemplateRef<HTMLElement>('timelineScroller')
 const detailStatusOptions: Array<{ label: string; value: SessionDetailStatus }> = [
@@ -85,6 +93,7 @@ async function renameCurrentSession() {
 const drawerTitle = computed(() => summary?.sessionName || (summary?.identified ? `会话 ${summary.sessionId}` : `未识别请求 ${summary?.fallbackRequestId ?? ''}`))
 const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requestItem, requestIndex, requests) => ({
   request: requestItem,
+  routeSummary: requestRouteSummary(requestItem),
   attempts: requestItem.attempts.map((attempt, attemptIndex) => ({
     attempt,
     channelSwitch: resolveChannelSwitch(requests, requestIndex, attemptIndex),
@@ -107,6 +116,34 @@ function formatPercent(value: number): string {
 
 function formatTiming(value: number): string {
   return value > 0 ? formatDuration(value) : '--'
+}
+
+function routeStrategyLabel(value: string): string {
+  if (value === 'lowest_cost') return '成本优先'
+  if (value === 'lowest_latency') return '效率优先'
+  if (value === 'priority_weighted') return '优先级加权'
+  return '策略未记录'
+}
+
+function requestRouteSummary(requestItem: RelayRequestLog): RequestRouteSummary {
+  const decisionAttempt = requestItem.attempts.find((attempt) => attempt.routeDecision)
+  if (decisionAttempt?.routeDecision) {
+    const decision = decisionAttempt.routeDecision
+    const selected = decision.candidates.find((candidate) => candidate.selected)
+    const target = selected?.channelName || channelLabel(decisionAttempt)
+    const affinity = decision.mode === 'session_affinity' || decision.mode === 'response_affinity'
+    return {
+      strategy: routeStrategyLabel(decision.strategy),
+      result: `${affinity ? '沿用' : '命中'} ${target}`,
+      kind: affinity ? 'reuse' : 'hit',
+    }
+  }
+  const affinityAttempt = requestItem.attempts.find((attempt) => attempt.selectionReason === 'session_affinity' || attempt.selectionReason === 'response_affinity')
+  if (affinityAttempt) return { strategy: '策略未记录', result: `沿用 ${channelLabel(affinityAttempt)}`, kind: 'reuse' }
+  const firstAttempt = requestItem.attempts[0]
+  return firstAttempt
+    ? { strategy: '策略未记录', result: `命中 ${channelLabel(firstAttempt)}`, kind: 'hit' }
+    : { strategy: '策略未记录', result: '未进入上游', kind: 'unavailable' }
 }
 
 function statusType(requestItem: RelayRequestLog): 'success' | 'warning' | 'danger' | 'info' {
@@ -147,6 +184,7 @@ function selectionReasonLabel(attempt: RelayAttemptLog): string {
     case 'circuit_opened': return '连续失败触发渠道熔断'
     case 'response_affinity': return '沿用响应固定渠道'
     case 'session_affinity': return '沿用会话固定渠道'
+    case 'model_switch': return '切换会话模型，重新选择渠道'
     default: return '首次路由选择'
   }
 }
@@ -222,6 +260,7 @@ function migrationReasonLabel(value: string): string {
     response_error: '读取上游响应失败',
     upstream_application_error: '上游业务中断',
     circuit_opened: '原渠道触发熔断',
+    model_switch: '切换会话模型',
     affinity_target_missing: '原会话渠道不可用',
     channel_disabled: '原渠道已停用',
     mapping_disabled: '原模型映射已停用',
@@ -258,6 +297,7 @@ async function refreshDetail() {
 }
 
 function handleDrawerClosed() {
+  timelineDialogOpen.value = false
   emit('closed')
 }
 
@@ -366,6 +406,8 @@ watch(
       detailStatus.value = 'all'
       detail.value = null
       selectedRequest.value = null
+      timelineDialogOpen.value = false
+      currentChannelExpanded.value = false
       expandedRequestIds.value = new Set()
     }
     void loadDetail()
@@ -403,16 +445,36 @@ watch(
       </section>
 
       <section class="current-channel-section">
-        <header><div><h3>当前渠道</h3><p>{{ detail.summary.latestModel }} · {{ detail.summary.latestEndpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</p></div><el-tag :type="currentChannelState().type" effect="plain">{{ currentChannelState().label }}</el-tag></header>
-        <div v-if="detail.summary.currentChannel" class="current-channel-grid">
+        <header>
+          <button
+            type="button"
+            class="current-channel-toggle"
+            :aria-expanded="currentChannelExpanded"
+            @click="currentChannelExpanded = !currentChannelExpanded"
+          >
+            <el-icon class="section-expand-icon" :class="{ 'is-expanded': currentChannelExpanded }"><Right /></el-icon>
+            <div>
+              <h3>当前渠道</h3>
+              <p v-if="detail.summary.currentChannel">
+                <strong>{{ detail.summary.currentChannel.channelName }}</strong>
+                <span>·</span>
+                <code>{{ detail.summary.currentChannel.upstreamModel }}</code>
+                <span>· {{ assignmentLabel(detail.summary.currentChannel.assignmentSource) }}</span>
+              </p>
+              <p v-else>{{ detail.summary.latestModel }} · 尚未进入上游渠道</p>
+            </div>
+          </button>
+          <el-tag :type="currentChannelState().type" effect="plain">{{ currentChannelState().label }}</el-tag>
+        </header>
+        <div v-if="currentChannelExpanded && detail.summary.currentChannel" class="current-channel-grid">
           <div><span>渠道</span><strong>{{ detail.summary.currentChannel.channelName }}</strong></div>
           <div><span>上游模型</span><code>{{ detail.summary.currentChannel.upstreamModel }}</code></div>
           <div><span>分配依据</span><strong>{{ assignmentLabel(detail.summary.currentChannel.assignmentSource) }}</strong></div>
           <div><span>最近使用</span><strong>{{ formatDate(detail.summary.currentChannel.lastUsedAt) }}</strong></div>
           <div class="channel-url"><span>Base URL</span><code>{{ detail.summary.currentChannel.channelBaseUrl }}</code></div>
         </div>
-        <div v-else class="muted-text">该会话尚未进入上游渠道</div>
-        <div v-if="detail.summary.currentChannel?.migrationHistory?.length" class="channel-migration-history">
+        <div v-else-if="currentChannelExpanded" class="muted-text">该会话尚未进入上游渠道</div>
+        <div v-if="currentChannelExpanded && detail.summary.currentChannel?.migrationHistory?.length" class="channel-migration-history">
           <div class="migration-heading"><strong>渠道迁移历史</strong><span>迁移后由接班渠道继续处理，直到接班渠道不可用</span></div>
           <ol>
             <li v-for="migration in detail.summary.currentChannel.migrationHistory" :key="`${migration.requestId}-${migration.occurredAt}-${migration.toChannelId}`">
@@ -427,7 +489,12 @@ watch(
         </div>
       </section>
 
-      <section class="timeline-section" aria-label="会话调用时间线">
+      <Teleport defer :disabled="!timelineDialogOpen" to="#session-timeline-dialog-host">
+      <section
+        class="timeline-section"
+        :class="{ 'is-dialog-mode': timelineDialogOpen }"
+        :aria-label="timelineDialogOpen ? '会话调用时间线对话框' : '会话调用时间线'"
+      >
         <header class="timeline-heading">
           <div><h3>调用时间线</h3><p>按调用发生时间从新到旧排列</p></div>
           <div class="timeline-heading-actions">
@@ -448,6 +515,9 @@ watch(
               </button>
             </div>
             <span>{{ formatCompactNumber(detail.requestTotal) }} 个匹配请求 · 会话共 {{ formatCompactNumber(detail.summary.attemptCount) }} 次上游尝试</span>
+            <el-tooltip v-if="!timelineDialogOpen" content="在对话框中打开" placement="top">
+              <el-button class="timeline-dialog-button" :icon="FullScreen" aria-label="在对话框中打开调用时间线" @click="timelineDialogOpen = true" />
+            </el-tooltip>
           </div>
         </header>
         <div v-loading="timelineLoading" class="timeline-list-shell">
@@ -479,13 +549,21 @@ watch(
                   </el-tooltip>
                 </div>
               </header>
+              <div v-if="!isRequestExpanded(entry.request.id)" class="request-brief" aria-label="路由和耗时摘要">
+                <span>
+                  <strong>路由策略</strong>{{ entry.routeSummary.strategy }} ·
+                  <em class="route-result" :class="`is-${entry.routeSummary.kind}`">{{ entry.routeSummary.result }}</em>
+                </span>
+                <span class="request-brief-timings">
+                  <span>首 Token {{ formatTiming(entry.request.firstTokenMs) }}</span>
+                  <i aria-hidden="true">/</i>
+                  <span>请求延迟 {{ formatTiming(entry.request.latencyMs) }}</span>
+                  <i aria-hidden="true">/</i>
+                  <span>请求耗时 {{ formatTiming(entry.request.durationMs) }}</span>
+                </span>
+              </div>
               <div v-if="isRequestExpanded(entry.request.id)" class="request-expanded">
               <div class="request-id"><code>{{ entry.request.id }}</code></div>
-              <dl class="request-timings">
-                <div><dt>首 Token</dt><dd>{{ formatTiming(entry.request.firstTokenMs) }}</dd></div>
-                <div><dt>请求延迟</dt><dd>{{ formatTiming(entry.request.latencyMs) }}</dd></div>
-                <div><dt>请求耗时</dt><dd>{{ formatTiming(entry.request.durationMs) }}</dd></div>
-              </dl>
 
               <div v-if="entry.attempts.length === 0" class="route-stage-failure">
                 <strong>请求未进入上游渠道</strong>
@@ -522,8 +600,21 @@ watch(
           </div>
         </div>
       </section>
+      </Teleport>
     </div>
   </el-drawer>
+
+  <el-dialog
+    v-model="timelineDialogOpen"
+    class="session-timeline-dialog"
+    :title="`调用时间线 · ${drawerTitle}`"
+    width="min(1480px, calc(100vw - 32px))"
+    top="3vh"
+    append-to-body
+    destroy-on-close
+  >
+    <div id="session-timeline-dialog-host" class="session-timeline-dialog-host" />
+  </el-dialog>
 
   <RequestPayloadDialog v-model="payloadDialogOpen" :request="selectedRequest" />
 </template>
@@ -541,11 +632,19 @@ watch(
 .session-summary-strip > div:last-child { border-right: 0; }
 .session-summary-strip span, .current-channel-grid span { color: var(--rose-text-muted); font-size: 11px; }
 .session-summary-strip strong { color: var(--rose-text); font-size: 15px; font-variant-numeric: tabular-nums; }
-.current-channel-section { border: 1px solid var(--rose-border); border-radius: var(--rose-radius-panel); background: var(--rose-surface); }
-.current-channel-section { padding: 16px; }
+.current-channel-section { max-height: min(42dvh, 440px); padding: 16px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--rose-border); border-radius: var(--rose-radius-panel); background: var(--rose-surface); scrollbar-gutter: stable; }
 .current-channel-section > header { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.current-channel-toggle { display: flex; min-width: 0; align-items: flex-start; gap: 9px; padding: 0; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.current-channel-toggle:hover h3, .current-channel-toggle:focus-visible h3 { color: var(--rose-primary-hover); }
+.current-channel-toggle:focus-visible { border-radius: 3px; outline: 2px solid var(--rose-primary); outline-offset: 4px; }
+.current-channel-toggle > div { min-width: 0; }
+.section-expand-icon { flex: 0 0 auto; margin-top: 2px; color: var(--rose-text-subtle); transition: transform 150ms ease; }
+.section-expand-icon.is-expanded { transform: rotate(90deg); }
 .current-channel-section h3, .timeline-heading h3 { font-size: 14px; }
 .current-channel-section p, .timeline-heading p { margin-top: 3px; color: var(--rose-text-muted); font-size: 11px; }
+.current-channel-section p { display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px; }
+.current-channel-section p strong { color: var(--rose-text); }
+.current-channel-section p code { color: var(--rose-primary-hover); overflow-wrap: anywhere; }
 .current-channel-grid { display: grid; grid-template-columns: repeat(4, minmax(120px, 1fr)); gap: 14px 20px; margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--rose-border); }
 .current-channel-grid > div { display: grid; gap: 4px; min-width: 0; }
 .channel-url { grid-column: 1 / -1; }
@@ -578,6 +677,7 @@ watch(
 .timeline-status-tabs button:disabled { cursor: wait; opacity: .65; }
 .timeline-status-tabs i { display: inline-grid; min-width: 18px; height: 18px; padding: 0 5px; place-items: center; border-radius: 9px; color: var(--rose-danger); background: var(--rose-danger-soft); font: normal 600 10px/1 var(--rose-font-mono); }
 .timeline-status-tabs button.is-active i { color: var(--rose-primary-hover); background: var(--rose-surface); }
+.timeline-dialog-button { flex: 0 0 auto; width: 32px; height: 32px; padding: 0; }
 .timeline-list-shell { position: relative; display: grid; min-width: 0; min-height: 0; grid-template-columns: minmax(0, 1fr) 44px; }
 .timeline-scroller { grid-column: 1; grid-row: 1; height: 100%; min-height: 0; overflow-y: auto; padding-right: 12px; scrollbar-gutter: stable; }
 .timeline-scroll-tools { z-index: 3; display: flex; grid-column: 2; grid-row: 1; align-self: stretch; align-items: center; justify-content: center; flex-direction: column; gap: 8px; border-left: 1px solid var(--rose-border); background: var(--rose-surface); }
@@ -586,10 +686,6 @@ watch(
 .timeline-filter-error { display: flex; grid-column: 1; grid-row: 1; min-height: 160px; align-items: center; justify-content: center; gap: 12px; color: var(--rose-danger); }
 .timeline-empty { padding: 32px 16px; color: var(--rose-text-muted); text-align: center; }
 .request-timeline { display: grid; margin: 0; padding: 0; list-style: none; }
-.request-timings { display: flex; flex-wrap: wrap; gap: 8px 22px; margin: 8px 0 0; font-variant-numeric: tabular-nums; }
-.request-timings > div { display: flex; align-items: baseline; gap: 6px; }
-.request-timings dt { color: var(--rose-text-muted); font-size: 10px; }
-.request-timings dd { margin: 0; color: var(--rose-text); font-size: 12px; font-weight: 650; }
 .request-event { position: relative; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 18px 0; }
 .request-event:not(:last-child)::before { position: absolute; top: 46px; bottom: -12px; left: 16px; width: 1px; background: var(--rose-border-strong); content: ''; }
 .request-marker { z-index: 1; display: grid; width: 33px; height: 33px; place-items: center; border: 1px solid var(--rose-primary); border-radius: 50%; color: var(--rose-primary-hover); background: var(--rose-surface); font: 600 11px/1 var(--rose-font-mono); }
@@ -603,6 +699,14 @@ watch(
 .request-expanded { padding: 0 6px 6px; }
 .request-title time { color: var(--rose-text); font-weight: 650; }
 .request-title span, .request-actions > span, .request-id { color: var(--rose-text-muted); font-size: 11px; }
+.request-brief { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 5px 18px; padding: 3px 6px 4px 44px; color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.request-brief > span { display: inline-flex; min-width: 0; align-items: baseline; flex-wrap: wrap; gap: 4px; }
+.request-brief strong { color: var(--rose-text); font-weight: 650; }
+.request-brief-timings i { color: var(--rose-border-strong); font-style: normal; }
+.route-result { font-style: normal; font-weight: 650; }
+.route-result.is-reuse { color: var(--rose-warning); }
+.route-result.is-hit { color: var(--rose-success); }
+.route-result.is-unavailable { color: var(--rose-text-subtle); }
 .request-id { margin-top: 2px; }
 .request-actions { flex: 0 0 auto; justify-content: flex-end; }
 .icon-action { width: 32px; height: 32px; padding: 0; }
@@ -616,7 +720,11 @@ watch(
 .switch-reason { flex-wrap: wrap; color: var(--rose-warning); font-size: 12px; }
 .switch-reason small { color: var(--rose-text-muted); }
 .timeline-loading, .timeline-end { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 16px; color: var(--rose-text-muted); font-size: 11px; }
+:global(.session-timeline-dialog) { max-height: 94dvh; margin-bottom: 0; }
+:global(.session-timeline-dialog .el-dialog__body) { min-height: 0; padding-top: 4px; }
+.session-timeline-dialog-host { height: calc(91dvh - 82px); min-height: 420px; }
+.timeline-section.is-dialog-mode { height: 100%; grid-template-rows: auto minmax(0, 1fr); }
 @media (max-width: 860px) { .session-summary-strip { grid-template-columns: repeat(3, 1fr); } .session-summary-strip > div:nth-child(3n) { border-right: 0; } .current-channel-grid { grid-template-columns: repeat(2, 1fr); } .migration-record { grid-template-columns: 116px minmax(0, 1fr) 24px; } .migration-reason { grid-column: 1 / -2; } .migration-view-icon { grid-column: -2 / -1; grid-row: 1; } .channel-switch-event { grid-template-columns: 1fr; gap: 4px; } }
-@media (max-width: 860px) { :global(.session-detail-drawer > .el-drawer__body) { overflow-y: auto; } .session-detail { height: auto; grid-template-rows: auto; overflow: visible; } .timeline-list-shell { height: min(62dvh, 640px); min-height: 320px; } }
-@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 860px) { :global(.session-detail-drawer > .el-drawer__body) { overflow-y: auto; } .session-detail { height: auto; grid-template-rows: auto; overflow: visible; } .current-channel-section { max-height: min(52dvh, 480px); } .timeline-list-shell { height: min(62dvh, 640px); min-height: 320px; } }
+@media (max-width: 560px) { .session-summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); } .session-summary-strip > div:nth-child(3n) { border-right: 1px solid var(--rose-border); } .session-summary-strip > div:nth-child(even), .session-summary-strip > div:last-child { border-right: 0; } .current-channel-grid { grid-template-columns: 1fr; } .current-channel-section > header, .timeline-heading, .request-header { align-items: flex-start; flex-direction: column; } .timeline-heading-actions { width: 100%; align-items: flex-start; flex-direction: column; } .request-event { grid-template-columns: 26px minmax(0, 1fr); gap: 8px; } .request-event:not(:last-child)::before { left: 12px; } .request-marker { width: 25px; height: 25px; font-size: 10px; } .request-actions { width: 100%; justify-content: flex-start; } .request-brief { padding-left: 6px; } .channel-switch-event { padding: 9px; } .switch-route { flex-wrap: wrap; } .route-stage-failure { align-items: flex-start; flex-direction: column; } }
 </style>

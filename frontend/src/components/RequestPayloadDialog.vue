@@ -13,8 +13,15 @@ interface RequestPayloadDialogProps {
 type DetailMode = 'chat' | 'source'
 
 const { request } = defineProps<RequestPayloadDialogProps>()
+
+function defaultActiveTab(): string {
+  const attempts = request?.attempts ?? []
+  const finalAttempt = attempts[attempts.length - 1]
+  return finalAttempt ? `attempt-${finalAttempt.id}` : 'original'
+}
+
 const open = defineModel<boolean>({ required: true })
-const activeTab = ref('final')
+const activeTab = ref(defaultActiveTab())
 const detailMode = ref<DetailMode>('chat')
 const detailModeOptions: Array<{ label: string; value: DetailMode }> = [
   { label: '聊天', value: 'chat' },
@@ -22,7 +29,6 @@ const detailModeOptions: Array<{ label: string; value: DetailMode }> = [
 ]
 const title = computed(() => request ? `调用详情 · ${request.id}` : '调用详情')
 const originalMessages = computed(() => requestConversation(request?.requestBody ?? ''))
-const finalMessages = computed(() => conversation(request?.requestBody ?? '', request?.responseBody ?? ''))
 const requestPayloadLogDetail = computed<PayloadLogDetail>(() => request?.payloadLogDetail || 'default')
 
 function attemptMessages(attempt: RelayAttemptLog) {
@@ -61,7 +67,7 @@ watch(
   () => [open.value, request?.id],
   ([isOpen]) => {
     if (!isOpen) return
-    activeTab.value = 'final'
+    activeTab.value = defaultActiveTab()
     detailMode.value = requestPayloadLogDetail.value === 'default' ? 'chat' : 'source'
   },
 )
@@ -75,6 +81,7 @@ watch(
     width="min(1120px, 96vw)"
     append-to-body
     destroy-on-close
+    draggable
   >
     <div v-if="request" class="payload-dialog">
       <div class="payload-toolbar">
@@ -93,7 +100,7 @@ watch(
       <el-alert v-if="retentionNotice(request.payloadLogDetail)" :title="retentionNotice(request.payloadLogDetail)" :type="request.payloadLogDetail === 'summary' ? 'warning' : 'info'" :closable="false" show-icon />
 
       <el-tabs v-model="activeTab" class="payload-tabs">
-        <el-tab-pane label="原始请求 / 增量上下文" name="original">
+        <el-tab-pane label="原始请求 / 增量上下文" name="original" lazy>
           <el-alert v-if="requestPayloadLogDetail === 'default' && request.requestBodyTruncated" title="原始正文超过 4 MiB，留存内容已截断" type="warning" :closable="false" show-icon />
           <el-alert v-if="deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />
           <ChatTranscript v-if="detailMode === 'chat'" :messages="originalMessages" />
@@ -101,7 +108,7 @@ watch(
           <div v-else class="payload-empty">{{ emptyPayloadText(request.payloadLogDetail, '没有留存原始请求正文') }}</div>
         </el-tab-pane>
 
-        <el-tab-pane v-for="(attempt, index) in request.attempts" :key="attempt.id" :label="`尝试 ${index + 1}`" :name="`attempt-${attempt.id}`">
+        <el-tab-pane v-for="(attempt, index) in request.attempts" :key="attempt.id" :label="`尝试 ${index + 1}`" :name="`attempt-${attempt.id}`" lazy>
           <div class="attempt-meta">
             <span><strong>渠道</strong>{{ attempt.channelName || `渠道 #${attempt.channelId}` }}</span>
             <span><strong>接口路径</strong><code>{{ attempt.apiPath || request.apiPath }}</code></span>
@@ -131,13 +138,6 @@ watch(
           </template>
         </el-tab-pane>
 
-        <el-tab-pane label="最终响应" name="final">
-          <el-alert v-if="requestPayloadLogDetail === 'default' && request.responseBodyTruncated" title="正文超过 4 MiB，当前内容已截断" type="warning" :closable="false" show-icon />
-          <el-alert v-if="detailMode === 'chat' && deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />
-          <ChatTranscript v-if="detailMode === 'chat'" :messages="finalMessages" />
-          <JsonCodeViewer v-else-if="request.responseBody" :value="request.responseBody" />
-          <div v-else class="payload-empty">{{ emptyPayloadText(request.payloadLogDetail, '没有留存最终响应正文') }}</div>
-        </el-tab-pane>
       </el-tabs>
     </div>
     <template #footer><el-button @click="open = false">关闭</el-button></template>
@@ -147,6 +147,7 @@ watch(
 <style scoped>
 :global(.request-payload-modal.el-dialog) { display: flex; flex-direction: column; max-height: calc(100dvh - 48px); margin: 24px auto; overflow: hidden; }
 :global(.request-payload-modal .el-dialog__header), :global(.request-payload-modal .el-dialog__footer) { flex: none; }
+:global(.request-payload-modal .el-dialog__header) { cursor: move; user-select: none; }
 :global(.request-payload-modal .el-dialog__body) { display: flex; flex: 1; min-height: 0; overflow: hidden; }
 .payload-dialog { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; }
 .payload-toolbar { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }

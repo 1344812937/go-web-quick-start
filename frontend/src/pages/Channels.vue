@@ -510,27 +510,27 @@ async function saveChannel() {
   }
   saving.value = true
   try {
-    const channel = await request<Channel>(editingId.value ? `/admin/gateway/channels/${editingId.value}` : '/admin/gateway/channels', {
-      method: editingId.value ? 'PUT' : 'POST',
+    await request<Channel>('/admin/gateway/channels/configuration', {
+      method: 'POST',
       body: JSON.stringify({
-        ...form,
-        priceMultiplierBasisPoints: Math.round(priceMultiplier.value * 10_000),
+        id: editingId.value ?? 0,
+        channel: {
+          ...form,
+          priceMultiplierBasisPoints: Math.round(priceMultiplier.value * 10_000),
+        },
+        models: mappings.value.map((item) => ({
+          modelId: item.modelId,
+          upstreamModel: item.upstreamModel,
+          priority: item.priority,
+          weight: item.weight,
+          inputPriceMicros: Math.round(item.inputPrice * 1_000_000),
+          outputPriceMicros: Math.round(item.outputPrice * 1_000_000),
+          cachedInputPriceMicros: item.cachedInputPrice === null ? null : Math.round(item.cachedInputPrice * 1_000_000),
+          cacheWritePriceMicros: item.cacheWritePrice === null ? null : Math.round(item.cacheWritePrice * 1_000_000),
+          priceMultiplierBasisPoints: Math.round(item.adjustmentMultiplier * 10_000),
+          enabled: item.enabled,
+        })),
       }),
-    })
-    await request<ChannelModel[]>(`/admin/gateway/channels/${channel.id}/models`, {
-      method: 'PUT',
-      body: JSON.stringify(mappings.value.map((item) => ({
-        modelId: item.modelId,
-        upstreamModel: item.upstreamModel,
-        priority: item.priority,
-        weight: item.weight,
-        inputPriceMicros: Math.round(item.inputPrice * 1_000_000),
-        outputPriceMicros: Math.round(item.outputPrice * 1_000_000),
-        cachedInputPriceMicros: item.cachedInputPrice === null ? null : Math.round(item.cachedInputPrice * 1_000_000),
-        cacheWritePriceMicros: item.cacheWritePrice === null ? null : Math.round(item.cacheWritePrice * 1_000_000),
-        priceMultiplierBasisPoints: Math.round(item.adjustmentMultiplier * 10_000),
-        enabled: item.enabled,
-      }))),
     })
     drawerOpen.value = false
     ElMessage.success('渠道配置已保存')
