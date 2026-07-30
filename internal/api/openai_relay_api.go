@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/1344812937/go-web-quick-start/internal/config"
@@ -86,9 +87,14 @@ func (a *OpenAIRelayApi) responses(c *gin.Context) {
 }
 
 func (a *OpenAIRelayApi) handleRelay(c *gin.Context, endpoint string) {
+	trace := gateway.NewRelayTrace()
+	c.Header("X-Request-Id", trace.RequestID())
+	authorizeStarted := time.Now()
 	token, release, publicErr := a.authorize(c)
+	trace.Record(gateway.RelayStageAccessControl, gateway.RelayStepCategoryGateway, 0, authorizeStarted, publicErr, "")
 	if publicErr != nil {
 		writeOpenAIError(c, publicErr)
+		trace.LogCompletion(publicErr.Status, publicErr.Code, nil)
 		return
 	}
 	defer release()
@@ -98,22 +104,35 @@ func (a *OpenAIRelayApi) handleRelay(c *gin.Context, endpoint string) {
 		limit = int64(cfg.GatewayConfig.RequestBodyLimitMB) << 20
 	}
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+	bodyReadStarted := time.Now()
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		var maxBytesErr *http.MaxBytesError
 		if errors.As(err, &maxBytesErr) {
-			writeOpenAIError(c, &gateway.PublicError{Status: http.StatusRequestEntityTooLarge, Message: "The request body is too large.", Type: "invalid_request_error", Code: "request_too_large"})
+			publicErr = &gateway.PublicError{Status: http.StatusRequestEntityTooLarge, Message: "The request body is too large.", Type: "invalid_request_error", Code: "request_too_large"}
+			trace.Record(gateway.RelayStageRequestBodyRead, gateway.RelayStepCategoryGateway, 0, bodyReadStarted, err, "request_too_large")
+			writeOpenAIError(c, publicErr)
+			trace.LogCompletion(publicErr.Status, publicErr.Code, nil)
 			return
 		}
-		writeOpenAIError(c, &gateway.PublicError{Status: http.StatusBadRequest, Message: "The request body could not be read.", Type: "invalid_request_error", Code: "invalid_request"})
+		publicErr = &gateway.PublicError{Status: http.StatusBadRequest, Message: "The request body could not be read.", Type: "invalid_request_error", Code: "invalid_request"}
+		trace.Record(gateway.RelayStageRequestBodyRead, gateway.RelayStepCategoryGateway, 0, bodyReadStarted, err, "body_read_failed")
+		writeOpenAIError(c, publicErr)
+		trace.LogCompletion(publicErr.Status, publicErr.Code, nil)
 		return
 	}
+	trace.Record(gateway.RelayStageRequestBodyRead, gateway.RelayStepCategoryGateway, 0, bodyReadStarted, nil, "bytes="+strconv.Itoa(len(body)))
+	payloadParseStarted := time.Now()
 	payload, err := gateway.ParseRelayPayload(body)
 	if err != nil {
-		writeOpenAIError(c, &gateway.PublicError{Status: http.StatusBadRequest, Message: err.Error(), Type: "invalid_request_error", Code: "invalid_request"})
+		publicErr = &gateway.PublicError{Status: http.StatusBadRequest, Message: err.Error(), Type: "invalid_request_error", Code: "invalid_request"}
+		trace.Record(gateway.RelayStagePayloadParse, gateway.RelayStepCategoryGateway, 0, payloadParseStarted, err, "invalid_payload")
+		writeOpenAIError(c, publicErr)
+		trace.LogCompletion(publicErr.Status, publicErr.Code, nil)
 		return
 	}
-	publicErr = a.relay.Relay(c.Request.Context(), c.Writer, c.Request.Header, c.Request.URL.RawQuery, endpoint, token, payload, body)
+	trace.Record(gateway.RelayStagePayloadParse, gateway.RelayStepCategoryGateway, 0, payloadParseStarted, nil, "endpoint="+endpoint)
+	publicErr = a.relay.RelayWithTrace(c.Request.Context(), c.Writer, c.Request.Header, c.Request.URL.RawQuery, endpoint, token, payload, body, trace)
 	if publicErr != nil && !c.Writer.Written() {
 		writeOpenAIError(c, publicErr)
 	}

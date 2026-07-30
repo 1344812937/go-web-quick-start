@@ -5,6 +5,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import RouteDecisionPanel from '@/components/RouteDecisionPanel.vue'
 import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
+import RelayStepTimeline from '@/components/RelayStepTimeline.vue'
 import type { CodexSessionDetail, CodexSessionSummary, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
@@ -44,6 +45,7 @@ const detail = ref<CodexSessionDetail | null>(null)
 const pagination = ref({ page: 1, pageSize: 25 })
 const payloadDialogOpen = ref(false)
 const timelineDialogOpen = ref(false)
+const timelineDialogReady = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
 const detailStatus = ref<SessionDetailStatus>('all')
@@ -100,7 +102,7 @@ const timelineRequests = computed(() => (detail.value?.requests ?? []).map((requ
   })),
 })))
 const hasMoreRequests = computed(() => (detail.value?.requests.length ?? 0) < (detail.value?.requestTotal ?? 0))
-const failureCount = computed(() => Math.max(0, (detail.value?.summary.requestCount ?? 0) - (detail.value?.summary.successCount ?? 0) - (detail.value?.summary.canceledCount ?? 0)))
+const failureCount = computed(() => Math.max(0, (detail.value?.summary.requestCount ?? 0) - (detail.value?.summary.successCount ?? 0) - (detail.value?.summary.canceledCount ?? 0) - (detail.value?.summary.processingCount ?? 0)))
 
 function formatDate(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'Asia/Shanghai' }).format(new Date(value))
@@ -147,6 +149,7 @@ function requestRouteSummary(requestItem: RelayRequestLog): RequestRouteSummary 
 }
 
 function statusType(requestItem: RelayRequestLog): 'success' | 'warning' | 'danger' | 'info' {
+  if (requestItem.outcome === 'processing') return 'info'
   if (requestItem.outcome === 'success' || (!requestItem.outcome && requestItem.statusCode >= 200 && requestItem.statusCode < 300)) return 'success'
   if (requestItem.outcome === 'canceled' || requestItem.statusCode === 499 || requestItem.statusCode === 408 || requestItem.statusCode === 429) return 'warning'
   if (requestItem.outcome === 'failed' || requestItem.statusCode >= 500 || requestItem.statusCode === 0) return 'danger'
@@ -154,6 +157,7 @@ function statusType(requestItem: RelayRequestLog): 'success' | 'warning' | 'dang
 }
 
 function statusLabel(requestItem: RelayRequestLog): string {
+  if (requestItem.outcome === 'processing') return '处理中'
   if (requestItem.outcome === 'success' || (!requestItem.outcome && requestItem.statusCode >= 200 && requestItem.statusCode < 300)) return `成功 · HTTP ${requestItem.statusCode}`
   if (requestItem.outcome === 'canceled' || requestItem.statusCode === 499) return '客户端取消'
   if (requestItem.statusCode > 0) return `HTTP ${requestItem.statusCode}`
@@ -383,6 +387,19 @@ function selectDetailStatus(status: SessionDetailStatus) {
   void filterDetailByStatus()
 }
 
+function openTimelineDialog() {
+  timelineDialogReady.value = false
+  timelineDialogOpen.value = true
+}
+
+function handleTimelineDialogOpened() {
+  timelineDialogReady.value = true
+}
+
+function handleTimelineDialogClose() {
+  timelineDialogReady.value = false
+}
+
 function handleTimelineScroll(event: Event) {
   const target = event.currentTarget as HTMLElement
   if (!hasMoreRequests.value || loading.value || timelineLoading.value || loadingMore.value) return
@@ -432,6 +449,7 @@ watch(
         <div><span>请求</span><strong>{{ formatCompactNumber(detail.summary.requestCount) }}</strong></div>
         <div><span>成功率</span><strong>{{ formatPercent(detail.summary.successRate) }}</strong></div>
         <div><span>取消</span><strong>{{ formatCompactNumber(detail.summary.canceledCount) }}</strong></div>
+        <div><span>处理中</span><strong>{{ formatCompactNumber(detail.summary.processingCount) }}</strong></div>
         <div><span>平均首 Token</span><strong>{{ detail.summary.firstTokenSampleCount ? formatTiming(detail.summary.averageFirstTokenMs) : '--' }}</strong></div>
         <div><span>平均请求延迟</span><strong>{{ detail.summary.latencySampleCount ? formatTiming(detail.summary.averageLatencyMs) : '--' }}</strong></div>
         <div><span>平均请求耗时</span><strong>{{ formatTiming(detail.summary.averageDurationMs) }}</strong></div>
@@ -489,11 +507,11 @@ watch(
         </div>
       </section>
 
-      <Teleport defer :disabled="!timelineDialogOpen" to="#session-timeline-dialog-host">
+      <Teleport defer :disabled="!timelineDialogReady" to="#session-timeline-dialog-host">
       <section
         class="timeline-section"
-        :class="{ 'is-dialog-mode': timelineDialogOpen }"
-        :aria-label="timelineDialogOpen ? '会话调用时间线对话框' : '会话调用时间线'"
+        :class="{ 'is-dialog-mode': timelineDialogReady }"
+        :aria-label="timelineDialogReady ? '会话调用时间线对话框' : '会话调用时间线'"
       >
         <header class="timeline-heading">
           <div><h3>调用时间线</h3><p>按调用发生时间从新到旧排列</p></div>
@@ -515,8 +533,8 @@ watch(
               </button>
             </div>
             <span>{{ formatCompactNumber(detail.requestTotal) }} 个匹配请求 · 会话共 {{ formatCompactNumber(detail.summary.attemptCount) }} 次上游尝试</span>
-            <el-tooltip v-if="!timelineDialogOpen" content="在对话框中打开" placement="top">
-              <el-button class="timeline-dialog-button" :icon="FullScreen" aria-label="在对话框中打开调用时间线" @click="timelineDialogOpen = true" />
+            <el-tooltip v-if="!timelineDialogReady" content="在对话框中打开" placement="top">
+              <el-button class="timeline-dialog-button" :icon="FullScreen" aria-label="在对话框中打开调用时间线" @click="openTimelineDialog" />
             </el-tooltip>
           </div>
         </header>
@@ -555,6 +573,8 @@ watch(
                   <em class="route-result" :class="`is-${entry.routeSummary.kind}`">{{ entry.routeSummary.result }}</em>
                 </span>
                 <span class="request-brief-timings">
+                  <span>网关前置 {{ formatTiming(entry.request.gatewayPreparationMs) }}</span>
+                  <i aria-hidden="true">/</i>
                   <span>首 Token {{ formatTiming(entry.request.firstTokenMs) }}</span>
                   <i aria-hidden="true">/</i>
                   <span>请求延迟 {{ formatTiming(entry.request.latencyMs) }}</span>
@@ -564,6 +584,8 @@ watch(
               </div>
               <div v-if="isRequestExpanded(entry.request.id)" class="request-expanded">
               <div class="request-id"><code>{{ entry.request.id }}</code></div>
+
+              <RelayStepTimeline :steps="entry.request.steps ?? []" />
 
               <div v-if="entry.attempts.length === 0" class="route-stage-failure">
                 <strong>请求未进入上游渠道</strong>
@@ -612,6 +634,8 @@ watch(
     top="3vh"
     append-to-body
     destroy-on-close
+    @opened="handleTimelineDialogOpened"
+    @close="handleTimelineDialogClose"
   >
     <div id="session-timeline-dialog-host" class="session-timeline-dialog-host" />
   </el-dialog>

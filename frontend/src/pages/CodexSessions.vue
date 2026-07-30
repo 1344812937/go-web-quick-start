@@ -39,9 +39,10 @@ function formatTiming(value: number, samples: number): string {
 }
 
 function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
-  const completedRequests = Math.max(0, row.requestCount - row.canceledCount)
+  const completedRequests = Math.max(0, row.requestCount - row.canceledCount - row.processingCount)
   const successRate = Math.min(1, Math.max(0, row.successRate))
   const volumeRisk = Math.min(1, Math.max(0, row.requestCount) / 300)
+  const requestEmphasis = Math.min(1, Math.log1p(Math.max(0, row.requestCount)) / Math.log1p(100))
   const risk = Math.min(1, volumeRisk + (1 - successRate) * (1 - volumeRisk) * 0.6)
   let tone = 'var(--rose-text-subtle)'
   if (completedRequests > 0) {
@@ -58,23 +59,27 @@ function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
     '--session-row-tone': tone,
     '--session-row-fill': `color-mix(in srgb, var(--rose-surface) ${100 - tint}%, ${tone})`,
     '--session-row-fill-hover': `color-mix(in srgb, var(--rose-surface) ${Math.max(0, 96 - tint)}%, ${tone})`,
+    '--request-count-size': `${Math.round(13 + requestEmphasis * 3)}px`,
   } as CSSProperties
 }
 
-function sessionSourceLabel(value: string): string {
-  if (value === 'prompt_cache_key') return '缓存键'
-  if (value === 'copilot_chat_history') return 'Copilot 历史链'
-  if (value === 'copilot_header.session_id') return 'Copilot 会话 ID'
-  if (value.includes('session_id')) return '客户端会话 ID'
-  if (value.includes('thread_id')) return '客户端任务 ID'
-  return '未识别'
+function sessionClientSource(session: CodexSessionSummary): { label: string; kind: 'codex' | 'copilot' | 'other' } {
+  const clientKind = session.clientKind?.trim().toLowerCase() ?? ''
+  const sessionSource = session.sessionSource?.trim().toLowerCase() ?? ''
+  if (clientKind === 'copilot' || sessionSource.startsWith('copilot')) return { label: 'Copilot', kind: 'copilot' }
+  if (clientKind === 'codex' || sessionSource === 'prompt_cache_key' || sessionSource.startsWith('client_metadata.') || sessionSource.startsWith('metadata.')) {
+    return { label: 'Codex', kind: 'codex' }
+  }
+  return { label: '其他', kind: 'other' }
 }
 
-function threadSourceBadge(value: string): { label: string; type: 'primary' | 'warning' | 'info' } {
-  if (value === 'user') return { label: '用户会话', type: 'primary' }
-  if (value === 'ambient_suggestions') return { label: '环境建议', type: 'warning' }
-  if (!value || value === 'unavailable') return { label: '来源未知', type: 'info' }
-  return { label: value.replaceAll('_', ' '), type: 'info' }
+function sessionOrigin(value: string): { label: string; kind: 'user' | 'system' | 'assistant' | 'developer' | 'other' } {
+  const source = value?.trim().toLowerCase() ?? ''
+  if (source === 'user') return { label: '用户', kind: 'user' }
+  if (source === 'system' || source === 'ambient_suggestions') return { label: 'System', kind: 'system' }
+  if (source === 'assistant') return { label: 'Assistant', kind: 'assistant' }
+  if (source === 'developer') return { label: 'Developer', kind: 'developer' }
+  return { label: '其他', kind: 'other' }
 }
 
 function channelState(session: CodexSessionSummary): { label: string; type: 'success' | 'warning' | 'danger' | 'info' } {
@@ -233,14 +238,15 @@ onMounted(async () => {
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
     <section v-else class="surface-panel table-panel log-table-panel">
       <el-table v-loading="loading" class="session-table" :data="sessions" :row-key="sessionRowKey" :row-style="sessionRowStyle" height="100%" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
-        <el-table-column label="会话" min-width="240">
+        <el-table-column label="会话" min-width="360">
           <template #default="scope">
-            <div class="session-identity">
-              <div class="session-heading">
-                <div class="session-title"><el-tag :type="scope.row.identified ? 'success' : 'info'" effect="plain">{{ sessionSourceLabel(scope.row.sessionSource) }}</el-tag><strong>{{ scope.row.sessionName || '未命名会话' }}</strong></div>
-                <el-tag class="session-thread-source" :type="threadSourceBadge(scope.row.threadSource).type" effect="plain" :title="scope.row.threadSource || 'unavailable'">{{ threadSourceBadge(scope.row.threadSource).label }}</el-tag>
+            <div class="session-identity" :class="`is-${sessionClientSource(scope.row).kind}`" :aria-label="`来源 ${sessionClientSource(scope.row).label}`">
+              <span class="session-source-watermark" aria-hidden="true">{{ sessionClientSource(scope.row).label }}</span>
+              <strong class="session-name" :title="scope.row.sessionName || '未命名会话'">{{ scope.row.sessionName || '未命名会话' }}</strong>
+              <div class="session-meta">
+                <small><code>{{ scope.row.identified ? scope.row.sessionId : scope.row.fallbackRequestId }}</code></small>
+                <span class="session-origin" :class="`is-${sessionOrigin(scope.row.threadSource).kind}`" :title="`原始来源：${scope.row.threadSource || 'unavailable'}`"><i aria-hidden="true" />{{ sessionOrigin(scope.row.threadSource).label }}</span>
               </div>
-              <small><code>{{ scope.row.identified ? scope.row.sessionId : scope.row.fallbackRequestId }}</code></small>
             </div>
           </template>
         </el-table-column>
@@ -280,16 +286,29 @@ onMounted(async () => {
 .log-table-panel { display: flex; min-width: 0; flex-direction: column; }
 .log-table-panel :deep(.el-table__inner-wrapper::before) { display: none; }
 .log-table-panel .table-pagination { flex: none; min-height: 56px; align-items: center; background: var(--rose-surface); }
-.session-identity { display: grid; min-width: 0; gap: 5px; }
-.session-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 8px; min-width: 0; }
-.session-title, .channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.session-thread-source { max-width: 96px; }
-.session-identity strong, .channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-identity { position: relative; isolation: isolate; display: grid; min-width: 0; gap: 6px; padding: 4px 6px; overflow: hidden; }
+.session-identity > *:not(.session-source-watermark) { z-index: 1; }
+.session-source-watermark { position: absolute; z-index: 0; top: 5px; right: 10px; color: var(--rose-text-subtle); font: 800 25px/1 var(--rose-font-mono); letter-spacing: 0; opacity: .12; transform: rotate(-7deg); transform-origin: right top; pointer-events: none; user-select: none; }
+.session-identity.is-codex .session-source-watermark { color: var(--rose-success); }
+.session-identity.is-copilot .session-source-watermark { color: var(--rose-primary); }
+.session-name { display: -webkit-box; max-width: 100%; padding-right: 104px; overflow: hidden; color: var(--rose-text); line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.session-meta { z-index: 1; display: flex; min-width: 0; align-items: center; gap: 8px; }
+.session-meta small { min-width: 0; flex: 1; }
+.session-origin { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 2px 6px; border: 1px solid var(--rose-border); color: var(--rose-text-muted); background: color-mix(in srgb, var(--rose-surface) 88%, transparent); font-size: 10px; line-height: 1.2; }
+.session-origin i { width: 5px; height: 5px; border-radius: 50%; background: var(--rose-text-subtle); }
+.session-origin.is-user { border-color: color-mix(in srgb, var(--rose-primary) 40%, var(--rose-border)); color: var(--rose-primary-hover); }
+.session-origin.is-user i { background: var(--rose-primary); }
+.session-origin.is-system, .session-origin.is-developer { border-color: color-mix(in srgb, var(--rose-warning) 46%, var(--rose-border)); color: var(--rose-warning); }
+.session-origin.is-system i, .session-origin.is-developer i { background: var(--rose-warning); }
+.session-origin.is-assistant { border-color: color-mix(in srgb, var(--rose-success) 42%, var(--rose-border)); color: var(--rose-success); }
+.session-origin.is-assistant i { background: var(--rose-success); }
+.channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-identity small { overflow: hidden; color: var(--rose-text-muted); text-overflow: ellipsis; white-space: nowrap; }
 .numeric-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
 .numeric-cell strong { color: var(--rose-text); }
 .numeric-cell small { color: var(--rose-text-muted); font-size: 11px; }
-.numeric-cell .request-count { color: var(--session-row-tone); }
+.numeric-cell .request-count { color: var(--session-row-tone); font-size: var(--request-count-size); }
 .session-table :deep(.el-table__body tr > td.el-table__cell) { background-color: var(--session-row-fill); transition: background-color 140ms ease; }
 .session-table :deep(.el-table__body tr:hover > td.el-table__cell) { background-color: var(--session-row-fill-hover) !important; }
 .session-table :deep(.el-table__body tr > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--session-row-tone); }

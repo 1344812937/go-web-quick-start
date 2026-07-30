@@ -1,6 +1,6 @@
 export type RoutingStrategy = 'priority_weighted' | 'lowest_cost' | 'lowest_latency'
 export type CostSource = 'upstream' | 'estimated_fallback' | 'mixed' | 'failed_zero'
-export type RelayOutcome = 'success' | 'canceled' | 'failed'
+export type RelayOutcome = 'success' | 'canceled' | 'failed' | 'processing'
 export type PayloadLogDetail = 'default' | 'summary' | 'none'
 
 export interface AdminSession {
@@ -628,6 +628,8 @@ export interface RelayRequestLog {
   reasoningEffort: string
   /** Public model requested by the client. */
   requestedModel: string
+  /** Detected client family, such as codex or copilot. */
+  clientKind: string
   /** Codex client session identifier when one could be extracted. */
   codexSessionId: string
   /** Payload field used to identify the Codex session, or unavailable. */
@@ -672,6 +674,8 @@ export interface RelayRequestLog {
   usageSource: string
   /** Number of upstream attempts made. */
   attemptCount: number
+  /** Time spent in gateway session resolution, routing, payload transformation, and request setup before the first upstream network call. */
+  gatewayPreparationMs: number
   /** Time from final upstream response headers to the first generated output token, or zero without a sample. */
   firstTokenMs: number
   /** Time from gateway ingress to the final upstream response headers, or zero without a sample. */
@@ -686,6 +690,33 @@ export interface RelayRequestLog {
   createdAt: string
   /** Ordered upstream attempts for this request. */
   attempts: RelayAttemptLog[]
+  /** Fine-grained processing stages ordered by their offset from gateway ingress. */
+  steps: RelayStepLog[]
+}
+
+export type RelayStepCategory = 'gateway' | 'upstream' | 'downstream' | 'storage'
+
+export interface RelayStepLog {
+  /** Persistent stage-row identifier. */
+  id: number
+  /** Public request UUID shared by all stages. */
+  requestId: string
+  /** Stable processing-stage code. */
+  stage: string
+  /** System boundary in which the stage ran. */
+  category: RelayStepCategory
+  /** One-based upstream attempt number, or zero for request-wide work. */
+  attempt: number
+  /** Stage start offset from gateway ingress in microseconds. */
+  startedOffsetUs: number
+  /** Measured stage duration in microseconds. */
+  durationUs: number
+  /** Stage-level completion outcome. */
+  outcome: RelayOutcome
+  /** Sanitized stage metadata without request content or credentials. */
+  detail: string
+  /** Stage start timestamp in RFC 3339 format. */
+  createdAt: string
 }
 
 export interface LogAggregateSummary {
@@ -802,6 +833,8 @@ export interface CodexSessionSummary {
   sessionName: string
   /** Payload field used to identify the session, or unavailable. */
   sessionSource: string
+  /** Detected client family, such as codex or copilot. */
+  clientKind: string
   /** Codex thread origin such as user or ambient_suggestions, or unavailable for legacy and generic clients. */
   threadSource: string
   /** Whether multiple requests can be reliably grouped into this session. */
@@ -824,6 +857,8 @@ export interface CodexSessionSummary {
   successCount: number
   /** Requests canceled by downstream clients before protocol completion. */
   canceledCount: number
+  /** Requests accepted by the gateway but not yet finalized. */
+  processingCount: number
   /** Successful retained requests divided by success/failure requests; cancellations are excluded. */
   successRate: number
   /** Total upstream attempts made by retained requests. */

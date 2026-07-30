@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue'
 import ChatTranscript from '@/components/ChatTranscript.vue'
 import JsonCodeViewer from '@/components/JsonCodeViewer.vue'
+import RelayStepTimeline from '@/components/RelayStepTimeline.vue'
 import type { PayloadLogDetail, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { conversation, deltaDescription, requestConversation } from '@/utils/conversation'
 
@@ -38,6 +39,7 @@ function attemptMessages(attempt: RelayAttemptLog) {
 function outcomeLabel(outcome: RelayRequestLog['outcome'] | RelayAttemptLog['outcome']): string {
   if (outcome === 'success') return '成功'
   if (outcome === 'canceled') return '客户端取消'
+  if (outcome === 'processing') return '处理中'
   return '失败'
 }
 
@@ -100,6 +102,10 @@ watch(
       <el-alert v-if="retentionNotice(request.payloadLogDetail)" :title="retentionNotice(request.payloadLogDetail)" :type="request.payloadLogDetail === 'summary' ? 'warning' : 'info'" :closable="false" show-icon />
 
       <el-tabs v-model="activeTab" class="payload-tabs">
+        <el-tab-pane label="阶段耗时" name="timings" lazy>
+          <RelayStepTimeline :steps="request.steps ?? []" default-expanded />
+          <div v-if="!(request.steps?.length ?? 0)" class="payload-empty">该请求没有阶段耗时记录</div>
+        </el-tab-pane>
         <el-tab-pane label="原始请求 / 增量上下文" name="original" lazy>
           <el-alert v-if="requestPayloadLogDetail === 'default' && request.requestBodyTruncated" title="原始正文超过 4 MiB，留存内容已截断" type="warning" :closable="false" show-icon />
           <el-alert v-if="deltaDescription(request.requestBody)" :title="deltaDescription(request.requestBody)" type="info" :closable="false" show-icon />

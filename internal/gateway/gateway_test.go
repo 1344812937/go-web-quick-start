@@ -127,7 +127,7 @@ func newTestStore(t *testing.T) *Store {
 	if err := db.AutoMigrate(
 		&AdminUser{}, &AdminSession{}, &Channel{}, &GatewayModel{}, &ChannelModel{},
 		&CircuitRecord{},
-		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayChatSessionClaim{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
+		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayChatSessionClaim{}, &RelayAttemptLog{}, &RelayStepLog{}, &TokenDailyStat{}, &GatewayMigration{},
 		&ResponseAffinity{}, &SessionAffinity{},
 	); err != nil {
 		t.Fatal(err)
@@ -1971,52 +1971,206 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	}
 }
 
-func TestCopilotChatSessionResolverFollowsMessageHistory(t *testing.T) {
+func TestSessionCandidateIndexesAreCreated(t *testing.T) {
 	store := newTestStore(t)
-	headers := http.Header{
-		"User-Agent":            []string{"GitHubCopilotChat/0.30.0"},
-		"Editor-Plugin-Version": []string{"copilot-chat/0.30.0"},
+	indexes := []struct {
+		model any
+		name  string
+	}{
+		{model: &RelaySessionState{}, name: "idx_relay_session_client_recent"},
+		{model: &RelayChatSessionClaim{}, name: "idx_relay_claim_client_recent"},
 	}
+	for _, index := range indexes {
+		if err := store.db.Migrator().DropIndex(index.model, index.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.ensureSessionCandidateIndexes(); err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range indexes {
+		if !store.db.Migrator().HasIndex(index.model, index.name) {
+			t.Fatalf("missing session candidate index %s", index.name)
+		}
+	}
+}
+
+func TestCopilotRequiresFixedIntegrationHeader(t *testing.T) {
+	store := newTestStore(t)
+	body := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are the GitHub Copilot CLI.\n<copilot_tauri_workspace>\nproject_session_id: abda4fa3-2495-49d6-a71c-5d147c5148db\n</copilot_tauri_workspace>"},{"role":"user","content":"hello"}]}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolution, err := store.resolveAgentSession(context.Background(), agentSessionRequest{
+		TokenID: 7, Endpoint: "chat", Headers: http.Header{"User-Agent": []string{"OpenAI/JS 5.20.1"}},
+		Payload: payload, Body: body, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAgentSessionResolution(payload, resolution)
+	if payload.ClientKind == copilotClientKind || payload.SessionKey != "" {
+		t.Fatalf("payload-only Copilot detection must be disabled: %+v", payload)
+	}
+	dynamicOnlyPayload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamicOnly, err := store.resolveAgentSession(context.Background(), agentSessionRequest{
+		TokenID: 7, Endpoint: "chat",
+		Headers: http.Header{"X-Copilot-Session-Id": []string{"must-not-identify-client"}},
+		Payload: dynamicOnlyPayload, Body: body, Now: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyAgentSessionResolution(dynamicOnlyPayload, dynamicOnly)
+	if dynamicOnlyPayload.ClientKind == copilotClientKind || dynamicOnlyPayload.SessionKey != "" {
+		t.Fatalf("dynamic data header identified Copilot without the fixed marker: %+v", dynamicOnlyPayload)
+	}
+
+	wrongHeaders := http.Header{copilotIntegrationHeader: []string{"another-client"}}
+	if (copilotAgentSessionResolver{}).Match(agentSessionRequest{Headers: wrongHeaders}) {
+		t.Fatal("unexpected Copilot match for a different fixed header value")
+	}
+	if !requestHeaderBlocked(copilotIntegrationHeader) {
+		t.Fatal("internal Copilot marker must not be forwarded upstream")
+	}
+}
+
+func TestCopilotChatUsesProjectSessionIDBeforeHistory(t *testing.T) {
+	store := newTestStore(t)
+	headers := http.Header{copilotIntegrationHeader: []string{copilotIntegrationID}, "User-Agent": []string{"OpenAI/JS 5.20.1"}}
 	now := time.Now().UTC()
-	firstBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"investigate routing"}]}`)
-	first, err := store.resolveCopilotChatSession(context.Background(), 7, headers, firstBody, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first == nil || !strings.HasPrefix(first.ID, "chat_") || first.Source != copilotChatSessionSource {
-		t.Fatalf("first inferred session = %+v", first)
-	}
-	repeated, err := store.resolveCopilotChatSession(context.Background(), 7, headers, firstBody, now.Add(time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if repeated == nil || repeated.ID != first.ID {
-		t.Fatalf("repeated request session = %+v, want %s", repeated, first.ID)
-	}
-	firstResponse := []byte(`{"choices":[{"message":{"role":"assistant","content":"routing details"}}]}`)
-	compactSessionPayload(store.db, 7, first.ID, "chat-request-1", "investigate", "", firstBody, firstResponse, now.Add(2*time.Second))
+	const sessionID = "abda4fa3-2495-49d6-a71c-5d147c5148db"
+	firstBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"rules\n<copilot_tauri_workspace>\nproject_session_id: abda4fa3-2495-49d6-a71c-5d147c5148db\nproject_id: b232c12a-5240-46d0-a7d8-4639a05c022f\n</copilot_tauri_workspace>"},{"role":"user","content":"<current_datetime>2026-07-30 12:36:00</current_datetime>\n苏卡"}]}`)
+	compressedBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"rules\n<copilot_tauri_workspace>\nproject_session_id: abda4fa3-2495-49d6-a71c-5d147c5148db\n</copilot_tauri_workspace>"},{"role":"user","content":"summary replaced the old history"}]}`)
 
-	secondBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"investigate routing"},{"role":"assistant","content":"routing details"},{"role":"user","content":"check retries too"}]}`)
-	second, err := store.resolveCopilotChatSession(context.Background(), 7, headers, secondBody, now.Add(3*time.Second))
+	for index, body := range [][]byte{firstBody, compressedBody} {
+		payload, err := ParseRelayPayload(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolution, err := store.resolveAgentSession(context.Background(), agentSessionRequest{
+			TokenID: 7, Endpoint: "chat", Headers: headers, Payload: payload, Body: body, Now: now.Add(time.Duration(index) * time.Minute),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		applyAgentSessionResolution(payload, resolution)
+		if payload.SessionKey != sessionID || payload.SessionSource != copilotChatProjectSource || payload.ClientKind != copilotClientKind {
+			t.Fatalf("Copilot Chat identity = %+v", payload)
+		}
+	}
+	if title, renamed := agentRequestSessionTitle("chat", copilotClientKind, firstBody); title != "苏卡" || renamed {
+		t.Fatalf("initial Chat title = %q, renamed=%v", title, renamed)
+	}
+	var claims int64
+	if err := store.db.Model(&RelayChatSessionClaim{}).Count(&claims).Error; err != nil || claims != 0 {
+		t.Fatalf("stable project session should bypass history claims: count=%d err=%v", claims, err)
+	}
+}
+
+func TestCopilotChatHistoryFallbackRemainsStrict(t *testing.T) {
+	store := newTestStore(t)
+	headers := http.Header{copilotIntegrationHeader: []string{copilotIntegrationID}}
+	now := time.Now().UTC()
+	firstBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"rules"},{"role":"user","content":"first"}]}`)
+	secondBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"rules"},{"role":"user","content":"first"},{"role":"assistant","content":"answer"},{"role":"user","content":"second"}]}`)
+
+	resolve := func(body []byte, at time.Time) agentSessionIdentity {
+		payload, err := ParseRelayPayload(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolution, err := store.resolveAgentSession(context.Background(), agentSessionRequest{
+			TokenID: 7, Endpoint: "chat", Headers: headers, Payload: payload, Body: body, Now: at,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolution.Identity
+	}
+	first := resolve(firstBody, now)
+	if !strings.HasPrefix(first.ID, "chat_") || first.Source != copilotChatHistorySource {
+		t.Fatalf("history fallback identity = %+v", first)
+	}
+	compactSessionPayload(store.db, 7, first.ID, "chat-request-1", "first", "", firstBody, []byte(`{"choices":[{"message":{"role":"assistant","content":"answer"}}]}`), now)
+	second := resolve(secondBody, now.Add(time.Minute))
+	if second.ID != first.ID || second.Source != copilotChatHistorySource {
+		t.Fatalf("continued history identity = %+v, want %s", second, first.ID)
+	}
+}
+
+func TestCopilotResponsesUsesPromptCacheKeyAndOwnTitleParser(t *testing.T) {
+	store := newTestStore(t)
+	headers := http.Header{copilotIntegrationHeader: []string{copilotIntegrationID}}
+	body := []byte(`{"model":"public-model","prompt_cache_key":"40c6ed6f-d1c0-4372-829a-e968a386416c","instructions":"<copilot_tauri_workspace>\nproject_session_id: da25c2e9-f42f-4255-b315-b3b189d1e0fa\n</copilot_tauri_workspace>","input":[{"role":"user","content":"<current_datetime>2026-07-30 12:36:00</current_datetime>\n认识 Copilot"}]}`)
+	payload, err := ParseRelayPayload(body)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if second == nil || second.ID != first.ID {
-		t.Fatalf("continued request session = %+v, want %s", second, first.ID)
-	}
-
-	unrelatedBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"write release notes"}]}`)
-	unrelated, err := store.resolveCopilotChatSession(context.Background(), 7, headers, unrelatedBody, now.Add(4*time.Second))
+	resolution, err := store.resolveAgentSession(context.Background(), agentSessionRequest{
+		TokenID: 7, Endpoint: "responses", Headers: headers, Payload: payload, Body: body, Now: time.Now().UTC(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if unrelated == nil || unrelated.ID == first.ID {
-		t.Fatalf("unrelated request session = %+v, first = %s", unrelated, first.ID)
+	applyAgentSessionResolution(payload, resolution)
+	if payload.SessionKey != "40c6ed6f-d1c0-4372-829a-e968a386416c" || payload.SessionSource != copilotResponsesPromptCacheSource || payload.ClientKind != copilotClientKind {
+		t.Fatalf("Copilot Responses identity = %+v", payload)
+	}
+	if title, renamed := agentRequestSessionTitle("responses", copilotClientKind, body); title != "认识 Copilot" || renamed {
+		t.Fatalf("initial Responses title = %q, renamed=%v", title, renamed)
+	}
+	renameBody := []byte(`{"model":"public-model","prompt_cache_key":"40c6ed6f-d1c0-4372-829a-e968a386416c","input":[{"type":"function_call_output","call_id":"rename-1","output":"Renamed session to \"深入了解 Copilot\"."}]}`)
+	if title, renamed := agentRequestSessionTitle("responses", copilotClientKind, renameBody); title != "深入了解 Copilot" || !renamed {
+		t.Fatalf("renamed Responses title = %q, renamed=%v", title, renamed)
+	}
+}
+
+func TestRelayPersistsCopilotResponsesIdentityAndRenamedTitle(t *testing.T) {
+	store := newTestStore(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"resp_copilot","object":"response","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}`))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	relay := newTestRelay(store)
+	headers := http.Header{copilotIntegrationHeader: []string{copilotIntegrationID}}
+	const sessionID = "40c6ed6f-d1c0-4372-829a-e968a386416c"
+	bodies := [][]byte{
+		[]byte(`{"model":"public-model","prompt_cache_key":"40c6ed6f-d1c0-4372-829a-e968a386416c","input":[{"role":"user","content":"<current_datetime>2026-07-30 12:36:00</current_datetime>\n认识 Copilot"}]}`),
+		[]byte(`{"model":"public-model","prompt_cache_key":"40c6ed6f-d1c0-4372-829a-e968a386416c","input":[{"type":"function_call_output","call_id":"rename-1","output":"Renamed session to \"深入了解 Copilot\"."}]}`),
+	}
+	for _, body := range bodies {
+		payload, err := ParseRelayPayload(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if publicErr := relay.Relay(context.Background(), httptest.NewRecorder(), headers, "", "responses", token, payload, body); publicErr != nil {
+			t.Fatal(publicErr)
+		}
 	}
 
-	nonCopilot, err := store.resolveCopilotChatSession(context.Background(), 7, http.Header{"User-Agent": []string{"generic-client/1.0"}}, firstBody, now)
-	if err != nil || nonCopilot != nil {
-		t.Fatalf("non-Copilot session = %+v, %v", nonCopilot, err)
+	var logs []RelayRequestLog
+	if err := store.db.Order("created_at ASC, id ASC").Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 || logs[0].CodexSessionID != sessionID || logs[1].CodexSessionID != sessionID {
+		t.Fatalf("Copilot Responses logs = %+v", logs)
+	}
+	if logs[0].CodexSessionSource != copilotResponsesPromptCacheSource || logs[0].SessionName != "认识 Copilot" || logs[1].SessionName != "深入了解 Copilot" {
+		t.Fatalf("Copilot Responses log metadata = %+v", logs)
+	}
+	var state RelaySessionState
+	if err := store.db.First(&state, "token_id = ? AND session_id = ?", token.ID, sessionID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if state.Title != "深入了解 Copilot" || state.SessionSource != copilotResponsesPromptCacheSource || state.ClientKind != copilotClientKind {
+		t.Fatalf("Copilot Responses state = %+v", state)
 	}
 }
 
@@ -2972,6 +3126,27 @@ func TestRelayRetriesJSONAndRewritesAuthorizationAndModel(t *testing.T) {
 	if err != nil || detail.RequestBody != string(payloadBody) || !strings.Contains(detail.ResponseBody, `"id":"chatcmpl_1"`) || !strings.Contains(detail.Attempts[0].ResponseBody, `"code":"temporary"`) {
 		t.Fatalf("log detail = %+v, %v", detail, err)
 	}
+	stageCounts := make(map[string]int)
+	for _, step := range detail.Steps {
+		if step.RequestID != requestLog.ID || step.DurationUS < 0 || step.StartedOffsetUS < 0 {
+			t.Fatalf("invalid relay step = %+v", step)
+		}
+		stageCounts[step.Stage]++
+	}
+	for _, stage := range []string{
+		RelayStageRequestLogStart, RelayStageSessionResolution, RelayStageTokenEstimation,
+		RelayStageRoutePlanning, RelayStagePayloadTransform, RelayStageCredentialDecrypt,
+		RelayStageUpstreamRequestBuild, RelayStageUpstreamWaitHeaders, RelayStageResponseBodyRead,
+		RelayStageResponseAnalysis, RelayStageAttemptLogPrepare, RelayStageResponseWrite,
+		RelayStageRequestFinalize, RelayStageRequestLogPersist,
+	} {
+		if stageCounts[stage] == 0 {
+			t.Fatalf("missing relay timing stage %q in %+v", stage, detail.Steps)
+		}
+	}
+	if stageCounts[RelayStageUpstreamWaitHeaders] != 2 || stageCounts[RelayStagePayloadTransform] != 2 {
+		t.Fatalf("attempt timing counts = %+v", stageCounts)
+	}
 	var stat TokenDailyStat
 	if err := store.db.First(&stat).Error; err != nil {
 		t.Fatal(err)
@@ -3489,6 +3664,59 @@ func TestRelayForwardsFirstSSEEventBeforeOutputToken(t *testing.T) {
 	}
 }
 
+func TestRelayPersistsProcessingLogBeforeUpstreamCompletes(t *testing.T) {
+	store := newTestStore(t)
+	upstreamStarted := make(chan struct{})
+	releaseUpstream := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		close(upstreamStarted)
+		<-releaseUpstream
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"resp_two_phase","object":"response","status":"completed","output":[]}`))
+	}))
+	defer upstream.Close()
+	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	body := []byte(`{"model":"public-model","input":"hello"}`)
+	payload, err := ParseRelayPayload(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	done := make(chan *PublicError, 1)
+	go func() {
+		done <- newTestRelay(store).Relay(context.Background(), recorder, nil, "", "responses", token, payload, body)
+	}()
+
+	select {
+	case <-upstreamStarted:
+	case <-time.After(time.Second):
+		t.Fatal("upstream request did not start")
+	}
+	var processing RelayRequestLog
+	if err := store.db.First(&processing).Error; err != nil {
+		t.Fatal(err)
+	}
+	if processing.Outcome != RelayOutcomeProcessing || processing.StatusCode != 0 || processing.RequestedModel != "public-model" {
+		t.Fatalf("processing log = %+v", processing)
+	}
+
+	close(releaseUpstream)
+	if publicErr := <-done; publicErr != nil {
+		t.Fatal(publicErr)
+	}
+	var completed RelayRequestLog
+	if err := store.db.First(&completed, "id = ?", processing.ID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if completed.Outcome != RelayOutcomeSuccess || completed.StatusCode != http.StatusOK || completed.AttemptCount != 1 {
+		t.Fatalf("completed log = %+v", completed)
+	}
+	var count int64
+	if err := store.db.Model(&RelayRequestLog{}).Count(&count).Error; err != nil || count != 1 {
+		t.Fatalf("request log count = %d, error = %v", count, err)
+	}
+}
+
 func TestRequestCostSourceBecomesMixedAcrossSuccessfulAttempts(t *testing.T) {
 	store := newTestStore(t)
 	token := ClientToken{ID: 99, Name: "mixed", KeyPrefix: "sk-mixed"}
@@ -3726,6 +3954,55 @@ func TestRelayMovesCodexSessionAffinityAfterRetryableFailure(t *testing.T) {
 	relayRequest("codex-session-b")
 	if firstCalls.Load() != 2 || secondCalls.Load() != 3 {
 		t.Fatalf("different-session calls = %d/%d, want 2/3", firstCalls.Load(), secondCalls.Load())
+	}
+}
+
+func TestRelayUsesStableCopilotSessionForRoutingAffinity(t *testing.T) {
+	store := newTestStore(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Header.Get(copilotIntegrationHeader) != "" {
+			t.Error("internal Copilot integration header was forwarded upstream")
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"id":"chatcmpl-copilot","choices":[{"message":{"role":"assistant","content":"你好"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}`))
+	}))
+	defer upstream.Close()
+	token, model, _, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
+	relay := newTestRelay(store)
+	headers := http.Header{copilotIntegrationHeader: []string{copilotIntegrationID}, "User-Agent": []string{"OpenAI/JS 5.20.1"}}
+	firstBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"<copilot_tauri_workspace>\nproject_session_id: abda4fa3-2495-49d6-a71c-5d147c5148db\n</copilot_tauri_workspace>"},{"role":"user","content":"你好"}]}`)
+	secondBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"<copilot_tauri_workspace>\nproject_session_id: abda4fa3-2495-49d6-a71c-5d147c5148db\n</copilot_tauri_workspace>"},{"role":"user","content":"压缩后的上下文"}]}`)
+
+	for _, body := range [][]byte{firstBody, secondBody} {
+		payload, err := ParseRelayPayload(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if publicErr := relay.Relay(context.Background(), httptest.NewRecorder(), headers, "", "chat", token, payload, body); publicErr != nil {
+			t.Fatal(publicErr)
+		}
+		if payload.SessionKey != "abda4fa3-2495-49d6-a71c-5d147c5148db" || payload.SessionKey != payload.LogSessionKey || payload.SessionSource != copilotChatProjectSource {
+			t.Fatalf("inferred routing identity = %+v", payload)
+		}
+	}
+
+	attempts := relayAttempts(t, store)
+	if len(attempts) != 2 || attempts[0].SelectionReason != SelectionReasonInitialRoute || attempts[1].SelectionReason != SelectionReasonSessionAffinity {
+		t.Fatalf("attempt selections = %+v", attempts)
+	}
+	var logs []RelayRequestLog
+	if err := store.db.Order("created_at ASC").Find(&logs).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 2 || logs[0].CodexSessionID == "" || logs[1].CodexSessionID != logs[0].CodexSessionID {
+		t.Fatalf("Copilot request logs = %+v", logs)
+	}
+	var affinity SessionAffinity
+	if err := store.db.Where("token_id = ? AND model_id = ? AND session_hash = ?", token.ID, model.ID, hashSecret(logs[0].CodexSessionID)).First(&affinity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if affinity.ChannelModelID != mappings[0].ID {
+		t.Fatalf("affinity mapping = %d, want %d", affinity.ChannelModelID, mappings[0].ID)
 	}
 }
 

@@ -27,6 +27,35 @@ const (
 
 var codexAuxiliarySessionSources = []string{codexTitleSessionSource, codexGuardianSessionSource}
 
+func applyCodexPayloadSession(payload *RelayPayload, values map[string]any) {
+	payload.SessionKey = stringValue(values["prompt_cache_key"])
+	if payload.SessionKey != "" {
+		payload.SessionSource = "prompt_cache_key"
+	}
+	for _, metadataKey := range []string{"client_metadata", "metadata"} {
+		if payload.SessionKey != "" {
+			break
+		}
+		metadata, _ := values[metadataKey].(map[string]any)
+		if metadata == nil {
+			continue
+		}
+		for _, field := range []string{"session_id", "thread_id"} {
+			if payload.SessionKey = stringValue(metadata[field]); payload.SessionKey != "" {
+				payload.SessionSource = metadataKey + "." + field
+				break
+			}
+		}
+	}
+	payload.SessionKey = truncateRunes(payload.SessionKey, 512)
+	if payload.SessionKey == "" {
+		payload.SessionSource = sessionUnavailable
+	}
+	payload.LogSessionKey = payload.SessionKey
+	payload.LogSessionSource = payload.SessionSource
+	payload.ThreadSource = codexThreadSourceFromPayload(values)
+}
+
 func codexThreadSourceFromPayload(payload map[string]any) string {
 	for _, metadataKey := range []string{"client_metadata", "metadata"} {
 		metadata, _ := payload[metadataKey].(map[string]any)

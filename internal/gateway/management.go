@@ -261,6 +261,7 @@ type RelayRequestView struct {
 	APIPath           string            `json:"apiPath"`
 	ReasoningEffort   string            `json:"reasoningEffort"`
 	Attempts          []RelayAttemptLog `json:"attempts"`
+	Steps             []RelayStepLog    `json:"steps"`
 }
 
 type LogPage struct {
@@ -1449,7 +1450,7 @@ func (s *ManagementService) Logs(ctx context.Context, query LogQuery) (*LogPage,
 	}
 	items := make([]RelayRequestView, 0, len(logs))
 	for _, log := range logs {
-		view, err := s.relayRequestView(ctx, log, false)
+		view, err := s.relayRequestView(ctx, log, false, false)
 		if err != nil {
 			return nil, err
 		}
@@ -1562,7 +1563,7 @@ func (s *ManagementService) LogDetail(ctx context.Context, requestID string) (*R
 	if err := s.store.db.WithContext(ctx).Where("id = ? AND created_at >= ?", requestID, cutoff).First(&log).Error; err != nil {
 		return nil, err
 	}
-	view, err := s.relayRequestView(ctx, log, true)
+	view, err := s.relayRequestView(ctx, log, true, true)
 	if err != nil {
 		return nil, err
 	}

@@ -71,6 +71,7 @@ type SessionLogSummary struct {
 	SessionID             string              `json:"sessionId"`
 	SessionName           string              `json:"sessionName"`
 	SessionSource         string              `json:"sessionSource"`
+	ClientKind            string              `json:"clientKind"`
 	ThreadSource          string              `json:"threadSource"`
 	Identified            bool                `json:"identified"`
 	FallbackRequestID     string              `json:"fallbackRequestId"`
@@ -82,6 +83,7 @@ type SessionLogSummary struct {
 	RequestCount          int64               `json:"requestCount"`
 	SuccessCount          int64               `json:"successCount"`
 	CanceledCount         int64               `json:"canceledCount"`
+	ProcessingCount       int64               `json:"processingCount"`
 	SuccessRate           float64             `json:"successRate"`
 	AttemptCount          int64               `json:"attemptCount"`
 	InputTokens           int64               `json:"inputTokens"`
@@ -152,6 +154,7 @@ func (s *ManagementService) SessionLogs(ctx context.Context, query SessionLogQue
 		"CASE WHEN codex_session_id = '' THEN id ELSE '' END AS fallback_request_id, token_id, " +
 		"COUNT(*) AS request_count, SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
 		"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
+		"SUM(CASE WHEN outcome = 'processing' THEN 1 ELSE 0 END) AS processing_count, " +
 		"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
 		"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 		"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
@@ -226,12 +229,12 @@ func finishSessionSummary(summary *SessionLogSummary, totalFirstTokenMS int64, t
 	if summary.LatencySampleCount > 0 {
 		summary.AverageLatencyMS = float64(totalLatencyMS) / float64(summary.LatencySampleCount)
 	}
-	if completedRequests := summary.RequestCount - summary.CanceledCount; completedRequests > 0 {
+	if completedRequests := summary.RequestCount - summary.CanceledCount - summary.ProcessingCount; completedRequests > 0 {
 		summary.SuccessRate = float64(summary.SuccessCount) / float64(completedRequests)
 	}
-	if summary.RequestCount > 0 {
-		summary.AverageDurationMS = float64(totalDurationMS) / float64(summary.RequestCount)
-		summary.DurationSampleCount = summary.RequestCount
+	if durationSamples := summary.RequestCount - summary.ProcessingCount; durationSamples > 0 {
+		summary.AverageDurationMS = float64(totalDurationMS) / float64(durationSamples)
+		summary.DurationSampleCount = durationSamples
 	}
 	summary.InputTokens = max(summary.InputTokens, 0)
 	summary.NormalInputTokens = max(summary.NormalInputTokens, 0)
@@ -263,6 +266,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		RequestCount      int64
 		SuccessCount      int64
 		CanceledCount     int64
+		ProcessingCount   int64
 		AttemptCount      int64
 		InputTokens       int64
 		NormalInputTokens int64
@@ -284,6 +288,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	if err := applySessionIdentity(s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).Where("created_at >= ?", cutoff), query).
 		Select("COUNT(*) AS request_count, SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) AS success_count, " +
 			"SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END) AS canceled_count, " +
+			"SUM(CASE WHEN outcome = 'processing' THEN 1 ELSE 0 END) AS processing_count, " +
 			"COALESCE(SUM(attempt_count), 0) AS attempt_count, COALESCE(SUM(input_tokens), 0) AS input_tokens, " +
 			"COALESCE(SUM(normal_input_tokens), 0) AS normal_input_tokens, " +
 			"COALESCE(SUM(output_tokens), 0) AS output_tokens, COALESCE(SUM(cached_tokens), 0) AS cached_tokens, " +
@@ -307,6 +312,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 		RequestCount:          aggregate.RequestCount,
 		SuccessCount:          aggregate.SuccessCount,
 		CanceledCount:         aggregate.CanceledCount,
+		ProcessingCount:       aggregate.ProcessingCount,
 		AttemptCount:          aggregate.AttemptCount,
 		InputTokens:           aggregate.InputTokens,
 		NormalInputTokens:     aggregate.NormalInputTokens,
@@ -336,7 +342,7 @@ func (s *ManagementService) SessionLogDetail(ctx context.Context, query SessionD
 	}
 	requests := make([]RelayRequestView, 0, len(logs))
 	for _, log := range logs {
-		view, err := s.relayRequestView(ctx, log, false)
+		view, err := s.relayRequestView(ctx, log, false, true)
 		if err != nil {
 			return nil, err
 		}
@@ -388,6 +394,7 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 			if strings.TrimSpace(state.Title) != "" {
 				summary.SessionName = state.Title
 			}
+			summary.ClientKind = state.ClientKind
 			summary.ThreadSource = state.ThreadSource
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
@@ -400,6 +407,9 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 		return err
 	}
 	summary.TokenID = latest.TokenID
+	if summary.ClientKind == "" {
+		summary.ClientKind = latest.ClientKind
+	}
 	summary.TokenName = latest.TokenName
 	summary.TokenKeyPrefix = latest.TokenKeyPrefix
 	if summary.TokenName == "" || summary.TokenKeyPrefix == "" {
@@ -635,7 +645,7 @@ func (s *ManagementService) sessionChannelHistory(ctx context.Context, summary S
 	return history, nil
 }
 
-func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog, includePayloads bool) (RelayRequestView, error) {
+func (s *ManagementService) relayRequestView(ctx context.Context, log RelayRequestLog, includePayloads bool, includeSteps bool) (RelayRequestView, error) {
 	if includePayloads {
 		log.RequestBody = decompressStoredPayload(log.RequestBody)
 		log.ResponseBody = decompressStoredPayload(log.ResponseBody)
@@ -647,6 +657,13 @@ func (s *ManagementService) relayRequestView(ctx context.Context, log RelayReque
 	}
 	if err := attemptDB.Order("created_at ASC, id ASC").Find(&attempts).Error; err != nil {
 		return RelayRequestView{}, err
+	}
+	steps := make([]RelayStepLog, 0)
+	if includeSteps {
+		if err := s.store.db.WithContext(ctx).Where("request_id = ?", log.ID).
+			Order("started_offset_us ASC, id ASC").Find(&steps).Error; err != nil {
+			return RelayRequestView{}, err
+		}
 	}
 	channelCache := make(map[uint64]Channel)
 	for index := range attempts {
@@ -694,6 +711,7 @@ func (s *ManagementService) relayRequestView(ctx context.Context, log RelayReque
 		APIPath:           apiPath,
 		ReasoningEffort:   requestReasoningEffort(parameters),
 		Attempts:          attempts,
+		Steps:             steps,
 	}, nil
 }
 

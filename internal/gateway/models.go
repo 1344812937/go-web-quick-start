@@ -31,6 +31,7 @@ const (
 	RelayOutcomeSuccess                           = "success"
 	RelayOutcomeCanceled                          = "canceled"
 	RelayOutcomeFailed                            = "failed"
+	RelayOutcomeProcessing                        = "processing"
 	CircuitLevelClosed                            = 0
 	CircuitLevelTemporary                         = 1
 	CircuitLevelExtended                          = 2
@@ -149,6 +150,7 @@ type RelayRequestLog struct {
 	TokenKeyPrefix        string    `gorm:"size:24" json:"tokenKeyPrefix"`
 	Endpoint              string    `gorm:"size:40;not null" json:"endpoint"`
 	RequestedModel        string    `gorm:"size:200;index;not null" json:"requestedModel"`
+	ClientKind            string    `gorm:"size:32;index" json:"clientKind"`
 	CodexSessionID        string    `gorm:"size:512;index" json:"codexSessionId"`
 	CodexSessionSource    string    `gorm:"size:48;index" json:"codexSessionSource"`
 	SessionName           string    `gorm:"size:80;index" json:"sessionName"`
@@ -174,6 +176,7 @@ type RelayRequestLog struct {
 	CostSource            string    `gorm:"size:32" json:"costSource"`
 	UsageSource           string    `gorm:"size:32" json:"usageSource"`
 	AttemptCount          int       `gorm:"not null;default:0" json:"attemptCount"`
+	GatewayPreparationMS  int64     `gorm:"not null;default:0" json:"gatewayPreparationMs"`
 	FirstTokenMS          int64     `gorm:"not null;default:0" json:"firstTokenMs"`
 	LatencyMS             int64     `gorm:"not null;default:0" json:"latencyMs"`
 	DurationMS            int64     `gorm:"not null;default:0" json:"durationMs"`
@@ -200,31 +203,31 @@ func (log *RelayRequestLog) BeforeCreate(_ *gorm.DB) error {
 // RelaySessionState keeps the small amount of state needed to name a session
 // and remove context already retained by its preceding request logs.
 type RelaySessionState struct {
-	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false" json:"tokenId"`
+	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false;index:idx_relay_session_client_recent,priority:1" json:"tokenId"`
 	SessionID           string    `gorm:"size:512;primaryKey" json:"sessionId"`
 	Title               string    `gorm:"size:80;index" json:"title"`
 	TitleCustomized     bool      `gorm:"not null;default:false" json:"titleCustomized"`
 	ThreadSource        string    `gorm:"size:48;index" json:"threadSource"`
 	SessionSource       string    `gorm:"size:48;index" json:"sessionSource"`
 	ClientKind          string    `gorm:"size:32;index" json:"clientKind"`
-	ClientFingerprint   string    `gorm:"size:64;index" json:"-"`
+	ClientFingerprint   string    `gorm:"size:64;index;index:idx_relay_session_client_recent,priority:2" json:"-"`
 	LatestRequestID     string    `gorm:"size:36" json:"latestRequestId"`
 	RequestManifestJSON string    `gorm:"type:text" json:"-"`
 	PayloadManifestJSON string    `gorm:"type:text" json:"-"`
 	CreatedAt           time.Time `json:"createdAt"`
-	UpdatedAt           time.Time `gorm:"index" json:"updatedAt"`
+	UpdatedAt           time.Time `gorm:"index;index:idx_relay_session_client_recent,priority:3,sort:desc" json:"updatedAt"`
 }
 
 // RelayChatSessionClaim maps one canonical Chat Completions history to the
 // inferred session selected before the upstream request starts.
 type RelayChatSessionClaim struct {
-	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false"`
-	ClientFingerprint   string    `gorm:"size:64;primaryKey"`
+	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false;index:idx_relay_claim_client_recent,priority:1"`
+	ClientFingerprint   string    `gorm:"size:64;primaryKey;index:idx_relay_claim_client_recent,priority:2"`
 	RequestHistoryHash  string    `gorm:"size:64;primaryKey"`
 	SessionID           string    `gorm:"size:512;index;not null"`
 	RequestManifestJSON string    `gorm:"type:text;not null"`
 	CreatedAt           time.Time `gorm:"index"`
-	UpdatedAt           time.Time `gorm:"index"`
+	UpdatedAt           time.Time `gorm:"index;index:idx_relay_claim_client_recent,priority:3,sort:desc"`
 }
 
 type RelayAttemptLog struct {
@@ -270,6 +273,21 @@ type RelayAttemptLog struct {
 	Outcome               string         `gorm:"size:16;index;not null;default:failed" json:"outcome"`
 	ErrorMessage          string         `gorm:"type:text" json:"errorMessage"`
 	CreatedAt             time.Time      `gorm:"index" json:"createdAt"`
+}
+
+// RelayStepLog is one measured stage in a relayed API request. Durations use
+// microseconds so short gateway operations remain useful during optimization.
+type RelayStepLog struct {
+	ID              uint64    `gorm:"primaryKey;autoIncrement" json:"id"`
+	RequestID       string    `gorm:"size:36;index;index:idx_relay_step_request_order,priority:1;not null" json:"requestId"`
+	Stage           string    `gorm:"size:64;index;not null" json:"stage"`
+	Category        string    `gorm:"size:24;index;not null" json:"category"`
+	Attempt         int       `gorm:"not null;default:0" json:"attempt"`
+	StartedOffsetUS int64     `gorm:"index:idx_relay_step_request_order,priority:2;not null;default:0" json:"startedOffsetUs"`
+	DurationUS      int64     `gorm:"not null;default:0" json:"durationUs"`
+	Outcome         string    `gorm:"size:16;index;not null" json:"outcome"`
+	Detail          string    `gorm:"size:512" json:"detail"`
+	CreatedAt       time.Time `gorm:"index;not null" json:"createdAt"`
 }
 
 func (log *RelayAttemptLog) BeforeCreate(_ *gorm.DB) error {

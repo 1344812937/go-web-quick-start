@@ -38,47 +38,7 @@ func ParseRelayPayload(data []byte) (*RelayPayload, error) {
 	payload := &RelayPayload{values: values, Model: model}
 	payload.Stream, _ = values["stream"].(bool)
 	payload.PreviousResponseID, _ = values["previous_response_id"].(string)
-	payload.SessionKey = stringValue(values["prompt_cache_key"])
-	if payload.SessionKey != "" {
-		payload.SessionSource = "prompt_cache_key"
-	}
-	if payload.SessionKey == "" {
-		if metadata, ok := values["client_metadata"].(map[string]any); ok {
-			payload.SessionKey = stringValue(metadata["session_id"])
-			if payload.SessionKey != "" {
-				payload.SessionSource = "client_metadata.session_id"
-			}
-			if payload.SessionKey == "" {
-				payload.SessionKey = stringValue(metadata["thread_id"])
-				if payload.SessionKey != "" {
-					payload.SessionSource = "client_metadata.thread_id"
-				}
-			}
-		}
-	}
-	if payload.SessionKey == "" {
-		if metadata, ok := values["metadata"].(map[string]any); ok {
-			payload.SessionKey = stringValue(metadata["session_id"])
-			if payload.SessionKey != "" {
-				payload.SessionSource = "metadata.session_id"
-			}
-			if payload.SessionKey == "" {
-				payload.SessionKey = stringValue(metadata["thread_id"])
-				if payload.SessionKey != "" {
-					payload.SessionSource = "metadata.thread_id"
-				}
-			}
-		}
-	}
-	if payload.SessionKey != "" {
-		payload.SessionKey = truncateRunes(payload.SessionKey, 512)
-	}
-	if payload.SessionKey == "" {
-		payload.SessionSource = "unavailable"
-	}
-	payload.LogSessionKey = payload.SessionKey
-	payload.LogSessionSource = payload.SessionSource
-	payload.ThreadSource = codexThreadSourceFromPayload(values)
+	applyCodexPayloadSession(payload, values)
 	for _, key := range []string{"max_output_tokens", "max_completion_tokens", "max_tokens"} {
 		if value, ok := values[key].(json.Number); ok {
 			parsed, _ := value.Int64()

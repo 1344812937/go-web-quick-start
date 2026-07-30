@@ -65,11 +65,15 @@ func (s *Store) migrate() error {
 		&RelaySessionState{},
 		&RelayChatSessionClaim{},
 		&RelayAttemptLog{},
+		&RelayStepLog{},
 		&TokenDailyStat{},
 		&GatewayMigration{},
 		&ResponseAffinity{},
 		&SessionAffinity{},
 	); err != nil {
+		return err
+	}
+	if err := s.ensureSessionCandidateIndexes(); err != nil {
 		return err
 	}
 	if err := s.backfillTokenDailyStats(); err != nil {
@@ -106,6 +110,18 @@ func (s *Store) migrate() error {
 		return err
 	}
 	return s.reclaimSQLiteSpaceOnce()
+}
+
+func (s *Store) ensureSessionCandidateIndexes() error {
+	for _, statement := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_relay_session_client_recent ON relay_session_states(token_id, client_fingerprint, updated_at DESC)",
+		"CREATE INDEX IF NOT EXISTS idx_relay_claim_client_recent ON relay_chat_session_claims(token_id, client_fingerprint, updated_at DESC)",
+	} {
+		if err := s.db.Exec(statement).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Store) backfillCircuitLevels() error {
@@ -456,6 +472,7 @@ func (s *Store) cleanupExpired() {
 	detailCutoff := now.Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	requestCutoff := now.UTC().Add(-DetailedLogRetentionDays * 24 * time.Hour)
 	_ = s.db.Where("created_at < ?", detailCutoff).Delete(&RelayAttemptLog{}).Error
+	_ = s.db.Where("created_at < ?", detailCutoff).Delete(&RelayStepLog{}).Error
 	_ = s.db.Where("created_at < ?", requestCutoff).Delete(&RelayRequestLog{}).Error
 	_ = s.db.Where("updated_at < ?", detailCutoff).Delete(&RelaySessionState{}).Error
 	_ = s.db.Where("updated_at < ?", detailCutoff).Delete(&RelayChatSessionClaim{}).Error
