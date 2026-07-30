@@ -104,23 +104,54 @@ func codexTitleRequestPrompt(body []byte) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	text, _ := payload["text"].(map[string]any)
-	format, _ := text["format"].(map[string]any)
-	if format["type"] != "json_schema" || format["name"] != "codex_output_schema" {
+	if !payloadRequestsTitleSchema(payload) {
 		return "", false
+	}
+	instruction := ""
+	if input, exists := payload["input"]; exists {
+		instruction = latestResponsesInputText(input)
+	} else if messages, ok := payload["messages"].([]any); ok {
+		instruction = latestUserMessageText(messages)
+	}
+	instruction = normalizeCodexPrompt(instruction)
+	if instruction == "" {
+		return "", false
+	}
+	for _, marker := range []string{codexTitlePromptMarker, "Original prompt:", "User request:", "Prompt:", "用户请求：", "用户问题："} {
+		if markerIndex := strings.LastIndex(strings.ToLower(instruction), strings.ToLower(marker)); markerIndex >= 0 {
+			prompt := normalizeCodexPrompt(instruction[markerIndex+len(marker):])
+			if prompt != "" {
+				return prompt, true
+			}
+		}
+	}
+	return instruction, true
+}
+
+func payloadRequestsTitleSchema(payload map[string]any) bool {
+	if text, ok := payload["text"].(map[string]any); ok {
+		if format, ok := text["format"].(map[string]any); ok && titleSchema(format) {
+			return true
+		}
+	}
+	responseFormat, _ := payload["response_format"].(map[string]any)
+	if responseFormat == nil || responseFormat["type"] != "json_schema" {
+		return false
+	}
+	if nested, ok := responseFormat["json_schema"].(map[string]any); ok {
+		return titleSchema(nested)
+	}
+	return titleSchema(responseFormat)
+}
+
+func titleSchema(format map[string]any) bool {
+	if format["type"] != nil && format["type"] != "json_schema" {
+		return false
 	}
 	schema, _ := format["schema"].(map[string]any)
 	properties, _ := schema["properties"].(map[string]any)
-	if len(properties) != 2 || properties["title"] == nil || properties["description"] == nil {
-		return "", false
-	}
-	instruction := latestResponsesInputText(payload["input"])
-	markerIndex := strings.Index(instruction, codexTitlePromptMarker)
-	if markerIndex < 0 {
-		return "", false
-	}
-	prompt := normalizeCodexPrompt(instruction[markerIndex+len(codexTitlePromptMarker):])
-	return prompt, prompt != ""
+	_, hasTitle := properties["title"]
+	return hasTitle
 }
 
 func normalizeCodexPrompt(value string) string {
@@ -149,9 +180,25 @@ func hashCodexPrompt(value string) string {
 }
 
 func codexGeneratedTitle(responseBody []byte) string {
-	output := responsesOutputText(responseBody)
+	output := strings.TrimSpace(responsesOutputText(responseBody))
 	if output == "" {
 		return ""
+	}
+	if strings.HasPrefix(output, "```") {
+		lines := strings.Split(output, "\n")
+		if len(lines) >= 3 {
+			output = strings.Join(lines[1:len(lines)-1], "\n")
+		}
+	}
+	for range 2 {
+		var unquoted string
+		if json.Unmarshal([]byte(output), &unquoted) != nil {
+			break
+		}
+		output = strings.TrimSpace(unquoted)
+	}
+	if start, end := strings.Index(output, "{"), strings.LastIndex(output, "}"); start >= 0 && end > start {
+		output = output[start : end+1]
 	}
 	var result struct {
 		Title string `json:"title"`
@@ -224,7 +271,37 @@ func responseObjectText(payload map[string]any) string {
 		item, _ := rawItem.(map[string]any)
 		result.WriteString(contentText(item["content"]))
 	}
+	if result.Len() == 0 {
+		if choices, ok := payload["choices"].([]any); ok {
+			for _, rawChoice := range choices {
+				choice, _ := rawChoice.(map[string]any)
+				message, _ := choice["message"].(map[string]any)
+				result.WriteString(contentText(message["content"]))
+			}
+		}
+	}
 	return result.String()
+}
+
+func codexTitleMatchesMain(titleBody []byte, mainBody []byte, titleHash string, mainHash string) bool {
+	if titleHash != "" && mainHash != "" && titleHash == mainHash {
+		return true
+	}
+	mainPrompt := normalizeCodexPrompt(codexRequestPrompt(mainBody))
+	if mainPrompt == "" {
+		return false
+	}
+	titlePayload, ok := decodeJSONObject(titleBody)
+	if !ok {
+		return false
+	}
+	instruction := ""
+	if input, exists := titlePayload["input"]; exists {
+		instruction = latestResponsesInputText(input)
+	} else if messages, ok := titlePayload["messages"].([]any); ok {
+		instruction = latestUserMessageText(messages)
+	}
+	return strings.Contains(strings.ToLower(normalizeCodexPrompt(instruction)), strings.ToLower(mainPrompt))
 }
 
 func (s *Store) mergePrecedingCodexTitleRequest(db *gorm.DB, log *RelayRequestLog, rawBody []byte, mainStartedAt time.Time) (string, error) {
@@ -269,7 +346,8 @@ func (s *Store) mergePrecedingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 			}
 			candidatePromptHash = hashCodexPrompt(titlePrompt)
 		}
-		if candidatePromptHash != mainPromptHash {
+		candidateBody := []byte(decompressStoredPayload(candidate.RequestBody))
+		if !codexTitleMatchesMain(candidateBody, rawBody, candidatePromptHash, mainPromptHash) {
 			continue
 		}
 		var candidateRequestCount int64
@@ -294,7 +372,7 @@ func (s *Store) mergePrecedingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 }
 
 func (s *Store) mergeFollowingCodexTitleRequest(db *gorm.DB, log *RelayRequestLog, titleStartedAt time.Time) (string, string, error) {
-	if log.CodexSessionID == "" || log.CodexSessionSource != "prompt_cache_key" || !log.CodexTitleRequest || log.CodexGeneratedTitle == "" || log.CodexPromptHash == "" {
+	if log.CodexSessionID == "" || log.CodexSessionSource != "prompt_cache_key" || !log.CodexTitleRequest || log.CodexGeneratedTitle == "" {
 		return "", "", nil
 	}
 	var candidates []RelayRequestLog
@@ -315,7 +393,9 @@ func (s *Store) mergeFollowingCodexTitleRequest(db *gorm.DB, log *RelayRequestLo
 		if candidatePromptHash == "" {
 			candidatePromptHash = hashCodexPrompt(codexRequestPrompt([]byte(decompressStoredPayload(candidate.RequestBody))))
 		}
-		if candidatePromptHash != log.CodexPromptHash {
+		titleBody := []byte(decompressStoredPayload(log.RequestBody))
+		candidateBody := []byte(decompressStoredPayload(candidate.RequestBody))
+		if !codexTitleMatchesMain(titleBody, candidateBody, log.CodexPromptHash, candidatePromptHash) {
 			continue
 		}
 		title, err := s.mergeCodexTitleLog(db, *log, candidate.CodexSessionID, log.CodexGeneratedTitle)
@@ -376,7 +456,7 @@ func (s *Store) applyMergedCodexTitle(db *gorm.DB, tokenID uint64, sessionID str
 }
 
 func (s *Store) backfillCodexAuxiliarySessions() error {
-	const migrationName = "codex_auxiliary_sessions_v2"
+	const migrationName = "codex_auxiliary_sessions_v3"
 	var migration GatewayMigration
 	err := s.db.First(&migration, "name = ?", migrationName).Error
 	if err == nil {
@@ -407,7 +487,7 @@ func (s *Store) backfillCodexAuxiliarySessions() error {
 		var titleRequests []RelayRequestLog
 		if err := db.Select("id, token_id, codex_session_id, codex_session_source, session_name, request_body, response_body, latency_ms, duration_ms, created_at").
 			Where("created_at >= ? AND codex_session_source = ? AND outcome = ?", cutoff, "prompt_cache_key", RelayOutcomeSuccess).
-			Where("request_parameters_json LIKE ?", `%"text_format":"json_schema"%`).
+			Where("request_parameters_json LIKE ? OR request_parameters_json LIKE ?", `%"text_format":"json_schema"%`, `%"response_format":{"type":"json_schema"%`).
 			Order("created_at ASC, id ASC").Find(&titleRequests).Error; err != nil {
 			return err
 		}
@@ -433,7 +513,9 @@ func (s *Store) backfillCodexAuxiliarySessions() error {
 				if mainStartedAt.Before(titleStartedAt.Add(-codexTitleStartTolerance)) || mainStartedAt.After(titleStartedAt.Add(codexTitleStartTolerance)) {
 					continue
 				}
-				if codexRequestPrompt([]byte(decompressStoredPayload(mainRequest.RequestBody))) != titlePrompt {
+				titleBody := []byte(decompressStoredPayload(titleRequest.RequestBody))
+				mainBody := []byte(decompressStoredPayload(mainRequest.RequestBody))
+				if !codexTitleMatchesMain(titleBody, mainBody, hashCodexPrompt(titlePrompt), hashCodexPrompt(codexRequestPrompt(mainBody))) {
 					continue
 				}
 				mergedTitle, err := s.mergeCodexTitleLog(db, titleRequest, mainRequest.CodexSessionID, title)

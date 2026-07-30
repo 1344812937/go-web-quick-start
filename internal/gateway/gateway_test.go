@@ -127,7 +127,7 @@ func newTestStore(t *testing.T) *Store {
 	if err := db.AutoMigrate(
 		&AdminUser{}, &AdminSession{}, &Channel{}, &GatewayModel{}, &ChannelModel{},
 		&CircuitRecord{},
-		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
+		&ClientToken{}, &ClientTokenModel{}, &RelayRequestLog{}, &RelaySessionState{}, &RelayChatSessionClaim{}, &RelayAttemptLog{}, &TokenDailyStat{}, &GatewayMigration{},
 		&ResponseAffinity{}, &SessionAffinity{},
 	); err != nil {
 		t.Fatal(err)
@@ -207,6 +207,9 @@ func TestTokenEstimatorUsesParsedPayload(t *testing.T) {
 	estimator := NewTokenEstimator()
 	if parsed, encoded := estimator.EstimateValue(payload.values), estimator.EstimateJSON(body); parsed == 0 || parsed != encoded {
 		t.Fatalf("parsed estimate = %d, JSON estimate = %d", parsed, encoded)
+	}
+	if count := estimator.EstimateText("hello world"); count != 2 {
+		t.Fatalf("text estimate = %d, want 2", count)
 	}
 }
 
@@ -1479,6 +1482,88 @@ func TestClientAccessLimitsAndModelPermission(t *testing.T) {
 	}
 }
 
+func TestClientAccessListModelsReturnsOnlyRoutableModels(t *testing.T) {
+	store := newTestStore(t)
+	access := NewClientAccessService(store)
+	now := time.Now()
+
+	type routeState struct {
+		modelEnabled   bool
+		mappingEnabled bool
+		channelEnabled bool
+		circuitUntil   *time.Time
+	}
+	createModel := func(name string, state routeState) GatewayModel {
+		t.Helper()
+		model := GatewayModel{Name: name, RoutingStrategy: RoutingPriorityWeighted, Enabled: true}
+		if err := store.db.Create(&model).Error; err != nil {
+			t.Fatal(err)
+		}
+		channel := Channel{
+			Name: name + "-channel", BaseURL: "http://upstream.invalid/v1", APIKeyCipher: "cipher",
+			Enabled: true, CircuitOpenUntil: state.circuitUntil,
+		}
+		if err := store.db.Create(&channel).Error; err != nil {
+			t.Fatal(err)
+		}
+		mapping := ChannelModel{
+			ChannelID: channel.ID, ModelID: model.ID, UpstreamModel: name,
+			Priority: 1, Weight: 1, Enabled: true,
+		}
+		if err := store.db.Create(&mapping).Error; err != nil {
+			t.Fatal(err)
+		}
+		if !state.modelEnabled {
+			if err := store.db.Model(&model).Update("enabled", false).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !state.channelEnabled {
+			if err := store.db.Model(&channel).Update("enabled", false).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		if !state.mappingEnabled {
+			if err := store.db.Model(&mapping).Update("enabled", false).Error; err != nil {
+				t.Fatal(err)
+			}
+		}
+		return model
+	}
+
+	available := createModel("available", routeState{modelEnabled: true, mappingEnabled: true, channelEnabled: true})
+	expiredCircuit := now.Add(-time.Minute)
+	expired := createModel("expired-circuit", routeState{modelEnabled: true, mappingEnabled: true, channelEnabled: true, circuitUntil: &expiredCircuit})
+	createModel("disabled-model", routeState{mappingEnabled: true, channelEnabled: true})
+	createModel("disabled-mapping", routeState{modelEnabled: true, channelEnabled: true})
+	createModel("disabled-channel", routeState{modelEnabled: true, mappingEnabled: true})
+	openCircuit := now.Add(time.Minute)
+	createModel("open-circuit", routeState{modelEnabled: true, mappingEnabled: true, channelEnabled: true, circuitUntil: &openCircuit})
+	if err := store.db.Create(&GatewayModel{Name: "no-mapping", RoutingStrategy: RoutingPriorityWeighted, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	allModels, err := access.ListModels(context.Background(), &ClientToken{ID: 1, Enabled: true, AllowAllModels: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(allModels) != 2 || allModels[0].ID != available.ID || allModels[1].ID != expired.ID {
+		t.Fatalf("all-model token models = %+v", allModels)
+	}
+
+	restrictedToken := &ClientToken{ID: 2, Enabled: true}
+	if err := store.db.Create(&ClientTokenModel{TokenID: restrictedToken.ID, ModelID: expired.ID}).Error; err != nil {
+		t.Fatal(err)
+	}
+	restrictedModels, err := access.ListModels(context.Background(), restrictedToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restrictedModels) != 1 || restrictedModels[0].ID != expired.ID {
+		t.Fatalf("restricted token models = %+v", restrictedModels)
+	}
+}
+
 func TestRouterOrdersStrategies(t *testing.T) {
 	router := &Router{random: func(int) int { return 0 }}
 	candidates := []RouteCandidate{
@@ -1883,6 +1968,78 @@ func TestParseRelayPayloadExtractsCodexSessionKey(t *testing.T) {
 	}
 	if ambient.ThreadSource != codexThreadSourceAmbient {
 		t.Fatalf("ambient thread source = %q", ambient.ThreadSource)
+	}
+}
+
+func TestCopilotChatSessionResolverFollowsMessageHistory(t *testing.T) {
+	store := newTestStore(t)
+	headers := http.Header{
+		"User-Agent":            []string{"GitHubCopilotChat/0.30.0"},
+		"Editor-Plugin-Version": []string{"copilot-chat/0.30.0"},
+	}
+	now := time.Now().UTC()
+	firstBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"investigate routing"}]}`)
+	first, err := store.resolveCopilotChatSession(context.Background(), 7, headers, firstBody, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil || !strings.HasPrefix(first.ID, "chat_") || first.Source != copilotChatSessionSource {
+		t.Fatalf("first inferred session = %+v", first)
+	}
+	repeated, err := store.resolveCopilotChatSession(context.Background(), 7, headers, firstBody, now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated == nil || repeated.ID != first.ID {
+		t.Fatalf("repeated request session = %+v, want %s", repeated, first.ID)
+	}
+	firstResponse := []byte(`{"choices":[{"message":{"role":"assistant","content":"routing details"}}]}`)
+	compactSessionPayload(store.db, 7, first.ID, "chat-request-1", "investigate", "", firstBody, firstResponse, now.Add(2*time.Second))
+
+	secondBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"investigate routing"},{"role":"assistant","content":"routing details"},{"role":"user","content":"check retries too"}]}`)
+	second, err := store.resolveCopilotChatSession(context.Background(), 7, headers, secondBody, now.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second == nil || second.ID != first.ID {
+		t.Fatalf("continued request session = %+v, want %s", second, first.ID)
+	}
+
+	unrelatedBody := []byte(`{"model":"public-model","messages":[{"role":"system","content":"You are helpful"},{"role":"user","content":"write release notes"}]}`)
+	unrelated, err := store.resolveCopilotChatSession(context.Background(), 7, headers, unrelatedBody, now.Add(4*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unrelated == nil || unrelated.ID == first.ID {
+		t.Fatalf("unrelated request session = %+v, first = %s", unrelated, first.ID)
+	}
+
+	nonCopilot, err := store.resolveCopilotChatSession(context.Background(), 7, http.Header{"User-Agent": []string{"generic-client/1.0"}}, firstBody, now)
+	if err != nil || nonCopilot != nil {
+		t.Fatalf("non-Copilot session = %+v, %v", nonCopilot, err)
+	}
+}
+
+func TestCodexTitleDetectionAcceptsSchemaVariantsAndFencedJSON(t *testing.T) {
+	titleBody := []byte(`{
+		"model":"title-model",
+		"text":{"format":{"type":"json_schema","name":"conversation_title_v2","schema":{"type":"object","properties":{"title":{"type":"string"},"summary":{"type":"string"},"language":{"type":"string"}}}}},
+		"input":[{"role":"user","content":"Create a concise title for this request: improve routing dashboard"}]
+	}`)
+	prompt, isTitle := codexTitleRequestPrompt(titleBody)
+	if !isTitle || !strings.Contains(prompt, "improve routing dashboard") {
+		t.Fatalf("title request = %t, prompt = %q", isTitle, prompt)
+	}
+	if name := requestSessionName(titleBody); name != "" {
+		t.Fatalf("title helper request name = %q", name)
+	}
+	mainBody := []byte(`{"model":"main-model","input":[{"role":"user","content":"improve routing dashboard"}]}`)
+	if !codexTitleMatchesMain(titleBody, mainBody, hashCodexPrompt(prompt), hashCodexPrompt(codexRequestPrompt(mainBody))) {
+		t.Fatal("schema-variant title request did not match its main request")
+	}
+	response := []byte("data: {\"type\":\"response.output_text.done\",\"text\":\"```json\\n{\\\"title\\\":\\\"Routing dashboard improvements\\\"}\\n```\"}\n\n")
+	if title := codexGeneratedTitle(response); title != "Routing dashboard improvements" {
+		t.Fatalf("generated title = %q", title)
 	}
 }
 
@@ -2369,6 +2526,79 @@ func TestCodexSessionAffinityPinsMappingAndAllowsCircuitFailover(t *testing.T) {
 	}
 	if failoverPlan.InitialSelection.Reason != SelectionReasonCircuitOpen || failoverPlan.InitialSelection.PreviousChannelID != channels[1].ID || failoverPlan.InitialSelection.PreviousChannelName != channels[1].Name || failoverPlan.InitialSelection.Detail == "" {
 		t.Fatalf("circuit failover selection = %+v", failoverPlan.InitialSelection)
+	}
+}
+
+func TestCodexSessionModelSwitchRecordsPreviousChannel(t *testing.T) {
+	store := newTestStore(t)
+	token, firstModel, channels, firstMappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	secondModel := GatewayModel{Name: "second-public-model", RoutingStrategy: RoutingPriorityWeighted, Enabled: true}
+	if err := store.db.Create(&secondModel).Error; err != nil {
+		t.Fatal(err)
+	}
+	secondMapping := ChannelModel{
+		ChannelID: channels[1].ID, ModelID: secondModel.ID, UpstreamModel: "second-upstream-model",
+		Priority: 100, Weight: 100, InputPriceMicros: 1_000_000, OutputPriceMicros: 1_000_000, Enabled: true,
+	}
+	if err := store.db.Create(&secondMapping).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousRequest := RelayRequestLog{
+		ID: "model-switch-previous", TokenID: token.ID, RequestedModel: firstModel.Name,
+		CodexSessionID: "model-switch-session", CreatedAt: time.Now().Add(-time.Minute),
+	}
+	if err := store.db.Create(&previousRequest).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&RelaySessionState{
+		TokenID: token.ID, SessionID: previousRequest.CodexSessionID, LatestRequestID: previousRequest.ID,
+		CreatedAt: previousRequest.CreatedAt, UpdatedAt: previousRequest.CreatedAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&RelayAttemptLog{
+		RequestID: previousRequest.ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name,
+		ChannelModelID: firstMappings[0].ID, UpstreamModel: firstMappings[0].UpstreamModel,
+		Success: true, CreatedAt: previousRequest.CreatedAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	router := NewRouter(store, NewClientAccessService(store), nil)
+	plan, err := router.Plan(context.Background(), token, secondModel.Name, 10, 10, "", "model-switch-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := plan.InitialSelection
+	if len(plan.Candidates) != 1 || plan.Candidates[0].Mapping.ID != secondMapping.ID {
+		t.Fatalf("model-switch candidates = %+v", plan.Candidates)
+	}
+	if selection.Reason != SelectionReasonModelSwitch || selection.PreviousChannelID != channels[0].ID || selection.PreviousChannelName != channels[0].Name || selection.Detail != firstModel.Name+" -> "+secondModel.Name {
+		t.Fatalf("model-switch selection = %+v", selection)
+	}
+	if selection.Decision == nil || selection.Decision.Mode != "probability" {
+		t.Fatalf("model-switch route decision = %+v", selection.Decision)
+	}
+
+	if err := store.db.Create(&RelayRequestLog{
+		ID: "same-model-previous", TokenID: token.ID, RequestedModel: secondModel.Name,
+		CodexSessionID: "same-model-session", CreatedAt: time.Now().Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&RelayAttemptLog{
+		RequestID: "same-model-previous", ChannelID: channels[1].ID, ChannelName: channels[1].Name,
+		ChannelModelID: secondMapping.ID, UpstreamModel: secondMapping.UpstreamModel,
+		Success: true, CreatedAt: time.Now().Add(-time.Minute),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	sameModelPlan, err := router.Plan(context.Background(), token, secondModel.Name, 10, 10, "", "same-model-session")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameModelPlan.InitialSelection.Reason != SelectionReasonInitialRoute || sameModelPlan.InitialSelection.PreviousChannelID != 0 {
+		t.Fatalf("same-model selection = %+v", sameModelPlan.InitialSelection)
 	}
 }
 

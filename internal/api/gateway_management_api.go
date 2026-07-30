@@ -18,6 +18,7 @@ type GatewayManagementApi struct {
 	pkgApi.BaseApi
 	management *gateway.ManagementService
 	security   *AdminSecurity
+	estimator  *gateway.TokenEstimator
 }
 
 type channelTestView struct {
@@ -25,8 +26,16 @@ type channelTestView struct {
 	Status    int   `json:"status"`
 }
 
-func NewGatewayManagementApi(management *gateway.ManagementService, security *AdminSecurity) *GatewayManagementApi {
-	return &GatewayManagementApi{management: management, security: security}
+type tokenCountInput struct {
+	Texts []string `json:"texts"`
+}
+
+type tokenCountView struct {
+	Counts []int64 `json:"counts"`
+}
+
+func NewGatewayManagementApi(management *gateway.ManagementService, security *AdminSecurity, estimator *gateway.TokenEstimator) *GatewayManagementApi {
+	return &GatewayManagementApi{management: management, security: security, estimator: estimator}
 }
 
 func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
@@ -37,6 +46,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.GET("/logs", a.logs)
 	admin.POST("/logs/clear-payloads", a.clearLogPayloads)
 	admin.GET("/logs/:requestId", a.logDetail)
+	admin.POST("/token-counts", a.tokenCounts)
 	admin.GET("/circuit-records", a.circuitRecords)
 	admin.POST("/circuit-records/:id/reopen-mapping", a.reopenCircuitMapping)
 	admin.GET("/sessions", a.sessions)
@@ -45,6 +55,7 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 
 	admin.GET("/channels", a.listChannels)
 	admin.POST("/channels", a.createChannel)
+	admin.POST("/channels/configuration", a.saveChannelConfiguration)
 	admin.PUT("/channels/:id", a.updateChannel)
 	admin.DELETE("/channels/:id", a.deleteChannel)
 	admin.POST("/channels/:id/reset-circuit", a.resetChannelCircuit)
@@ -62,6 +73,30 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.PUT("/tokens/:id", a.updateToken)
 	admin.POST("/tokens/:id/rotate", a.rotateToken)
 	admin.DELETE("/tokens/:id", a.deleteToken)
+}
+
+func (a *GatewayManagementApi) tokenCounts(c *gin.Context) {
+	var input tokenCountInput
+	if !bindManagementJSON(c, &input) {
+		return
+	}
+	if len(input.Texts) > 512 {
+		c.JSON(http.StatusBadRequest, common.F[any](http.StatusBadRequest, "单次最多计算 512 段文本"))
+		return
+	}
+	totalBytes := 0
+	for _, value := range input.Texts {
+		totalBytes += len(value)
+		if totalBytes > 4<<20 {
+			c.JSON(http.StatusRequestEntityTooLarge, common.F[any](http.StatusRequestEntityTooLarge, "待计算文本总大小不能超过 4 MiB"))
+			return
+		}
+	}
+	counts := make([]int64, len(input.Texts))
+	for index, value := range input.Texts {
+		counts[index] = a.estimator.EstimateText(value)
+	}
+	c.JSON(http.StatusOK, common.S(&tokenCountView{Counts: counts}))
 }
 
 func parseID(c *gin.Context) (uint64, bool) {
@@ -113,6 +148,19 @@ func (a *GatewayManagementApi) createChannel(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusCreated, common.S(item))
+}
+
+func (a *GatewayManagementApi) saveChannelConfiguration(c *gin.Context) {
+	var input gateway.ChannelConfigurationInput
+	if !bindManagementJSON(c, &input) {
+		return
+	}
+	item, err := a.management.SaveChannelConfiguration(c.Request.Context(), input)
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(item))
 }
 
 func (a *GatewayManagementApi) updateChannel(c *gin.Context) {

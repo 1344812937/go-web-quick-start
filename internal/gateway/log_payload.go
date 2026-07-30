@@ -44,6 +44,7 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 		upsertSessionTitleWithoutManifest(db, tokenID, sessionID, requestID, title, threadSource, now)
 		return body
 	}
+	requestManifestJSON, _ := json.Marshal(manifest)
 	appendResponseManifest(&manifest, body, responseBody)
 
 	var state RelaySessionState
@@ -56,6 +57,7 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 			Title:               title,
 			ThreadSource:        threadSource,
 			LatestRequestID:     requestID,
+			RequestManifestJSON: string(requestManifestJSON),
 			PayloadManifestJSON: string(encodedManifest),
 			CreatedAt:           now,
 			UpdatedAt:           now,
@@ -66,10 +68,14 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 		return body
 	}
 
-	compacted := compactPayloadAgainstManifest(body, state.PayloadManifestJSON, state.LatestRequestID, "session")
+	compacted := body
+	if state.LatestRequestID != "" {
+		compacted = compactPayloadAgainstManifest(body, state.PayloadManifestJSON, state.LatestRequestID, "session")
+	}
 	encodedManifest, _ := json.Marshal(manifest)
 	updates := map[string]any{
 		"latest_request_id":     requestID,
+		"request_manifest_json": string(requestManifestJSON),
 		"payload_manifest_json": string(encodedManifest),
 		"updated_at":            now,
 	}

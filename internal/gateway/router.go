@@ -152,6 +152,10 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 	if err := r.access.AuthorizeModel(ctx, token, model.ID); err != nil {
 		return nil, err
 	}
+	previousSessionRoute, err := r.previousSessionRoute(ctx, token.ID, sessionKey)
+	if err != nil {
+		return nil, err
+	}
 	outputTokens := declaredOutput
 	if outputTokens <= 0 {
 		outputTokens = r.recentOutputMedian(ctx, model.Name)
@@ -162,12 +166,14 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		if err != nil {
 			return nil, err
 		}
-		return &RoutePlan{
+		plan := &RoutePlan{
 			Model:            model,
 			Candidates:       []RouteCandidate{*candidate},
 			InitialSelection: RouteSelection{Reason: SelectionReasonResponseAffinity, Decision: deterministicRouteDecision(model.RoutingStrategy, "response_affinity", []RouteCandidate{*candidate})},
 			Affinity:         true,
-		}, nil
+		}
+		annotateModelSwitch(plan, previousSessionRoute)
+		return plan, nil
 	}
 
 	candidates, err := r.availableCandidates(ctx, model.ID, inputTokens, outputTokens)
@@ -192,18 +198,74 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 				initialSelection = r.unavailableSessionSelection(ctx, token.ID, model, sessionKey, affinity.ChannelModelID)
 				initialSelection.Decision = decision
 			}
-			return &RoutePlan{
+			plan := &RoutePlan{
 				Model:                    model,
 				Candidates:               candidates,
 				InitialSelection:         initialSelection,
 				SessionAffinity:          true,
 				SessionAffinityMappingID: affinity.ChannelModelID,
-			}, nil
+			}
+			annotateModelSwitch(plan, previousSessionRoute)
+			return plan, nil
 		}
 	}
 	decision := r.orderCandidates(model.RoutingStrategy, candidates)
 	initialSelection.Decision = decision
-	return &RoutePlan{Model: model, Candidates: candidates, InitialSelection: initialSelection}, nil
+	plan := &RoutePlan{Model: model, Candidates: candidates, InitialSelection: initialSelection}
+	annotateModelSwitch(plan, previousSessionRoute)
+	return plan, nil
+}
+
+type sessionRouteSnapshot struct {
+	RequestedModel string
+	ChannelID      uint64
+	ChannelName    string
+}
+
+func (r *Router) previousSessionRoute(ctx context.Context, tokenID uint64, sessionKey string) (*sessionRouteSnapshot, error) {
+	if tokenID == 0 || sessionKey == "" {
+		return nil, nil
+	}
+	var snapshot sessionRouteSnapshot
+	db := r.store.db.WithContext(ctx)
+	err := db.Table("relay_session_states AS state").
+		Select("request.requested_model, attempt.channel_id, attempt.channel_name").
+		Joins("JOIN relay_request_logs AS request ON request.id = state.latest_request_id").
+		Joins("JOIN relay_attempt_logs AS attempt ON attempt.request_id = request.id").
+		Where("state.token_id = ? AND state.session_id = ?", tokenID, sessionKey).
+		Order("attempt.created_at DESC, attempt.id DESC").
+		Take(&snapshot).Error
+	if err == nil {
+		return &snapshot, nil
+	}
+	if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	// Legacy state and route-stage failures may not point at a request with attempts.
+	err = db.Table("relay_attempt_logs AS attempt").
+		Select("request.requested_model, attempt.channel_id, attempt.channel_name").
+		Joins("JOIN relay_request_logs AS request ON request.id = attempt.request_id").
+		Where("request.token_id = ? AND request.codex_session_id = ?", tokenID, sessionKey).
+		Order("request.created_at DESC, attempt.created_at DESC, attempt.id DESC").
+		Take(&snapshot).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &snapshot, nil
+}
+
+func annotateModelSwitch(plan *RoutePlan, previous *sessionRouteSnapshot) {
+	if plan == nil || previous == nil || previous.RequestedModel == "" || previous.RequestedModel == plan.Model.Name || len(plan.Candidates) == 0 {
+		return
+	}
+	plan.InitialSelection.PreviousChannelID = previous.ChannelID
+	plan.InitialSelection.PreviousChannelName = previous.ChannelName
+	plan.InitialSelection.Reason = SelectionReasonModelSwitch
+	plan.InitialSelection.Detail = previous.RequestedModel + " -> " + plan.Model.Name
 }
 
 func (r *Router) unavailableSessionSelection(ctx context.Context, tokenID uint64, model GatewayModel, sessionKey string, channelModelID uint64) RouteSelection {

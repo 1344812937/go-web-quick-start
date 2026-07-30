@@ -123,6 +123,14 @@ func NewRelayService(store *Store, router *Router, estimator *TokenEstimator, co
 
 func (s *RelayService) Relay(ctx context.Context, writer http.ResponseWriter, headers http.Header, rawQuery string, endpoint string, token *ClientToken, payload *RelayPayload, rawBody []byte) *PublicError {
 	startedAt := time.Now()
+	if endpoint == "chat" && payload.LogSessionKey == "" {
+		if identity, err := s.store.resolveCopilotChatSession(ctx, token.ID, headers, rawBody, startedAt.UTC()); err == nil && identity != nil {
+			payload.LogSessionKey = identity.ID
+			payload.LogSessionSource = identity.Source
+			payload.ClientKind = identity.ClientKind
+			payload.ClientFingerprint = identity.ClientFingerprint
+		}
+	}
 	inputTokens := s.estimator.EstimateValue(payload.values)
 	if inputTokens == 0 {
 		inputTokens = s.estimator.EstimateJSON(rawBody)
@@ -998,6 +1006,9 @@ func publicErrorBody(publicErr *PublicError) []byte {
 }
 
 func requestSessionName(body []byte) string {
+	if _, titleRequest := codexTitleRequestPrompt(body); titleRequest {
+		return ""
+	}
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
 		return ""
@@ -1396,7 +1407,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	durationMS = durationAfterLatency(durationMS, execution.latencyMS)
 	responseBody, responseBodyTruncated := retainLoggedPayload(execution.payloadLogDetail, execution.responseBody, execution.responseBodyTruncated)
 	sessionName := requestSessionName(execution.rawBody)
-	loggedSessionID, loggedSessionSource := loggedCodexSessionIdentity(execution.payload.SessionKey, execution.payload.SessionSource)
+	loggedSessionID, loggedSessionSource := loggedCodexSessionIdentity(execution.payload.LogSessionKey, execution.payload.LogSessionSource)
 	codexPromptHash, codexTitleRequest, codexGeneratedTitle := codexLogPayloadMetadata(execution.rawBody, execution.responseBody)
 	requestParametersJSON := execution.payload.RequestParametersJSON
 	if execution.payloadLogDetail == config.PayloadLogDetailNone {

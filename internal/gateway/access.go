@@ -110,7 +110,17 @@ func (s *ClientAccessService) ListModels(ctx context.Context, token *ClientToken
 	if token == nil {
 		return nil, ErrInvalidClientToken
 	}
-	db := s.store.db.WithContext(ctx).Model(&GatewayModel{}).Where("enabled = ?", true)
+	db := s.store.db.WithContext(ctx).Model(&GatewayModel{}).
+		Where("enabled = ?", true).
+		Where(`EXISTS (
+			SELECT 1
+			FROM channel_models AS mapping
+			JOIN channels AS channel ON channel.id = mapping.channel_id
+			WHERE mapping.model_id = gateway_models.id
+				AND mapping.enabled = ?
+				AND channel.enabled = ?
+				AND (channel.circuit_open_until IS NULL OR channel.circuit_open_until <= ?)
+		)`, true, true, time.Now())
 	if !token.AllowAllModels {
 		db = db.Where("EXISTS (SELECT 1 FROM client_token_models tm WHERE tm.model_id = gateway_models.id AND tm.token_id = ?)", token.ID)
 	}

@@ -13,6 +13,7 @@ const (
 	SelectionReasonInitialRoute                   = "initial_route"
 	SelectionReasonResponseAffinity               = "response_affinity"
 	SelectionReasonSessionAffinity                = "session_affinity"
+	SelectionReasonModelSwitch                    = "model_switch"
 	SelectionReasonChannelDisabled                = "channel_disabled"
 	SelectionReasonMappingDisabled                = "mapping_disabled"
 	SelectionReasonCircuitOpen                    = "circuit_open"
@@ -204,10 +205,26 @@ type RelaySessionState struct {
 	Title               string    `gorm:"size:80;index" json:"title"`
 	TitleCustomized     bool      `gorm:"not null;default:false" json:"titleCustomized"`
 	ThreadSource        string    `gorm:"size:48;index" json:"threadSource"`
+	SessionSource       string    `gorm:"size:48;index" json:"sessionSource"`
+	ClientKind          string    `gorm:"size:32;index" json:"clientKind"`
+	ClientFingerprint   string    `gorm:"size:64;index" json:"-"`
 	LatestRequestID     string    `gorm:"size:36" json:"latestRequestId"`
+	RequestManifestJSON string    `gorm:"type:text" json:"-"`
 	PayloadManifestJSON string    `gorm:"type:text" json:"-"`
 	CreatedAt           time.Time `json:"createdAt"`
 	UpdatedAt           time.Time `gorm:"index" json:"updatedAt"`
+}
+
+// RelayChatSessionClaim maps one canonical Chat Completions history to the
+// inferred session selected before the upstream request starts.
+type RelayChatSessionClaim struct {
+	TokenID             uint64    `gorm:"primaryKey;autoIncrement:false"`
+	ClientFingerprint   string    `gorm:"size:64;primaryKey"`
+	RequestHistoryHash  string    `gorm:"size:64;primaryKey"`
+	SessionID           string    `gorm:"size:512;index;not null"`
+	RequestManifestJSON string    `gorm:"type:text;not null"`
+	CreatedAt           time.Time `gorm:"index"`
+	UpdatedAt           time.Time `gorm:"index"`
 }
 
 type RelayAttemptLog struct {

@@ -31,6 +31,12 @@ type ChannelInput struct {
 	PriceMultiplierBasisPoints *int64 `json:"priceMultiplierBasisPoints"`
 }
 
+type ChannelConfigurationInput struct {
+	ID      uint64              `json:"id"`
+	Channel ChannelInput        `json:"channel"`
+	Models  []ChannelModelInput `json:"models"`
+}
+
 type ChannelModelDiscoveryInput struct {
 	ChannelID uint64 `json:"channelId"`
 	BaseURL   string `json:"baseUrl"`
@@ -442,13 +448,26 @@ func (s *ManagementService) channelMetrics(ctx context.Context, channelIDs []uin
 }
 
 func (s *ManagementService) CreateChannel(ctx context.Context, input ChannelInput) (*ChannelView, error) {
-	input, err := validateChannelInput(input, true)
+	channel, err := s.createChannel(s.store.db.WithContext(ctx), input)
 	if err != nil {
 		return nil, err
 	}
+	return &ChannelView{
+		Channel:          channel,
+		APIKeyConfigured: true,
+		Models:           []ChannelModel{},
+		Metrics:          ChannelMetrics{LatencySeries: []ChannelLatencyPoint{}, RecentSuccessRate: 1},
+	}, nil
+}
+
+func (s *ManagementService) createChannel(db *gorm.DB, input ChannelInput) (Channel, error) {
+	input, err := validateChannelInput(input, true)
+	if err != nil {
+		return Channel{}, err
+	}
 	cipherText, err := s.store.secretBox.Encrypt(strings.TrimSpace(input.APIKey))
 	if err != nil {
-		return nil, err
+		return Channel{}, err
 	}
 	priceMultiplierBasisPoints := DefaultPriceMultiplierBasisPoints
 	if input.PriceMultiplierBasisPoints != nil {
@@ -462,25 +481,28 @@ func (s *ManagementService) CreateChannel(ctx context.Context, input ChannelInpu
 		SupportsStreamUsage:        input.SupportsStreamUsage,
 		PriceMultiplierBasisPoints: priceMultiplierBasisPoints,
 	}
-	if err := s.store.db.WithContext(ctx).Create(&channel).Error; err != nil {
-		return nil, err
+	if err := db.Create(&channel).Error; err != nil {
+		return Channel{}, err
 	}
-	return &ChannelView{
-		Channel:          channel,
-		APIKeyConfigured: true,
-		Models:           []ChannelModel{},
-		Metrics:          ChannelMetrics{LatencySeries: []ChannelLatencyPoint{}, RecentSuccessRate: 1},
-	}, nil
+	return channel, nil
 }
 
 func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input ChannelInput) (*ChannelView, error) {
-	input, err := validateChannelInput(input, false)
+	channel, err := s.updateChannel(s.store.db.WithContext(ctx), id, input)
 	if err != nil {
 		return nil, err
 	}
+	return s.channelView(ctx, channel)
+}
+
+func (s *ManagementService) updateChannel(db *gorm.DB, id uint64, input ChannelInput) (Channel, error) {
+	input, err := validateChannelInput(input, false)
+	if err != nil {
+		return Channel{}, err
+	}
 	var channel Channel
-	if err := s.store.db.WithContext(ctx).First(&channel, id).Error; err != nil {
-		return nil, err
+	if err := db.First(&channel, id).Error; err != nil {
+		return Channel{}, err
 	}
 	channel.Name = input.Name
 	channel.BaseURL = input.BaseURL
@@ -498,14 +520,20 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 	if strings.TrimSpace(input.APIKey) != "" {
 		channel.APIKeyCipher, err = s.store.secretBox.Encrypt(strings.TrimSpace(input.APIKey))
 		if err != nil {
-			return nil, err
+			return Channel{}, err
 		}
 	}
-	if err := s.store.db.WithContext(ctx).Save(&channel).Error; err != nil {
+	if err := db.Save(&channel).Error; err != nil {
+		return Channel{}, err
+	}
+	return channel, nil
+}
+
+func (s *ManagementService) channelView(ctx context.Context, channel Channel) (*ChannelView, error) {
+	var models []ChannelModel
+	if err := s.store.db.WithContext(ctx).Where("channel_id = ?", channel.ID).Find(&models).Error; err != nil {
 		return nil, err
 	}
-	var models []ChannelModel
-	_ = s.store.db.WithContext(ctx).Where("channel_id = ?", channel.ID).Find(&models).Error
 	channelModelIDs := make([]uint64, 0, len(models))
 	for _, model := range models {
 		channelModelIDs = append(channelModelIDs, model.ID)
@@ -535,6 +563,38 @@ func (s *ManagementService) UpdateChannel(ctx context.Context, id uint64, input 
 		Models:           models,
 		Metrics:          metrics,
 	}, nil
+}
+
+func (s *ManagementService) SaveChannelConfiguration(ctx context.Context, input ChannelConfigurationInput) (*ChannelView, error) {
+	var view ChannelView
+	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		var channel Channel
+		var err error
+		if input.ID == 0 {
+			channel, err = s.createChannel(db, input.Channel)
+		} else {
+			channel, err = s.updateChannel(db, input.ID, input.Channel)
+		}
+		if err != nil {
+			return err
+		}
+
+		models, err := s.replaceChannelModels(db, channel.ID, input.Models)
+		if err != nil {
+			return err
+		}
+		view = ChannelView{
+			Channel:          channel,
+			APIKeyConfigured: channel.APIKeyCipher != "",
+			Models:           models,
+			Metrics:          ChannelMetrics{LatencySeries: []ChannelLatencyPoint{}, RecentSuccessRate: 1},
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &view, nil
 }
 
 func (s *ManagementService) DeleteChannel(ctx context.Context, id uint64) error {
@@ -576,8 +636,18 @@ func (s *ManagementService) ResetChannelCircuit(ctx context.Context, id uint64) 
 }
 
 func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID uint64, inputs []ChannelModelInput) ([]ChannelModel, error) {
+	var models []ChannelModel
+	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		var err error
+		models, err = s.replaceChannelModels(db, channelID, inputs)
+		return err
+	})
+	return models, err
+}
+
+func (s *ManagementService) replaceChannelModels(db *gorm.DB, channelID uint64, inputs []ChannelModelInput) ([]ChannelModel, error) {
 	var channel Channel
-	if err := s.store.db.WithContext(ctx).First(&channel, channelID).Error; err != nil {
+	if err := db.First(&channel, channelID).Error; err != nil {
 		return nil, err
 	}
 	models := make([]ChannelModel, 0, len(inputs))
@@ -606,7 +676,10 @@ func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID 
 			priceMultiplierBasisPoints = *input.PriceMultiplierBasisPoints
 		}
 		var count int64
-		if err := s.store.db.WithContext(ctx).Model(&GatewayModel{}).Where("id = ?", input.ModelID).Count(&count).Error; err != nil || count == 0 {
+		if err := db.Model(&GatewayModel{}).Where("id = ?", input.ModelID).Count(&count).Error; err != nil {
+			return nil, err
+		}
+		if count == 0 {
 			return nil, fmt.Errorf("model %d does not exist", input.ModelID)
 		}
 		models = append(models, ChannelModel{
@@ -623,54 +696,51 @@ func (s *ManagementService) ReplaceChannelModels(ctx context.Context, channelID 
 			Enabled:                    input.Enabled,
 		})
 	}
-	err := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
-		var existing []ChannelModel
-		if err := db.Where("channel_id = ?", channelID).Find(&existing).Error; err != nil {
-			return err
-		}
-		existingByModelID := make(map[uint64]ChannelModel, len(existing))
-		for _, mapping := range existing {
-			existingByModelID[mapping.ModelID] = mapping
-		}
-		requestedModelIDs := make(map[uint64]struct{}, len(models))
-		for index := range models {
-			requestedModelIDs[models[index].ModelID] = struct{}{}
-			current, exists := existingByModelID[models[index].ModelID]
-			if !exists {
-				if err := db.Create(&models[index]).Error; err != nil {
-					return err
-				}
-				continue
+	var existing []ChannelModel
+	if err := db.Where("channel_id = ?", channelID).Find(&existing).Error; err != nil {
+		return nil, err
+	}
+	existingByModelID := make(map[uint64]ChannelModel, len(existing))
+	for _, mapping := range existing {
+		existingByModelID[mapping.ModelID] = mapping
+	}
+	requestedModelIDs := make(map[uint64]struct{}, len(models))
+	for index := range models {
+		requestedModelIDs[models[index].ModelID] = struct{}{}
+		current, exists := existingByModelID[models[index].ModelID]
+		if !exists {
+			if err := db.Create(&models[index]).Error; err != nil {
+				return nil, err
 			}
-			models[index].ID = current.ID
-			models[index].CreatedAt = current.CreatedAt
-			models[index].CircuitDisabled = current.CircuitDisabled && !models[index].Enabled
-			if current.CircuitDisabled && models[index].Enabled {
-				if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionManualReopen, time.Now()); err != nil {
-					return err
-				}
-			}
-			if err := db.Save(&models[index]).Error; err != nil {
-				return err
+			continue
+		}
+		models[index].ID = current.ID
+		models[index].CreatedAt = current.CreatedAt
+		models[index].CircuitDisabled = current.CircuitDisabled && !models[index].Enabled
+		if current.CircuitDisabled && models[index].Enabled {
+			if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionManualReopen, time.Now()); err != nil {
+				return nil, err
 			}
 		}
-		for _, current := range existing {
-			if _, kept := requestedModelIDs[current.ModelID]; kept {
-				continue
-			}
-			if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionMappingRemoved, time.Now()); err != nil {
-				return err
-			}
-			if err := db.Delete(&current).Error; err != nil {
-				return err
-			}
+		if err := db.Save(&models[index]).Error; err != nil {
+			return nil, err
 		}
-		return nil
-	})
+	}
+	for _, current := range existing {
+		if _, kept := requestedModelIDs[current.ModelID]; kept {
+			continue
+		}
+		if err := resolveCircuitRecords(db, channelID, current.ID, CircuitLevelManual, CircuitResolutionMappingRemoved, time.Now()); err != nil {
+			return nil, err
+		}
+		if err := db.Delete(&current).Error; err != nil {
+			return nil, err
+		}
+	}
 	for index := range models {
 		models[index].RecentSuccessRate = 1
 	}
-	return models, err
+	return models, nil
 }
 
 func validRoutingStrategy(value string) bool {

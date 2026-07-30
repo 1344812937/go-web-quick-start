@@ -38,16 +38,16 @@ func (e *TokenEstimator) EstimateJSON(data []byte) int64 {
 	if strings.TrimSpace(text) == "" {
 		text = string(data)
 	}
-	return e.estimateText(text)
+	return e.EstimateText(text)
 }
 
 func (e *TokenEstimator) EstimateValue(value any) int64 {
 	var builder strings.Builder
 	collectText(value, &builder)
-	return e.estimateText(builder.String())
+	return e.EstimateText(builder.String())
 }
 
-func (e *TokenEstimator) estimateText(text string) int64 {
+func (e *TokenEstimator) EstimateText(text string) int64 {
 	if strings.TrimSpace(text) == "" {
 		return 0
 	}
