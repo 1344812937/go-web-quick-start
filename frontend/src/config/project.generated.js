@@ -6,7 +6,7 @@ const projectMeta = Object.freeze({
   "appName": "go-web-quick-start",
   "displayName": "OpenAI 网关控制台",
   "description": "OpenAI 兼容的多渠道网关控制台，支持模型路由、会话亲和、失败重试、熔断、令牌和五天调用时间线。",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "tokenPrefix": "quickstart",
   "faviconPath": "/favicon.svg"
 })

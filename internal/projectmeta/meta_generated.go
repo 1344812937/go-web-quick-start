@@ -8,7 +8,7 @@ const (
 	AppName     = "go-web-quick-start"
 	DisplayName = "OpenAI 网关控制台"
 	Description = "OpenAI 兼容的多渠道网关控制台，支持模型路由、会话亲和、失败重试、熔断、令牌和五天调用时间线。"
-	Version     = "0.1.1"
+	Version     = "0.1.2"
 	TokenPrefix = "quickstart"
 	FaviconPath = "/favicon.svg"
 )
