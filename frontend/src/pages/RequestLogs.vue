@@ -220,7 +220,7 @@ onMounted(async () => {
 
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>调用日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadLogs">重试</el-button></div>
     <section v-else class="surface-panel table-panel log-table-panel">
-      <el-table v-loading="loading" :data="logs" row-key="id" height="100%" empty-text="当前筛选条件下没有调用日志">
+      <el-table v-loading="loading" class="compact-log-table" :data="logs" row-key="id" height="100%" empty-text="当前筛选条件下没有调用日志">
         <el-table-column type="expand">
           <template #default="scope">
             <div class="attempt-list">
@@ -242,23 +242,17 @@ onMounted(async () => {
         <el-table-column label="接口 / 模型" min-width="200"><template #default="scope"><div class="primary-cell"><strong><code>{{ scope.row.apiPath }}</code></strong><small>{{ scope.row.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }} · <code>{{ scope.row.requestedModel }}</code></small></div></template></el-table-column>
         <el-table-column label="渠道" min-width="160"><template #default="scope"><div v-if="finalAttempt(scope.row)" class="primary-cell"><strong>{{ finalChannelName(scope.row) }}</strong><small><code>{{ finalChannelModel(scope.row) }}</code></small></div><span v-else class="muted-text">未进入上游渠道</span></template></el-table-column>
         <el-table-column label="状态" width="108"><template #default="scope"><el-tag :type="outcomeType(scope.row)" effect="plain">{{ outcomeLabel(scope.row) }}</el-tag></template></el-table-column>
-        <el-table-column label="Token 明细" min-width="300">
+        <el-table-column label="Token / 费用" min-width="310">
           <template #default="scope">
-            <div class="token-breakdown">
-              <span><small>普通输入</small><strong>{{ formatCompactNumber(scope.row.normalInputTokens) }}</strong></span>
-              <span><small>输出</small><strong>{{ formatCompactNumber(scope.row.outputTokens) }}</strong></span>
-              <span><small>缓存读</small><strong>{{ formatCompactNumber(scope.row.cachedTokens) }}</strong></span>
-              <span><small>缓存写</small><strong>{{ formatCompactNumber(scope.row.cacheWriteTokens) }}</strong></span>
-              <span class="sent-token"><small>真实发送（本地分词）</small><strong>{{ formatCompactNumber(scope.row.sentTokens) }}</strong></span>
+            <div class="usage-cost-cell">
+              <div><strong>普通输入 {{ formatCompactNumber(scope.row.normalInputTokens) }} · 输出 {{ formatCompactNumber(scope.row.outputTokens) }}</strong><span>{{ formatUSD(scope.row.upstreamCostMicros) }}</span></div>
+              <small>缓存读 {{ formatCompactNumber(scope.row.cachedTokens) }} · 缓存写 {{ formatCompactNumber(scope.row.cacheWriteTokens) }} · 真实发送（本地分词）{{ formatCompactNumber(scope.row.sentTokens) }}</small>
+              <small>自行估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="费用" width="158" align="right"><template #default="scope"><div class="cost-breakdown"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>自行估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
         <el-table-column label="来源" width="142"><template #default="scope"><div class="source-breakdown"><el-tag :type="costSourceType(scope.row)" effect="plain" size="small">{{ costSource(scope.row) }}</el-tag><small>{{ usageSource(scope.row.usageSource) }}</small></div></template></el-table-column>
-        <el-table-column label="首 Token" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.firstTokenMs) }}</template></el-table-column>
-        <el-table-column label="请求延迟" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.latencyMs) }}</template></el-table-column>
-        <el-table-column label="请求耗时" width="104" align="right"><template #default="scope">{{ formatTiming(scope.row.durationMs) }}</template></el-table-column>
-        <el-table-column label="尝试" width="72" align="right" prop="attemptCount" />
+        <el-table-column label="性能 / 尝试" min-width="220"><template #default="scope"><div class="performance-cell"><strong>首 Token {{ formatTiming(scope.row.firstTokenMs) }} · 延迟 {{ formatTiming(scope.row.latencyMs) }}</strong><small>请求耗时 {{ formatTiming(scope.row.durationMs) }} · {{ scope.row.attemptCount }} 次尝试</small></div></template></el-table-column>
         <el-table-column label="详情" width="62" fixed="right" align="right"><template #default="scope"><el-tooltip content="查看调用记录" placement="top"><el-button class="table-action-button" text :icon="View" :loading="payloadLoadingId === scope.row.id" aria-label="查看调用记录" @click="showPayloads(scope.row)" /></el-tooltip></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadLogs" /></footer>
@@ -272,17 +266,15 @@ onMounted(async () => {
 .log-table-panel { display: flex; min-width: 0; flex-direction: column; }
 .log-table-panel :deep(.el-table__inner-wrapper::before) { display: none; }
 .log-table-panel .table-pagination { flex: none; min-height: 56px; align-items: center; background: var(--rose-surface); }
-.attempt-list { display: grid; gap: 8px; padding: 14px 24px 18px 54px; background: var(--rose-surface-muted); }
+.compact-log-table :deep(.el-table__cell) { padding-block: 6px; }
+.attempt-list { display: grid; gap: 7px; padding: 12px 20px 14px 48px; background: var(--rose-surface-muted); }
 .attempt-list > header { display: flex; justify-content: space-between; color: var(--rose-text-muted); font-size: 12px; }
 .attempt-list > header strong { color: var(--rose-text); }
-.token-breakdown { display: grid; grid-template-columns: repeat(4, minmax(58px, 1fr)); gap: 5px 10px; font-variant-numeric: tabular-nums; }
-.token-breakdown > span { display: grid; gap: 1px; min-width: 0; }
-.token-breakdown small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
-.token-breakdown strong { color: var(--rose-text); font-size: 12px; }
-.token-breakdown .sent-token { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
-.cost-breakdown, .source-breakdown { display: grid; gap: 3px; }
-.cost-breakdown strong { color: var(--rose-text); font-variant-numeric: tabular-nums; }
-.cost-breakdown small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; }
+.usage-cost-cell, .performance-cell, .source-breakdown { display: grid; min-width: 0; gap: 3px; font-variant-numeric: tabular-nums; }
+.usage-cost-cell > div { display: flex; min-width: 0; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 3px 12px; }
+.usage-cost-cell > div strong, .performance-cell strong { color: var(--rose-text); font-size: 11px; line-height: 1.35; }
+.usage-cost-cell > div span { flex: none; color: var(--rose-text); font: 600 12px/1.3 var(--rose-font-mono); }
+.usage-cost-cell small, .performance-cell small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; line-height: 1.35; overflow-wrap: anywhere; }
 .source-breakdown { justify-items: start; }
 @media (min-width: 961px) {
   .log-page { height: 100%; min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }

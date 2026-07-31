@@ -549,7 +549,7 @@ watch(
           <div v-else ref="timelineScroller" class="timeline-scroller" @scroll="handleTimelineScroll">
           <div v-if="timelineRequests.length === 0" class="timeline-empty">当前筛选条件下没有调用记录</div>
           <ol v-else class="request-timeline">
-          <li v-for="(entry, requestIndex) in timelineRequests" :key="entry.request.id" class="request-event">
+          <li v-for="(entry, requestIndex) in timelineRequests" :key="entry.request.id" class="request-event" :class="{ 'is-compaction': entry.request.isCompaction }">
             <div class="request-marker" aria-hidden="true">{{ requestIndex + 1 }}</div>
             <article class="request-content" :class="{ 'is-expanded': isRequestExpanded(entry.request.id) }">
               <header class="request-header" role="button" tabindex="0" :aria-expanded="isRequestExpanded(entry.request.id)" @click="toggleRequest(entry.request.id)" @keydown.enter.prevent="toggleRequest(entry.request.id)" @keydown.space.prevent="toggleRequest(entry.request.id)">
@@ -557,6 +557,7 @@ watch(
                   <el-icon class="request-expand-icon"><Right /></el-icon>
                   <time :datetime="entry.request.createdAt">{{ formatDate(entry.request.createdAt) }}</time>
                   <span>{{ entry.request.endpoint === 'chat' ? 'Chat Completions' : 'Responses' }}</span>
+                  <el-tag v-if="entry.request.isCompaction" class="compaction-request-tag" type="warning" effect="plain" size="small">上下文压缩</el-tag>
                   <code>{{ entry.request.apiPath }}</code>
                   <code>{{ entry.request.requestedModel }}</code>
                   <span>思考等级 {{ entry.request.reasoningEffort || '默认' }}</span>
@@ -715,6 +716,7 @@ watch(
 .request-event { position: relative; display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 12px; padding: 18px 0; }
 .request-event:not(:last-child)::before { position: absolute; top: 46px; bottom: -12px; left: 16px; width: 1px; background: var(--rose-border-strong); content: ''; }
 .request-marker { z-index: 1; display: grid; width: 33px; height: 33px; place-items: center; border: 1px solid var(--rose-primary); border-radius: 50%; color: var(--rose-primary-hover); background: var(--rose-surface); font: 600 11px/1 var(--rose-font-mono); }
+.request-event.is-compaction .request-marker { border-color: var(--rose-warning); color: var(--rose-warning); background: var(--rose-warning-soft); }
 .request-content { min-width: 0; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
 .request-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 34px; }
 .request-header { padding: 5px 6px; border-radius: 3px; cursor: pointer; }
@@ -725,6 +727,7 @@ watch(
 .request-expanded { padding: 0 6px 6px; }
 .request-title time { color: var(--rose-text); font-weight: 650; }
 .request-title span, .request-actions > span, .request-id { color: var(--rose-text-muted); font-size: 11px; }
+.request-title .compaction-request-tag { color: var(--rose-warning); font-weight: 650; }
 .request-brief { display: flex; min-width: 0; align-items: center; flex-wrap: wrap; gap: 5px 18px; padding: 3px 6px 4px 44px; color: var(--rose-text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
 .request-brief > span { display: inline-flex; min-width: 0; align-items: baseline; flex-wrap: wrap; gap: 4px; }
 .request-brief strong { color: var(--rose-text); font-weight: 650; }
