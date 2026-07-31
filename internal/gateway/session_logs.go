@@ -81,6 +81,7 @@ type SessionLogSummary struct {
 	LatestModel           string              `json:"latestModel"`
 	LatestEndpoint        string              `json:"latestEndpoint"`
 	RequestCount          int64               `json:"requestCount"`
+	CompactionCount       int64               `json:"compactionCount"`
 	SuccessCount          int64               `json:"successCount"`
 	CanceledCount         int64               `json:"canceledCount"`
 	ProcessingCount       int64               `json:"processingCount"`
@@ -396,6 +397,7 @@ func (s *ManagementService) populateSessionSummary(ctx context.Context, summary 
 			}
 			summary.ClientKind = state.ClientKind
 			summary.ThreadSource = state.ThreadSource
+			summary.CompactionCount = state.CompactionCount
 		} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}

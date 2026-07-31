@@ -636,6 +636,8 @@ export interface RelayRequestLog {
   codexSessionSource: string
   /** Latest real user text from this request, normalized and limited to ten Unicode characters. */
   sessionName: string
+  /** Whether Codex classified this request as a context-compaction request. */
+  isCompaction: boolean
   /** Allowlisted non-content API parameters retained for five-day diagnostics. */
   requestParameters: Record<string, unknown>
   /** Payload retention detail captured when this request entered the gateway. */
@@ -853,6 +855,8 @@ export interface CodexSessionSummary {
   latestEndpoint: string
   /** Requests retained for this session within the five-day window. */
   requestCount: number
+  /** Context-compaction requests recorded for this session. */
+  compactionCount: number
   /** Requests that reached a protocol-level successful completion. */
   successCount: number
   /** Requests canceled by downstream clients before protocol completion. */

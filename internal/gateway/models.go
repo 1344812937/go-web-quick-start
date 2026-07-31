@@ -157,6 +157,7 @@ type RelayRequestLog struct {
 	CodexPromptHash       string    `gorm:"size:64;index" json:"-"`
 	CodexTitleRequest     bool      `gorm:"not null;default:false" json:"-"`
 	CodexGeneratedTitle   string    `gorm:"size:80" json:"-"`
+	IsCompaction          bool      `gorm:"not null;default:false;index" json:"isCompaction"`
 	RequestParametersJSON string    `gorm:"type:text" json:"-"`
 	PayloadLogDetail      string    `gorm:"size:16;not null;default:default" json:"payloadLogDetail"`
 	RequestBody           string    `gorm:"type:text" json:"requestBody"`
@@ -212,6 +213,7 @@ type RelaySessionState struct {
 	ClientKind          string    `gorm:"size:32;index" json:"clientKind"`
 	ClientFingerprint   string    `gorm:"size:64;index;index:idx_relay_session_client_recent,priority:2" json:"-"`
 	LatestRequestID     string    `gorm:"size:36" json:"latestRequestId"`
+	CompactionCount     int64     `gorm:"not null;default:0" json:"compactionCount"`
 	RequestManifestJSON string    `gorm:"type:text" json:"-"`
 	PayloadManifestJSON string    `gorm:"type:text" json:"-"`
 	CreatedAt           time.Time `json:"createdAt"`

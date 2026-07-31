@@ -1548,6 +1548,7 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 		CodexPromptHash:       codexPromptHash,
 		CodexTitleRequest:     codexTitleRequest,
 		CodexGeneratedTitle:   codexGeneratedTitle,
+		IsCompaction:          execution.payload.IsCompactionRequest,
 		RequestParametersJSON: requestParametersJSON,
 		PayloadLogDetail:      execution.payloadLogDetail,
 		ResponseBody:          responseBody,
@@ -1621,6 +1622,10 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 	steps := execution.trace.stepsFor(execution.requestID)
 	persistStarted := time.Now()
 	persistErr := s.store.db.WithContext(ctx).Transaction(func(db *gorm.DB) error {
+		var previousLog RelayRequestLog
+		if err := db.Select("is_compaction").Where("id = ?", log.ID).First(&previousLog).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
 		if err := db.Model(&ClientToken{}).Where("id = ?", execution.token.ID).Update("last_used_at", now).Error; err != nil {
 			return err
 		}
@@ -1688,6 +1693,11 @@ func (s *RelayService) recordRequest(ctx context.Context, execution *relayExecut
 				log.CodexSessionID = canonicalSessionID
 				log.CodexSessionSource = codexTitleSessionSource
 				log.SessionName = title
+			}
+		}
+		if log.IsCompaction && !previousLog.IsCompaction && log.CodexSessionID != "" {
+			if err := incrementSessionCompactionCount(db, log.TokenID, log.CodexSessionID, now); err != nil {
+				return err
 			}
 		}
 		return db.Clauses(clause.OnConflict{

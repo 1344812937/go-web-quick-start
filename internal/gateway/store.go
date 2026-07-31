@@ -109,6 +109,9 @@ func (s *Store) migrate() error {
 	if err := s.backfillCodexThreadSources(); err != nil {
 		return err
 	}
+	if err := s.backfillCodexCompactionTracking(); err != nil {
+		return err
+	}
 	return s.reclaimSQLiteSpaceOnce()
 }
 

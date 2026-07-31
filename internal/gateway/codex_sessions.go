@@ -65,18 +65,52 @@ func codexThreadSourceFromPayload(payload map[string]any) string {
 		if source := normalizeCodexThreadSource(stringValue(metadata["thread_source"])); source != "" {
 			return source
 		}
-		turnMetadata := make(map[string]any)
-		switch value := metadata["x-codex-turn-metadata"].(type) {
-		case string:
-			_ = json.Unmarshal([]byte(value), &turnMetadata)
-		case map[string]any:
-			turnMetadata = value
-		}
+		turnMetadata := codexTurnMetadata(metadata["x-codex-turn-metadata"])
 		if source := normalizeCodexThreadSource(stringValue(turnMetadata["thread_source"])); source != "" {
 			return source
 		}
 	}
 	return ""
+}
+
+func codexCompactionRequestFromPayload(payload map[string]any) bool {
+	for _, metadataKey := range []string{"client_metadata", "metadata"} {
+		metadata, _ := payload[metadataKey].(map[string]any)
+		if metadata == nil {
+			continue
+		}
+		turnMetadata := codexTurnMetadata(metadata["x-codex-turn-metadata"])
+		if strings.EqualFold(stringValue(turnMetadata["request_kind"]), "compaction") {
+			return true
+		}
+	}
+	return false
+}
+
+func codexTurnMetadata(value any) map[string]any {
+	switch typed := value.(type) {
+	case string:
+		metadata := make(map[string]any)
+		if json.Unmarshal([]byte(typed), &metadata) == nil {
+			return metadata
+		}
+	case map[string]any:
+		return typed
+	}
+	return nil
+}
+
+func codexCompactionRequestFromBody(body []byte) bool {
+	payload, ok := decodeJSONObject(body)
+	if !ok {
+		return false
+	}
+	if _, isDelta := payload["_gatewayLog"]; isDelta {
+		if nested, nestedOK := payload["payload"].(map[string]any); nestedOK {
+			payload = nested
+		}
+	}
+	return codexCompactionRequestFromPayload(payload)
 }
 
 func codexThreadSourceFromBody(body []byte) string {
@@ -614,6 +648,87 @@ func (s *Store) backfillCodexThreadSources() error {
 				if err := db.Model(&RelaySessionState{}).
 					Where("token_id = ? AND session_id = ?", identity.tokenID, identity.sessionID).
 					Update("thread_source", preferred).Error; err != nil {
+					return err
+				}
+			}
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: now}).Error
+	})
+}
+
+func incrementSessionCompactionCount(db *gorm.DB, tokenID uint64, sessionID string, now time.Time) error {
+	sessionID = truncateRunes(strings.TrimSpace(sessionID), 512)
+	if tokenID == 0 || sessionID == "" {
+		return nil
+	}
+	result := db.Model(&RelaySessionState{}).
+		Where("token_id = ? AND session_id = ?", tokenID, sessionID).
+		UpdateColumn("compaction_count", gorm.Expr("compaction_count + 1"))
+	if result.Error != nil || result.RowsAffected > 0 {
+		return result.Error
+	}
+	return db.Create(&RelaySessionState{
+		TokenID: tokenID, SessionID: sessionID, CompactionCount: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}).Error
+}
+
+func (s *Store) backfillCodexCompactionTracking() error {
+	const migrationName = "codex_compaction_tracking_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+
+		var logs []RelayRequestLog
+		if err := db.Select("id, request_body").Where("request_body <> ''").Find(&logs).Error; err != nil {
+			return err
+		}
+		for _, log := range logs {
+			body := []byte(decompressStoredPayload(log.RequestBody))
+			if !codexCompactionRequestFromBody(body) {
+				continue
+			}
+			if err := db.Model(&RelayRequestLog{}).Where("id = ?", log.ID).
+				UpdateColumn("is_compaction", true).Error; err != nil {
+				return err
+			}
+		}
+
+		if err := db.Model(&RelaySessionState{}).Where("compaction_count <> 0").
+			UpdateColumn("compaction_count", 0).Error; err != nil {
+			return err
+		}
+		type sessionCompactionCount struct {
+			TokenID         uint64
+			SessionID       string
+			CompactionCount int64
+		}
+		var counts []sessionCompactionCount
+		if err := db.Model(&RelayRequestLog{}).
+			Select("token_id, codex_session_id AS session_id, COUNT(*) AS compaction_count").
+			Where("is_compaction = ? AND codex_session_id <> ''", true).
+			Group("token_id, codex_session_id").Scan(&counts).Error; err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		for _, count := range counts {
+			result := db.Model(&RelaySessionState{}).
+				Where("token_id = ? AND session_id = ?", count.TokenID, count.SessionID).
+				UpdateColumn("compaction_count", count.CompactionCount)
+			if result.Error != nil {
+				return result.Error
+			}
+			if result.RowsAffected == 0 {
+				if err := db.Create(&RelaySessionState{
+					TokenID: count.TokenID, SessionID: count.SessionID, CompactionCount: count.CompactionCount,
+					CreatedAt: now, UpdatedAt: now,
+				}).Error; err != nil {
 					return err
 				}
 			}
