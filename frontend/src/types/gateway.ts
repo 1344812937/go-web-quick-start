@@ -325,6 +325,62 @@ export interface IssuedClientToken {
   secret: string
 }
 
+export type CodexProviderMode = 'existing' | 'new'
+export type CodexTokenMode = 'existing' | 'new'
+
+export interface CodexProviderConfiguration {
+  /** Stable model provider key used by Codex configuration. */
+  name: string
+  /** Provider display name stored inside its configuration table. */
+  displayName: string
+  /** OpenAI-compatible Responses API base URL. */
+  baseUrl: string
+  /** Codex wire protocol configured for this provider. */
+  wireApi: string
+  /** Whether Codex reads OPENAI_API_KEY from auth.json for this provider. */
+  requiresOpenAIAuth: boolean
+}
+
+export interface CodexLocalConfiguration {
+  /** Absolute path of the current OS user's Codex config.toml. */
+  configPath: string
+  /** Absolute path of the current OS user's Codex auth.json. */
+  authPath: string
+  /** Whether config.toml existed when the snapshot was loaded. */
+  configExists: boolean
+  /** Whether auth.json existed when the snapshot was loaded. */
+  authExists: boolean
+  /** Provider selected by the top-level model_provider setting. */
+  modelProvider: string
+  /** Model selected by the top-level model setting. */
+  model: string
+  /** Provider tables currently present in config.toml. */
+  providers: CodexProviderConfiguration[]
+  /** Whether auth.json contains an OPENAI_API_KEY value. */
+  authConfigured: boolean
+  /** Redacted prefix of the OPENAI_API_KEY value, or blank when absent. */
+  authKeyPrefix: string
+  /** Gateway token matching the auth.json key hash, or zero when no match exists. */
+  authTokenId: number
+}
+
+export interface CodexConfigurationSaveRequest {
+  /** Whether the save updates an existing provider table or creates a new one. */
+  providerMode: CodexProviderMode
+  /** Provider table key selected or entered by the administrator. */
+  providerName: string
+  /** Enabled public model Codex should request. */
+  model: string
+  /** OpenAI-compatible gateway base URL written to the provider table. */
+  baseUrl: string
+  /** Whether auth.json reuses its current matching token or receives a newly issued token. */
+  tokenMode: CodexTokenMode
+  /** Existing gateway token ID when tokenMode is existing. */
+  tokenId: number
+  /** Name assigned to the newly issued gateway token when tokenMode is new. */
+  newTokenName: string
+}
+
 export interface DashboardDaily {
   /** UTC+8 calendar date in YYYY-MM-DD format. */
   date: string
@@ -387,6 +443,10 @@ export interface DashboardBreakdown {
   successRate: number
   /** Input tokens attributed to this channel or public model. */
   inputTokens: number
+  /** Cached input tokens attributed to this channel or public model. */
+  cachedTokens: number
+  /** Cached input divided by total input for this channel or public model. */
+  cacheHitRate: number
   /** Output tokens attributed to this channel or public model. */
   outputTokens: number
   /** Estimated cost in micro-USD. */
@@ -492,8 +552,12 @@ export interface RouteDecisionCandidate {
   priceScore: number
   /** Composite first-token, response-latency, and throughput score used by this decision. */
   efficiencyScore: number
-  /** Composite success, cache, and recent-route balance score used by this decision. */
+  /** Composite recent success and cache-quality score used by this decision. */
   qualityScore: number
+  /** Base target share before recent-route balancing is applied. */
+  targetRouteShare: number
+  /** Confidence-weighted recent-route correction multiplier. */
+  balanceMultiplier: number
   /** Recent calls with cached input divided by calls with reported input usage. */
   cacheHitRate: number
   /** Recent calls with reported input usage used for cache-hit calculation. */
@@ -521,8 +585,10 @@ export interface RouteDecisionWeights {
   price: number
   /** Efficiency contribution applied to the composite route score, from zero to one. */
   efficiency: number
-  /** Residual success, cache, and route-balance contribution, from zero to one. */
+  /** Success and cache-quality contribution, from zero to one. */
   quality: number
+  /** Share of the final probability reserved for recent-route balancing. */
+  balance: number
 }
 
 export interface RouteDecision {
@@ -784,6 +850,17 @@ export interface LogPayloadCleanupResult {
   attemptLogsCleared: number
 }
 
+export interface LogStorageUsage {
+  /** UTC cutoff used by the cleanup action shown alongside this metric. */
+  cutoffAt: string
+  /** Combined bytes retained in request and attempt payload fields. */
+  payloadBytes: number
+  /** Bytes retained in request parameters and request/response bodies. */
+  requestPayloadBytes: number
+  /** Bytes retained in upstream-attempt request/response bodies. */
+  attemptPayloadBytes: number
+}
+
 export interface SessionChannel {
   /** Persistent channel identifier. */
   channelId: number
@@ -918,6 +995,17 @@ export interface CodexSessionPage {
   pageSize: number
 }
 
+export interface ActiveSessionPage {
+  /** Active user sessions for the selected page, populated with identity and latest-request fields. */
+  items: CodexSessionSummary[]
+  /** Total user sessions active within the server-defined activity window. */
+  total: number
+  /** One-based page number. */
+  page: number
+  /** Maximum active sessions returned on this page. */
+  pageSize: number
+}
+
 export interface CodexSessionDetail {
   /** Full five-day aggregate for the selected session. */
   summary: CodexSessionSummary
@@ -958,6 +1046,10 @@ export interface ApplicationSettings {
     routingPriceWeightPercent: number
     /** Efficiency contribution percentage used for new routing decisions. */
     routingEfficiencyWeightPercent: number
+    /** Success and cache quality contribution percentage used for new routing decisions. */
+    routingQualityWeightPercent: number
+    /** Recent traffic balance contribution percentage used for new routing decisions. */
+    routingBalanceWeightPercent: number
     /** Administrator login session lifetime in hours. */
     sessionTTLHours: number
     /** Whether the administrator cookie is restricted to HTTPS. */

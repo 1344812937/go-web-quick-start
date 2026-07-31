@@ -112,7 +112,37 @@ func (s *Store) migrate() error {
 	if err := s.backfillCodexCompactionTracking(); err != nil {
 		return err
 	}
+	if err := s.backfillRelaySessionActivity(); err != nil {
+		return err
+	}
 	return s.reclaimSQLiteSpaceOnce()
+}
+
+func (s *Store) backfillRelaySessionActivity() error {
+	const migrationName = "relay_session_activity_v1"
+	return s.db.Transaction(func(db *gorm.DB) error {
+		var migration GatewayMigration
+		err := db.First(&migration, "name = ?", migrationName).Error
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, gorm.ErrRecordNotFound) {
+			return err
+		}
+		if err := db.Exec(`
+			UPDATE relay_session_states
+			SET last_activity_at = COALESCE(
+				(SELECT latest.created_at FROM relay_request_logs AS latest WHERE latest.id = relay_session_states.latest_request_id),
+				(SELECT MAX(session_log.created_at) FROM relay_request_logs AS session_log
+				 WHERE session_log.token_id = relay_session_states.token_id
+				 AND session_log.codex_session_id = relay_session_states.session_id)
+			)
+			WHERE last_activity_at IS NULL
+		`).Error; err != nil {
+			return err
+		}
+		return db.Create(&GatewayMigration{Name: migrationName, AppliedAt: time.Now().UTC()}).Error
+	})
 }
 
 func (s *Store) ensureSessionCandidateIndexes() error {

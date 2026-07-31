@@ -1,11 +1,13 @@
 import type { Component } from 'vue'
 import type { RouteRecordRaw } from 'vue-router'
 import {
+  ChatDotRound,
   ChatLineSquare,
   Connection,
   DataBoard,
   Grid,
   Key,
+  Reading,
   Setting,
   Tickets,
   WarningFilled,
@@ -24,6 +26,8 @@ export interface NavigationItem {
   routeName?: string
   /** Lazy page component mounted when the menu leaf is visited. */
   component?: RouteRecordRaw['component']
+  /** Workspace scrolling strategy used after the fixed breadcrumb toolbar. */
+  workspaceMode?: 'scroll' | 'contained'
   /** Nested functional menus; nesting may continue to any practical depth. */
   children?: NavigationItem[]
 }
@@ -54,6 +58,14 @@ export const navigationGroups: NavigationGroup[] = [
         label: '渠道管理',
         icon: Connection,
         component: () => import('@/pages/Channels.vue'),
+      },
+      {
+        key: 'active-sessions',
+        path: '/active-sessions',
+        routeName: 'active-sessions',
+        label: '活跃会话',
+        icon: ChatDotRound,
+        component: () => import('@/pages/ActiveSessions.vue'),
       },
       {
         key: 'circuit-records',
@@ -101,6 +113,15 @@ export const navigationGroups: NavigationGroup[] = [
     label: '系统',
     items: [
       {
+        key: 'user-manual',
+        path: '/manual',
+        routeName: 'user-manual',
+        label: '使用手册',
+        icon: Reading,
+        component: () => import('@/pages/UserManual.vue'),
+        workspaceMode: 'contained',
+      },
+      {
         key: 'settings',
         path: '/settings',
         routeName: 'settings',
@@ -138,6 +159,7 @@ function collectRoutes(
         title: item.label,
         breadcrumbs: [groupLabel, ...itemLabels],
         menuKey: item.key,
+        workspaceMode: item.workspaceMode ?? 'scroll',
       },
     }
     return [currentRoute, ...childRoutes]

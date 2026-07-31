@@ -28,8 +28,8 @@ func TestGatewayConfigDefaultsPayloadLogDetail(t *testing.T) {
 	if gatewayConfig.PayloadLogDetail != PayloadLogDetailDefault {
 		t.Fatalf("payload log detail = %q, want %q", gatewayConfig.PayloadLogDetail, PayloadLogDetailDefault)
 	}
-	if gatewayConfig.RoutingPriceWeightPercent != DefaultRoutingPriceWeightPercent || gatewayConfig.RoutingEfficiencyWeightPercent != DefaultRoutingEfficiencyWeightPercent {
-		t.Fatalf("routing weights = %d/%d", gatewayConfig.RoutingPriceWeightPercent, gatewayConfig.RoutingEfficiencyWeightPercent)
+	if gatewayConfig.RoutingPriceWeightPercent != DefaultRoutingPriceWeightPercent || gatewayConfig.RoutingEfficiencyWeightPercent != DefaultRoutingEfficiencyWeightPercent || gatewayConfig.RoutingQualityWeightPercent != DefaultRoutingQualityWeightPercent || gatewayConfig.RoutingBalanceWeightPercent != DefaultRoutingBalanceWeightPercent {
+		t.Fatalf("routing weights = %d/%d/%d/%d", gatewayConfig.RoutingPriceWeightPercent, gatewayConfig.RoutingEfficiencyWeightPercent, gatewayConfig.RoutingQualityWeightPercent, gatewayConfig.RoutingBalanceWeightPercent)
 	}
 }
 
@@ -83,14 +83,16 @@ func TestApplicationConfigManagerSaveUpdatesRoutingWeightsAtRuntime(t *testing.T
 	manager := &ApplicationConfigManager{}
 	cfg := &ApplicationConfig{GatewayConfig: GatewayConfig{
 		RoutingPriceWeightPercent:      60,
-		RoutingEfficiencyWeightPercent: 30,
+		RoutingEfficiencyWeightPercent: 20,
+		RoutingQualityWeightPercent:    10,
+		RoutingBalanceWeightPercent:    10,
 	}}
 	if err := manager.Save(cfg); err != nil {
 		t.Fatalf("Save(weights) error = %v", err)
 	}
-	price, efficiency, quality := EffectiveRoutingDecisionWeights(manager.GetConfig())
-	if price != 0.6 || efficiency != 0.3 || quality != 0.1 {
-		t.Fatalf("runtime routing weights = %v/%v/%v", price, efficiency, quality)
+	price, efficiency, quality, balance := EffectiveRoutingDecisionWeights(manager.GetConfig())
+	if price != 0.6 || efficiency != 0.2 || quality != 0.1 || balance != 0.1 {
+		t.Fatalf("runtime routing weights = %v/%v/%v/%v", price, efficiency, quality, balance)
 	}
 
 	cfg.GatewayConfig.RoutingPriceWeightPercent = 80
@@ -98,28 +100,28 @@ func TestApplicationConfigManagerSaveUpdatesRoutingWeightsAtRuntime(t *testing.T
 	if err := manager.Save(cfg); err == nil {
 		t.Fatal("Save(invalid weights) error = nil")
 	}
-	price, efficiency, quality = EffectiveRoutingDecisionWeights(manager.GetConfig())
-	if price != 0.6 || efficiency != 0.3 || quality != 0.1 {
-		t.Fatalf("invalid save changed runtime routing weights to %v/%v/%v", price, efficiency, quality)
+	price, efficiency, quality, balance = EffectiveRoutingDecisionWeights(manager.GetConfig())
+	if price != 0.6 || efficiency != 0.2 || quality != 0.1 || balance != 0.1 {
+		t.Fatalf("invalid save changed runtime routing weights to %v/%v/%v/%v", price, efficiency, quality, balance)
 	}
 }
 
 func TestRoutingDecisionWeightsReserveMinimumQualityShare(t *testing.T) {
-	valid := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 35}
+	valid := GatewayConfig{RoutingPriceWeightPercent: 50, RoutingEfficiencyWeightPercent: 30, RoutingQualityWeightPercent: 5, RoutingBalanceWeightPercent: 15}
 	if err := normalizeRoutingDecisionWeights(&valid); err != nil {
 		t.Fatalf("minimum quality share rejected: %v", err)
 	}
-	invalid := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 36}
+	invalid := GatewayConfig{RoutingPriceWeightPercent: 50, RoutingEfficiencyWeightPercent: 31, RoutingQualityWeightPercent: 4, RoutingBalanceWeightPercent: 15}
 	if err := normalizeRoutingDecisionWeights(&invalid); err == nil {
 		t.Fatal("routing weights below minimum quality share were accepted")
 	}
 
-	legacy := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 40}
-	if !migrateLegacyRoutingDecisionWeights(&legacy) {
+	legacy := GatewayConfig{RoutingPriceWeightPercent: 60, RoutingEfficiencyWeightPercent: 35}
+	if !completeRoutingDecisionWeights(&legacy, configFieldPresence{}) {
 		t.Fatal("legacy routing weights were not migrated")
 	}
-	if legacy.RoutingPriceWeightPercent != 60 || legacy.RoutingEfficiencyWeightPercent != 35 {
-		t.Fatalf("migrated routing weights = %d/%d, want 60/35", legacy.RoutingPriceWeightPercent, legacy.RoutingEfficiencyWeightPercent)
+	if legacy.RoutingPriceWeightPercent != 60 || legacy.RoutingEfficiencyWeightPercent != 35 || legacy.RoutingQualityWeightPercent != 5 || legacy.RoutingBalanceWeightPercent != 0 {
+		t.Fatalf("migrated routing weights = %d/%d/%d/%d, want 60/35/5/0", legacy.RoutingPriceWeightPercent, legacy.RoutingEfficiencyWeightPercent, legacy.RoutingQualityWeightPercent, legacy.RoutingBalanceWeightPercent)
 	}
 }
 

@@ -24,8 +24,10 @@ var configPath = filepath.Join("./", "config", "config.toml")
 const (
 	DefaultWebHost                        = "0.0.0.0"
 	DefaultWebPort                        = "8888"
-	DefaultRoutingPriceWeightPercent      = 45
-	DefaultRoutingEfficiencyWeightPercent = 45
+	DefaultRoutingPriceWeightPercent      = 40
+	DefaultRoutingEfficiencyWeightPercent = 35
+	DefaultRoutingQualityWeightPercent    = 15
+	DefaultRoutingBalanceWeightPercent    = 10
 	MinimumRoutingQualityWeightPercent    = 5
 	PayloadLogDetailDefault               = "default"
 	PayloadLogDetailSummary               = "summary"
@@ -87,7 +89,7 @@ func (acm *ApplicationConfigManager) Load() {
 	}
 	cfg.GatewayConfig.PayloadLogDetail = payloadLogDetail
 	cfg.GatewayConfig.CommonModelNames = normalizeCommonModelNames(cfg.GatewayConfig.CommonModelNames)
-	routingWeightsMigrated := migrateLegacyRoutingDecisionWeights(&cfg.GatewayConfig)
+	routingWeightsMigrated := completeRoutingDecisionWeights(&cfg.GatewayConfig, presence)
 	if err := normalizeRoutingDecisionWeights(&cfg.GatewayConfig); err != nil {
 		panic(err)
 	}
@@ -147,8 +149,10 @@ type GatewayConfig struct {
 	RequestBodyLimitMB             int      `toml:"request_body_limit_mb" json:"requestBodyLimitMB" default:"32"`
 	ResponseHeaderTimeoutSeconds   int      `toml:"response_header_timeout_seconds" json:"responseHeaderTimeoutSeconds" default:"120"`
 	StreamIdleTimeoutSeconds       int      `toml:"stream_idle_timeout_seconds" json:"streamIdleTimeoutSeconds" default:"300"`
-	RoutingPriceWeightPercent      int      `toml:"routing_price_weight_percent" json:"routingPriceWeightPercent" default:"45"`
-	RoutingEfficiencyWeightPercent int      `toml:"routing_efficiency_weight_percent" json:"routingEfficiencyWeightPercent" default:"45"`
+	RoutingPriceWeightPercent      int      `toml:"routing_price_weight_percent" json:"routingPriceWeightPercent" default:"40"`
+	RoutingEfficiencyWeightPercent int      `toml:"routing_efficiency_weight_percent" json:"routingEfficiencyWeightPercent" default:"35"`
+	RoutingQualityWeightPercent    int      `toml:"routing_quality_weight_percent" json:"routingQualityWeightPercent" default:"15"`
+	RoutingBalanceWeightPercent    int      `toml:"routing_balance_weight_percent" json:"routingBalanceWeightPercent" default:"10"`
 	SessionTTLHours                int      `toml:"session_ttl_hours" json:"sessionTTLHours" default:"12"`
 	SecureCookie                   bool     `toml:"secure_cookie" json:"secureCookie" default:"false"`
 	PayloadLogDetail               string   `toml:"payload_log_detail" json:"payloadLogDetail" default:"default"`
@@ -160,6 +164,9 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 		return errors.New("配置不能为空")
 	}
 	configCopy := *cfg
+	if configCopy.GatewayConfig.RoutingQualityWeightPercent == 0 && configCopy.GatewayConfig.RoutingBalanceWeightPercent == 0 && configCopy.GatewayConfig.RoutingPriceWeightPercent+configCopy.GatewayConfig.RoutingEfficiencyWeightPercent <= 100-MinimumRoutingQualityWeightPercent {
+		completeRoutingDecisionWeights(&configCopy.GatewayConfig, configFieldPresence{})
+	}
 	payloadLogDetail, err := normalizePayloadLogDetail(configCopy.GatewayConfig.PayloadLogDetail)
 	if err != nil {
 		return err
@@ -179,28 +186,56 @@ func (acm *ApplicationConfigManager) Save(cfg *ApplicationConfig) error {
 }
 
 func normalizeRoutingDecisionWeights(gatewayConfig *GatewayConfig) error {
-	if gatewayConfig.RoutingPriceWeightPercent == 0 && gatewayConfig.RoutingEfficiencyWeightPercent == 0 {
+	if gatewayConfig.RoutingPriceWeightPercent == 0 && gatewayConfig.RoutingEfficiencyWeightPercent == 0 && gatewayConfig.RoutingQualityWeightPercent == 0 && gatewayConfig.RoutingBalanceWeightPercent == 0 {
 		gatewayConfig.RoutingPriceWeightPercent = DefaultRoutingPriceWeightPercent
 		gatewayConfig.RoutingEfficiencyWeightPercent = DefaultRoutingEfficiencyWeightPercent
+		gatewayConfig.RoutingQualityWeightPercent = DefaultRoutingQualityWeightPercent
+		gatewayConfig.RoutingBalanceWeightPercent = DefaultRoutingBalanceWeightPercent
+	} else if gatewayConfig.RoutingQualityWeightPercent == 0 && gatewayConfig.RoutingBalanceWeightPercent == 0 {
+		remaining := 100 - gatewayConfig.RoutingPriceWeightPercent - gatewayConfig.RoutingEfficiencyWeightPercent
+		if remaining >= MinimumRoutingQualityWeightPercent {
+			gatewayConfig.RoutingBalanceWeightPercent = min(DefaultRoutingBalanceWeightPercent, remaining-MinimumRoutingQualityWeightPercent)
+			gatewayConfig.RoutingQualityWeightPercent = remaining - gatewayConfig.RoutingBalanceWeightPercent
+		}
 	}
 	price := gatewayConfig.RoutingPriceWeightPercent
 	efficiency := gatewayConfig.RoutingEfficiencyWeightPercent
-	maximumPrimaryWeight := 100 - MinimumRoutingQualityWeightPercent
-	if price < 0 || price > maximumPrimaryWeight || efficiency < 0 || efficiency > maximumPrimaryWeight || price+efficiency > maximumPrimaryWeight {
-		return fmt.Errorf("路由价格与效率占比必须在 0%% 到 %d%% 之间，且质量与均衡占比不能低于 %d%%", maximumPrimaryWeight, MinimumRoutingQualityWeightPercent)
+	quality := gatewayConfig.RoutingQualityWeightPercent
+	balance := gatewayConfig.RoutingBalanceWeightPercent
+	if price < 0 || price > 100 || efficiency < 0 || efficiency > 100 || quality < MinimumRoutingQualityWeightPercent || quality > 100 || balance < 0 || balance > 100 || price+efficiency+quality+balance != 100 {
+		return fmt.Errorf("路由价格、效率、质量与均衡占比之和必须为 100%%，且质量占比不能低于 %d%%", MinimumRoutingQualityWeightPercent)
 	}
 	return nil
 }
 
-func migrateLegacyRoutingDecisionWeights(gatewayConfig *GatewayConfig) bool {
-	price := gatewayConfig.RoutingPriceWeightPercent
-	efficiency := gatewayConfig.RoutingEfficiencyWeightPercent
-	if price < 0 || price > 100 || efficiency < 0 || efficiency > 100 || price+efficiency <= 100-MinimumRoutingQualityWeightPercent || price+efficiency > 100 {
+func completeRoutingDecisionWeights(gatewayConfig *GatewayConfig, presence configFieldPresence) bool {
+	if presence.RoutingQualityWeight && presence.RoutingBalanceWeight {
 		return false
 	}
-	maximumPrimaryWeight := 100 - MinimumRoutingQualityWeightPercent
-	gatewayConfig.RoutingPriceWeightPercent = min(price, maximumPrimaryWeight)
-	gatewayConfig.RoutingEfficiencyWeightPercent = min(efficiency, maximumPrimaryWeight-gatewayConfig.RoutingPriceWeightPercent)
+	price := min(max(gatewayConfig.RoutingPriceWeightPercent, 0), 100-MinimumRoutingQualityWeightPercent)
+	efficiency := min(max(gatewayConfig.RoutingEfficiencyWeightPercent, 0), 100-price-MinimumRoutingQualityWeightPercent)
+	if price == 0 && efficiency == 0 {
+		price = DefaultRoutingPriceWeightPercent
+		efficiency = DefaultRoutingEfficiencyWeightPercent
+	}
+	remaining := 100 - price - efficiency
+	quality := gatewayConfig.RoutingQualityWeightPercent
+	balance := gatewayConfig.RoutingBalanceWeightPercent
+	switch {
+	case !presence.RoutingQualityWeight && !presence.RoutingBalanceWeight:
+		balance = min(DefaultRoutingBalanceWeightPercent, max(remaining-MinimumRoutingQualityWeightPercent, 0))
+		quality = remaining - balance
+	case !presence.RoutingQualityWeight:
+		balance = min(max(balance, 0), max(remaining-MinimumRoutingQualityWeightPercent, 0))
+		quality = remaining - balance
+	case !presence.RoutingBalanceWeight:
+		quality = min(max(quality, MinimumRoutingQualityWeightPercent), remaining)
+		balance = remaining - quality
+	}
+	gatewayConfig.RoutingPriceWeightPercent = price
+	gatewayConfig.RoutingEfficiencyWeightPercent = efficiency
+	gatewayConfig.RoutingQualityWeightPercent = quality
+	gatewayConfig.RoutingBalanceWeightPercent = balance
 	return true
 }
 
@@ -225,17 +260,21 @@ func normalizeCommonModelNames(values []string) []string {
 	return normalized
 }
 
-func EffectiveRoutingDecisionWeights(cfg *ApplicationConfig) (price float64, efficiency float64, quality float64) {
+func EffectiveRoutingDecisionWeights(cfg *ApplicationConfig) (price float64, efficiency float64, quality float64, balance float64) {
 	pricePercent := DefaultRoutingPriceWeightPercent
 	efficiencyPercent := DefaultRoutingEfficiencyWeightPercent
+	qualityPercent := DefaultRoutingQualityWeightPercent
+	balancePercent := DefaultRoutingBalanceWeightPercent
 	if cfg != nil {
 		candidate := cfg.GatewayConfig
 		if normalizeRoutingDecisionWeights(&candidate) == nil {
 			pricePercent = candidate.RoutingPriceWeightPercent
 			efficiencyPercent = candidate.RoutingEfficiencyWeightPercent
+			qualityPercent = candidate.RoutingQualityWeightPercent
+			balancePercent = candidate.RoutingBalanceWeightPercent
 		}
 	}
-	return float64(pricePercent) / 100, float64(efficiencyPercent) / 100, float64(100-pricePercent-efficiencyPercent) / 100
+	return float64(pricePercent) / 100, float64(efficiencyPercent) / 100, float64(qualityPercent) / 100, float64(balancePercent) / 100
 }
 
 func normalizePayloadLogDetail(value string) (string, error) {

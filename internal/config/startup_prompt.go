@@ -16,9 +16,11 @@ import (
 )
 
 type configFieldPresence struct {
-	WebHost         bool
-	WebPort         bool
-	NodeSharedToken bool
+	WebHost              bool
+	WebPort              bool
+	NodeSharedToken      bool
+	RoutingQualityWeight bool
+	RoutingBalanceWeight bool
 }
 
 type startupGuidePlan struct {
@@ -42,9 +44,11 @@ func detectConfigFieldPresence(content []byte) (configFieldPresence, error) {
 		return configFieldPresence{}, err
 	}
 	return configFieldPresence{
-		WebHost:         hasTomlKey(raw, "web_config", "host"),
-		WebPort:         hasTomlKey(raw, "web_config", "port"),
-		NodeSharedToken: hasTomlKey(raw, "node_config", "shared_token"),
+		WebHost:              hasTomlKey(raw, "web_config", "host"),
+		WebPort:              hasTomlKey(raw, "web_config", "port"),
+		NodeSharedToken:      hasTomlKey(raw, "node_config", "shared_token"),
+		RoutingQualityWeight: hasTomlKey(raw, "gateway_config", "routing_quality_weight_percent"),
+		RoutingBalanceWeight: hasTomlKey(raw, "gateway_config", "routing_balance_weight_percent"),
 	}, nil
 }
 

@@ -507,7 +507,7 @@ func (s *Store) applyMergedCodexTitle(db *gorm.DB, tokenID uint64, sessionID str
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return db.Create(&RelaySessionState{
 			TokenID: tokenID, SessionID: sessionID, Title: title, LatestRequestID: requestID,
-			CreatedAt: now, UpdatedAt: now,
+			LastActivityAt: &now, CreatedAt: now, UpdatedAt: now,
 		}).Error
 	}
 	if err != nil || state.TitleCustomized {
@@ -515,7 +515,7 @@ func (s *Store) applyMergedCodexTitle(db *gorm.DB, tokenID uint64, sessionID str
 	}
 	return db.Model(&RelaySessionState{}).
 		Where("token_id = ? AND session_id = ?", tokenID, sessionID).
-		Updates(map[string]any{"title": title, "updated_at": now}).Error
+		Updates(map[string]any{"title": title, "last_activity_at": now, "updated_at": now}).Error
 }
 
 func (s *Store) backfillCodexAuxiliarySessions() error {

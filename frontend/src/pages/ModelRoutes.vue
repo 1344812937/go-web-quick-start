@@ -46,7 +46,7 @@ const visibleModels = computed(() => {
 const hiddenModelCount = computed(() => Math.max(0, models.value.length - maxVisibleModels))
 const modelTableEmptyText = computed(() => modelSearchQuery.value.trim() ? '未找到匹配的公开模型' : '还没有公开模型')
 const strategies: Array<{ value: RoutingStrategy; label: string; note: string }> = [
-  { value: 'priority_weighted', label: '优先级加权', note: '先限定最高优先级，再按系统配置的价格、效率和质量占比抽样' },
+  { value: 'priority_weighted', label: '优先级加权', note: '先限定最高优先级，再按价格、效率、质量与近期均衡占比抽样' },
   { value: 'lowest_cost', label: '成本优先', note: '在系统价格占比基础上放大渠道间的价格优势' },
   { value: 'lowest_latency', label: '效率优先', note: '在系统效率占比基础上放大首 token、延迟和吞吐优势' },
 ]
@@ -232,12 +232,12 @@ onMounted(loadData)
             <div><h3>优先级加权</h3><p>先锁定最高优先级，再在组内按综合期望值抽样。</p></div>
           </header>
           <div class="strategy-formula">
-            <span>候选期望值</span>
-            <code>E<sub>i</sub> = 1[p<sub>i</sub> = p<sub>max</sub>] &times; w<sub>i</sub> &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
+            <span>候选基础分</span>
+            <code>B<sub>i</sub> = 1[p<sub>i</sub> = p<sub>max</sub>] &times; w<sub>i</sub> &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
           </div>
           <ol class="strategy-steps">
             <li><strong>分组</strong><span>只保留优先级 <code>p<sub>max</sub></code> 的渠道，低优先级本轮概率为 0。</span></li>
-            <li><strong>加权</strong><span>同级渠道按系统配置的价格、效率、质量占比和渠道权重形成期望值。</span></li>
+            <li><strong>加权</strong><span>同级渠道先按价格、效率、质量和渠道权重形成基础目标占比，再按近期实际占比纠偏。</span></li>
             <li><strong>选择</strong><span>同级渠道按 <code>P<sub>i</sub></code> 随机抽样，不是固定轮询第一名。</span></li>
           </ol>
           <p class="strategy-conclusion"><strong>适合：</strong>有明确主备层级，同时希望同级渠道自动均衡。</p>
@@ -281,18 +281,19 @@ onMounted(loadData)
 
           <footer class="factor-legend">
             <div class="base-equation">
-              <span>三种策略共享的综合分</span>
-              <code>E<sub>i</sub> = max(w<sub>i</sub>, 1) / 100 &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
+              <span>三种策略共享的基础分与最终概率</span>
+              <code>B<sub>i</sub> = max(w<sub>i</sub>, 1) / 100 &times; (&alpha;C<sub>i</sub> + &beta;F<sub>i</sub> + &gamma;Q<sub>i</sub>)</code>
+              <code>P<sub>i</sub> = (1 - &delta;)T<sub>i</sub> + &delta;R<sub>i</sub></code>
             </div>
             <dl>
-              <div><dt>&alpha; / &beta;</dt><dd>系统设置中的价格占比与效率占比，保存后实时生效</dd></div>
-              <div><dt>&gamma;</dt><dd><code>1 - &alpha; - &beta;</code>，用于成功率、缓存和近期分流均衡</dd></div>
+              <div><dt>&alpha; / &beta; / &gamma;</dt><dd>系统设置中的价格、效率与质量占比，保存后实时生效</dd></div>
+              <div><dt>&delta;</dt><dd>均衡占比；将基础目标 <code>T</code> 与按近期实际偏差修正后的 <code>R</code> 混合</dd></div>
               <div><dt>C</dt><dd>本次缓存修正后预计费用相对最低费用的归一化价格分</dd></div>
               <div><dt>F</dt><dd>首 token 45%、响应头延迟 20%、输出吞吐 35%</dd></div>
-              <div><dt>Q</dt><dd>成功率 65%、缓存命中 15%、缓存率 10%、流量均衡 10%</dd></div>
+              <div><dt>Q</dt><dd>成功率 70%、缓存命中 18%、缓存 Token 率 12%</dd></div>
               <div><dt>w</dt><dd>渠道模型映射的配置权重，最小按 1 计算</dd></div>
             </dl>
-            <p>成本优先会平方价格分，效率优先会平方效率分；新渠道继续保留 20% 的有界探索流量。</p>
+            <p>近期均衡只统计当前模型可路由候选，样本随候选数从 100 条扩展到最多 1000 条；修正乘数限制在 0.5～1.5，新渠道继续保留 20% 的有界探索流量。</p>
           </footer>
         </el-collapse-item>
       </el-collapse>
@@ -441,7 +442,7 @@ onMounted(loadData)
 .select-option { display: grid; line-height: 1.3; }
 .select-option small { color: var(--rose-text-muted); font-size: 11px; }
 @media (min-width: 961px) {
-  .model-route-page { height: calc(100dvh - var(--rose-header-height) - 100px); grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; }
+  .model-route-page { height: 100%; min-height: 0; grid-template-rows: auto auto minmax(0, 1fr); overflow: hidden; }
   .model-route-page > .table-panel { display: flex; align-self: stretch; width: 100%; min-height: 0; flex-direction: column; }
   .model-route-page > .table-panel > .model-list-table { flex: 1; min-height: 0; }
   .model-list-expand-bar, .table-empty-action { flex: none; }

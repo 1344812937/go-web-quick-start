@@ -56,6 +56,8 @@ type RouteDecisionCandidate struct {
 	PriceScore         float64 `json:"priceScore"`
 	EfficiencyScore    float64 `json:"efficiencyScore"`
 	QualityScore       float64 `json:"qualityScore"`
+	TargetRouteShare   float64 `json:"targetRouteShare"`
+	BalanceMultiplier  float64 `json:"balanceMultiplier"`
 	CacheHitRate       float64 `json:"cacheHitRate"`
 	CacheSampleCount   int64   `json:"cacheSampleCount"`
 	CacheRate          float64 `json:"cacheRate"`
@@ -79,6 +81,7 @@ type RouteDecisionWeights struct {
 	Price      float64 `json:"price"`
 	Efficiency float64 `json:"efficiency"`
 	Quality    float64 `json:"quality"`
+	Balance    float64 `json:"balance"`
 }
 
 type RoutePlan struct {
@@ -88,6 +91,7 @@ type RoutePlan struct {
 	Affinity                 bool
 	SessionAffinity          bool
 	SessionAffinityMappingID uint64
+	RefreshSessionAffinity   bool
 }
 
 type RouteSelection struct {
@@ -160,6 +164,36 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 	if outputTokens <= 0 {
 		outputTokens = r.recentOutputMedian(ctx, model.Name)
 	}
+	var candidates []RouteCandidate
+	modelSwitched := previousSessionRoute != nil &&
+		previousSessionRoute.Successful &&
+		previousSessionRoute.RequestedModel != "" &&
+		previousSessionRoute.RequestedModel != model.Name
+	if modelSwitched {
+		candidates, err = r.availableCandidates(ctx, model.ID, model.RoutingStrategy, inputTokens, outputTokens)
+		if err != nil {
+			return nil, err
+		}
+		if len(candidates) == 0 {
+			return nil, ErrNoAvailableChannel
+		}
+		r.orderCandidatesWithoutWeightedAdvance(model.RoutingStrategy, candidates)
+		if pinChannelCandidate(candidates, previousSessionRoute.ChannelID) {
+			return &RoutePlan{
+				Model:                  model,
+				Candidates:             candidates,
+				SessionAffinity:        true,
+				RefreshSessionAffinity: true,
+				InitialSelection: RouteSelection{
+					PreviousChannelID:   previousSessionRoute.ChannelID,
+					PreviousChannelName: previousSessionRoute.ChannelName,
+					Reason:              SelectionReasonModelSwitch,
+					Detail:              previousSessionRoute.RequestedModel + " -> " + model.Name,
+					Decision:            deterministicRouteDecision(model.RoutingStrategy, "session_affinity", candidates),
+				},
+			}, nil
+		}
+	}
 
 	if previousResponseID != "" {
 		candidate, err := r.affinityCandidate(ctx, model.ID, previousResponseID, inputTokens, outputTokens)
@@ -176,9 +210,11 @@ func (r *Router) Plan(ctx context.Context, token *ClientToken, modelName string,
 		return plan, nil
 	}
 
-	candidates, err := r.availableCandidates(ctx, model.ID, inputTokens, outputTokens)
-	if err != nil {
-		return nil, err
+	if candidates == nil {
+		candidates, err = r.availableCandidates(ctx, model.ID, model.RoutingStrategy, inputTokens, outputTokens)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if len(candidates) == 0 {
 		return nil, ErrNoAvailableChannel
@@ -220,6 +256,7 @@ type sessionRouteSnapshot struct {
 	RequestedModel string
 	ChannelID      uint64
 	ChannelName    string
+	Successful     bool
 }
 
 func (r *Router) previousSessionRoute(ctx context.Context, tokenID uint64, sessionKey string) (*sessionRouteSnapshot, error) {
@@ -229,7 +266,7 @@ func (r *Router) previousSessionRoute(ctx context.Context, tokenID uint64, sessi
 	var snapshot sessionRouteSnapshot
 	db := r.store.db.WithContext(ctx)
 	err := db.Table("relay_session_states AS state").
-		Select("request.requested_model, attempt.channel_id, attempt.channel_name").
+		Select("request.requested_model, attempt.channel_id, attempt.channel_name, attempt.success AS successful").
 		Joins("JOIN relay_request_logs AS request ON request.id = state.latest_request_id").
 		Joins("JOIN relay_attempt_logs AS attempt ON attempt.request_id = request.id").
 		Where("state.token_id = ? AND state.session_id = ?", tokenID, sessionKey).
@@ -244,7 +281,7 @@ func (r *Router) previousSessionRoute(ctx context.Context, tokenID uint64, sessi
 
 	// Legacy state and route-stage failures may not point at a request with attempts.
 	err = db.Table("relay_attempt_logs AS attempt").
-		Select("request.requested_model, attempt.channel_id, attempt.channel_name").
+		Select("request.requested_model, attempt.channel_id, attempt.channel_name, attempt.success AS successful").
 		Joins("JOIN relay_request_logs AS request ON request.id = attempt.request_id").
 		Where("request.token_id = ? AND request.codex_session_id = ?", tokenID, sessionKey).
 		Order("request.created_at DESC, attempt.created_at DESC, attempt.id DESC").
@@ -332,7 +369,25 @@ func pinCandidate(candidates []RouteCandidate, channelModelID uint64) bool {
 	return false
 }
 
-func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputTokens int64, outputTokens int64) ([]RouteCandidate, error) {
+func pinChannelCandidate(candidates []RouteCandidate, channelID uint64) bool {
+	if channelID == 0 {
+		return false
+	}
+	for index := range candidates {
+		if candidates[index].Channel.ID != channelID {
+			continue
+		}
+		if index > 0 {
+			candidate := candidates[index]
+			copy(candidates[1:index+1], candidates[:index])
+			candidates[0] = candidate
+		}
+		return true
+	}
+	return false
+}
+
+func (r *Router) availableCandidates(ctx context.Context, modelID uint64, strategy string, inputTokens int64, outputTokens int64) ([]RouteCandidate, error) {
 	var mappings []ChannelModel
 	if err := r.store.db.WithContext(ctx).Where("model_id = ? AND enabled = ?", modelID, true).Find(&mappings).Error; err != nil {
 		return nil, err
@@ -363,7 +418,24 @@ func (r *Router) availableCandidates(ctx context.Context, modelID uint64, inputT
 	if err != nil {
 		return nil, err
 	}
-	recentRouting, err := loadRecentRoutingMetrics(ctx, r.store.db, channelModelIDs, now)
+	routableMappingIDs := make([]uint64, 0, len(mappings))
+	maxRoutablePriority := 0
+	if strategy == RoutingPriorityWeighted {
+		for _, mapping := range mappings {
+			channel, exists := channelsByID[mapping.ChannelID]
+			if exists && channel.Enabled && (channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(now)) {
+				maxRoutablePriority = max(maxRoutablePriority, mapping.Priority)
+			}
+		}
+	}
+	for _, mapping := range mappings {
+		channel, exists := channelsByID[mapping.ChannelID]
+		eligiblePriority := strategy != RoutingPriorityWeighted || mapping.Priority == maxRoutablePriority
+		if exists && channel.Enabled && eligiblePriority && (channel.CircuitOpenUntil == nil || !channel.CircuitOpenUntil.After(now)) {
+			routableMappingIDs = append(routableMappingIDs, mapping.ID)
+		}
+	}
+	recentRouting, err := loadRecentRoutingMetrics(ctx, r.store.db, routableMappingIDs, now)
 	if err != nil {
 		return nil, err
 	}

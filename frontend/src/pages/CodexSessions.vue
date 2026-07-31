@@ -318,7 +318,7 @@ onMounted(async () => {
 .session-tokens strong { color: var(--rose-text); font-size: 12px; }
 .session-sent { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
 @media (min-width: 961px) {
-  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
+  .log-page { height: 100%; min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
   .log-table-panel { min-height: 0; }
   .log-table-panel > .el-table { min-height: 0; flex: 1 1 0; }
   .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }

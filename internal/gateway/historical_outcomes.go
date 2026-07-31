@@ -11,7 +11,7 @@ import (
 	"gorm.io/gorm"
 )
 
-const historicalApplicationOutcomesMigration = "application_outcomes_v2"
+const historicalApplicationOutcomesMigration = "application_outcomes_v3"
 
 type historicalRequestOutcomeRow struct {
 	ID                    string
@@ -197,6 +197,7 @@ func classifyHistoricalResponse(endpoint string, stream bool, storedBody string,
 	reader := bufio.NewReader(strings.NewReader(body))
 	receivedEvent := false
 	terminalSuccess := false
+	hasUsableOutput := false
 	responseID := ""
 	for {
 		event, readErr := readSSEEvent(reader)
@@ -211,6 +212,9 @@ func classifyHistoricalResponse(endpoint string, stream bool, storedBody string,
 			if sseEventIsTerminalSuccess(event, endpoint) {
 				terminalSuccess = true
 			}
+			if endpoint != "responses" || sseEventHasUsableResponseOutput(event) {
+				hasUsableOutput = true
+			}
 		}
 		if readErr != nil {
 			if !errors.Is(readErr, io.EOF) && !truncated {
@@ -220,6 +224,9 @@ func classifyHistoricalResponse(endpoint string, stream bool, storedBody string,
 		}
 	}
 	if terminalSuccess {
+		if endpoint == "responses" && !hasUsableOutput {
+			return emptyUpstreamResponseFailure(), responseID, true
+		}
 		return nil, responseID, true
 	}
 	if truncated {

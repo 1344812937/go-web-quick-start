@@ -1,10 +1,10 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { Coin, Connection, DataLine, Delete, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { Coin, Connection, DataLine, Refresh, RefreshLeft, Search, Tickets, Timer, View } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
 import RequestPayloadDialog from '@/components/RequestPayloadDialog.vue'
 import SessionAttemptCard from '@/components/SessionAttemptCard.vue'
-import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, LogPayloadCleanupResult, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
+import type { Channel, ClientToken, GatewayModel, LogAggregateSummary, LogPage, RelayAttemptLog, RelayRequestLog } from '@/types/gateway'
 import { request } from '@/utils/api'
 import { formatCompactNumber, formatDuration } from '@/utils/formatters'
 import { logDateDefaultTimes, logDateRangeShortcuts, toEastEightISOString, todayLogRange } from '@/utils/logDateRanges'
@@ -22,7 +22,6 @@ const pagination = reactive({ page: 1, pageSize: 50 })
 const payloadDialogOpen = ref(false)
 const selectedRequest = ref<RelayRequestLog | null>(null)
 const payloadLoadingId = ref('')
-const clearingPayloads = ref(false)
 
 function formatUSD(micros: number): string {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(micros / 1_000_000)
@@ -158,30 +157,6 @@ function resetLogs() {
   void loadLogs()
 }
 
-async function clearHistoricalPayloads() {
-  try {
-    await ElMessageBox.confirm(
-      '将永久清空 30 分钟前调用日志中的请求参数、请求正文和响应正文。状态、Token、费用和耗时统计会保留。',
-      '清理历史参数与明细',
-      { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  clearingPayloads.value = true
-  try {
-    const result = await request<LogPayloadCleanupResult>('/admin/gateway/logs/clear-payloads', { method: 'POST' })
-    payloadDialogOpen.value = false
-    selectedRequest.value = null
-    ElMessage.success(`已清理 ${result.requestLogsCleared} 条调用和 ${result.attemptLogsCleared} 条上游尝试的参数与明细`)
-    await loadLogs()
-  } catch (error) {
-    ElMessage.error(error instanceof Error ? error.message : '历史参数与明细清理失败')
-  } finally {
-    clearingPayloads.value = false
-  }
-}
-
 onMounted(async () => {
   try {
     await loadOptions()
@@ -197,7 +172,6 @@ onMounted(async () => {
     <header class="page-heading">
       <div><h1>调用日志</h1><p>默认按东八区显示今天，可查询 5 天内的请求状态、重试尝试与费用</p></div>
       <div class="page-actions">
-        <el-button type="danger" plain :icon="Delete" :loading="clearingPayloads" @click="clearHistoricalPayloads">清理 30 分钟前明细</el-button>
         <el-tooltip content="刷新调用日志" placement="bottom"><el-button class="page-refresh-button" :icon="Refresh" :loading="loading" aria-label="刷新调用日志" @click="loadLogs" /></el-tooltip>
       </div>
     </header>
@@ -311,7 +285,7 @@ onMounted(async () => {
 .cost-breakdown small, .source-breakdown small { color: var(--rose-text-muted); font-size: 10px; }
 .source-breakdown { justify-items: start; }
 @media (min-width: 961px) {
-  .log-page { height: calc(100dvh - var(--rose-header-height) - 100px); min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
+  .log-page { height: 100%; min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
   .log-table-panel { min-height: 0; }
   .log-table-panel > .el-table { min-height: 0; flex: 1 1 0; }
   .log-page .metric-strip { grid-template-columns: repeat(6, minmax(0, 1fr)); }

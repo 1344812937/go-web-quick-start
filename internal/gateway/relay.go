@@ -55,6 +55,7 @@ type relayExecution struct {
 	token                    *ClientToken
 	modelID                  uint64
 	sessionAffinityMappingID uint64
+	refreshSessionAffinity   bool
 	endpoint                 string
 	payload                  *RelayPayload
 	rawBody                  []byte
@@ -177,6 +178,7 @@ func (s *RelayService) RelayWithTrace(ctx context.Context, writer http.ResponseW
 		fmt.Sprintf("strategy=%s candidates=%d selection=%s", plan.Model.RoutingStrategy, len(plan.Candidates), plan.InitialSelection.Reason))
 	execution.modelID = plan.Model.ID
 	execution.sessionAffinityMappingID = plan.SessionAffinityMappingID
+	execution.refreshSessionAffinity = plan.RefreshSessionAffinity
 
 	retryPolicyStarted := time.Now()
 	maxAttempts := 3
@@ -217,6 +219,12 @@ func (s *RelayService) RelayWithTrace(ctx context.Context, writer http.ResponseW
 		message = "The request was canceled."
 		status = statusClientClosedRequest
 		code = "request_canceled"
+	} else {
+		var applicationFailure *upstreamApplicationFailure
+		if errors.As(lastNetworkError, &applicationFailure) && applicationFailureCode(applicationFailure) == "upstream_empty_response" {
+			message = applicationFailure.Message
+			code = applicationFailureCode(applicationFailure)
+		}
 	}
 	publicErr := &PublicError{Status: status, Message: message, Type: "api_error", Code: code}
 	execution.responseBody = publicErrorBody(publicErr)
@@ -434,7 +442,7 @@ func (s *RelayService) performAttempt(ctx context.Context, writer http.ResponseW
 	}
 	if success {
 		affinityStarted := time.Now()
-		s.router.RecordSessionAffinityAfterSuccess(logCtx, execution.token.ID, execution.modelID, execution.payload.SessionKey, execution.sessionAffinityMappingID, candidate.Mapping.ID)
+		s.recordSessionAffinityAfterSuccess(logCtx, execution, candidate.Mapping.ID)
 		execution.trace.Record(RelayStageAffinityUpdate, RelayStepCategoryStorage, execution.attempts, affinityStarted, nil, "session_affinity")
 	}
 	s.recordRequest(logCtx, execution, response.StatusCode, code)
@@ -462,6 +470,7 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	outputEstimate := int64(0)
 	responseID := ""
 	terminalSuccess := false
+	hasUsableOutput := false
 	result := attemptResult{response: response, requestBody: requestBody, sentTokens: sentTokens, latencyMS: latency}
 	capture := payloadCapture{}
 	committed := false
@@ -493,6 +502,9 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 			capture.Write(event)
 			consumeSSEEvent(event, s.estimator, &usage, &upstreamCost, &outputEstimate, &responseID)
 			hasOutput := sseEventHasOutputToken(event)
+			if execution.endpoint == "responses" && sseEventHasUsableResponseOutput(event) {
+				hasUsableOutput = true
+			}
 			appErr, hasApplicationError := sseApplicationError(event)
 			if sseEventIsTerminalSuccess(event, execution.endpoint) {
 				terminalSuccess = true
@@ -561,6 +573,9 @@ func (s *RelayService) streamResponse(ctx context.Context, writer http.ResponseW
 	result.body, result.bodyTruncated = capture.Snapshot()
 	if !terminalSuccess && streamErr == nil && receivedEvent {
 		streamErr = io.ErrUnexpectedEOF
+	}
+	if terminalSuccess && streamErr == nil && execution.endpoint == "responses" && !hasUsableOutput {
+		streamErr = emptyUpstreamResponseFailure()
 	}
 	if !committed && streamErr != nil {
 		if !receivedEvent {
@@ -681,10 +696,18 @@ func (s *RelayService) finishStream(ctx context.Context, execution *relayExecuti
 	}
 	if success {
 		affinityStarted := time.Now()
-		s.router.RecordSessionAffinityAfterSuccess(logCtx, execution.token.ID, execution.modelID, execution.payload.SessionKey, execution.sessionAffinityMappingID, candidate.Mapping.ID)
+		s.recordSessionAffinityAfterSuccess(logCtx, execution, candidate.Mapping.ID)
 		execution.trace.Record(RelayStageAffinityUpdate, RelayStepCategoryStorage, execution.attempts, affinityStarted, nil, "session_affinity")
 	}
 	s.recordRequest(logCtx, execution, requestStatus, errorCode)
+}
+
+func (s *RelayService) recordSessionAffinityAfterSuccess(ctx context.Context, execution *relayExecution, successfulChannelModelID uint64) {
+	if execution.refreshSessionAffinity {
+		s.router.RecordSessionAffinity(ctx, execution.token.ID, execution.modelID, execution.payload.SessionKey, successfulChannelModelID)
+		return
+	}
+	s.router.RecordSessionAffinityAfterSuccess(ctx, execution.token.ID, execution.modelID, execution.payload.SessionKey, execution.sessionAffinityMappingID, successfulChannelModelID)
 }
 
 func elapsedMilliseconds(started time.Time, finished time.Time) int64 {
@@ -931,7 +954,12 @@ func validateBufferedApplicationResponse(endpoint string, data []byte) *upstream
 	case "responses":
 		status, _ := payload["status"].(string)
 		switch strings.ToLower(strings.TrimSpace(status)) {
-		case "completed", "in_progress", "queued":
+		case "completed":
+			if !responsesPayloadHasUsableOutput(payload) {
+				return emptyUpstreamResponseFailure()
+			}
+			return nil
+		case "in_progress", "queued":
 			return nil
 		default:
 			return newApplicationFailure("upstream response is missing a valid status", "invalid_upstream_response")
@@ -942,6 +970,54 @@ func validateBufferedApplicationResponse(endpoint string, data []byte) *upstream
 		}
 	}
 	return nil
+}
+
+func emptyUpstreamResponseFailure() *upstreamApplicationFailure {
+	return newApplicationFailure("upstream response completed without any usable output", "upstream_empty_response")
+}
+
+func responsesPayloadHasUsableOutput(payload map[string]any) bool {
+	response := payload
+	if nested, ok := payload["response"].(map[string]any); ok {
+		response = nested
+	}
+	output, _ := response["output"].([]any)
+	for _, item := range output {
+		if responseOutputItemHasUsableOutput(item) {
+			return true
+		}
+	}
+	return false
+}
+
+func responseOutputItemHasUsableOutput(value any) bool {
+	item, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	typeName := strings.ToLower(strings.TrimSpace(stringValue(item["type"])))
+	switch typeName {
+	case "message":
+		content, _ := item["content"].([]any)
+		for _, part := range content {
+			if responseOutputItemHasUsableOutput(part) {
+				return true
+			}
+		}
+	case "output_text", "text":
+		return strings.TrimSpace(stringValue(item["text"])) != ""
+	case "refusal":
+		return strings.TrimSpace(stringValue(item["refusal"])) != "" || strings.TrimSpace(stringValue(item["text"])) != ""
+	default:
+		if strings.HasSuffix(typeName, "_call") && !strings.HasSuffix(typeName, "_call_output") {
+			for _, key := range []string{"name", "arguments", "input", "call_id", "id"} {
+				if strings.TrimSpace(stringValue(item[key])) != "" {
+					return true
+				}
+			}
+		}
+	}
+	return false
 }
 
 func applicationFailureDetails(value any) *upstreamApplicationFailure {
@@ -1085,12 +1161,12 @@ func requestSessionName(body []byte) string {
 	}
 	if messages, ok := payload["messages"].([]any); ok {
 		if text := latestUserMessageText(messages); text != "" {
-			return truncateRunes(normalizeSessionName(text), 10)
+			return truncateRunes(normalizeCodexPrompt(text), 10)
 		}
 	}
 	if input, exists := payload["input"]; exists {
 		if text := latestResponsesInputText(input); text != "" {
-			return truncateRunes(normalizeSessionName(text), 10)
+			return truncateRunes(normalizeCodexPrompt(text), 10)
 		}
 	}
 	return ""
@@ -1220,6 +1296,41 @@ func sseEventHasOutputToken(event []byte) bool {
 			choice, _ := item.(map[string]any)
 			if delta, ok := choice["delta"]; ok && generatedDeltaHasContent(delta) {
 				return true
+			}
+		}
+	}
+	return false
+}
+
+func sseEventHasUsableResponseOutput(event []byte) bool {
+	for _, line := range bytes.Split(event, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+		if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		var payload map[string]any
+		if json.Unmarshal(data, &payload) != nil {
+			continue
+		}
+		if responsesPayloadHasUsableOutput(payload) || responseOutputItemHasUsableOutput(payload["item"]) {
+			return true
+		}
+		typeName := strings.ToLower(strings.TrimSpace(stringValue(payload["type"])))
+		switch typeName {
+		case "response.output_text.delta", "response.refusal.delta":
+			if strings.TrimSpace(stringValue(payload["delta"])) != "" {
+				return true
+			}
+		}
+		if strings.Contains(typeName, "function_call") || strings.Contains(typeName, "custom_tool_call") || strings.Contains(typeName, "computer_call") || strings.Contains(typeName, "shell_call") || strings.Contains(typeName, "mcp_call") {
+			for _, key := range []string{"delta", "name", "arguments", "input", "call_id"} {
+				if strings.TrimSpace(stringValue(payload[key])) != "" {
+					return true
+				}
 			}
 		}
 	}

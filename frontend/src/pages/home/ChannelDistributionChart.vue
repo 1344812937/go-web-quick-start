@@ -146,14 +146,14 @@ function formatValue(value: number): string {
 </template>
 
 <style scoped>
-.channel-pie-layout { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(220px, 1.2fr); align-items: center; gap: 20px; min-height: 338px; padding: 24px; }
+.channel-pie-layout { display: grid; grid-template-columns: minmax(210px, .8fr) minmax(220px, 1.2fr); align-items: start; gap: 20px; min-height: 338px; padding: 24px; }
 .channel-pie-figure { width: min(100%, 286px); margin-inline: auto; aspect-ratio: 1; }
 .channel-pie-figure svg { display: block; width: 100%; height: 100%; overflow: visible; }
 .channel-pie-slice { fill: currentColor; stroke: var(--rose-surface); stroke-width: 2; transform-box: fill-box; transform-origin: center; transition: opacity 140ms ease, transform 140ms ease; cursor: default; }
 .channel-pie-slice.is-active { transform: scale(1.025); }
 .channel-pie-slice.is-muted { opacity: .38; }
 .channel-pie-slice:focus-visible { outline: none; stroke: var(--rose-text); stroke-width: 3; }
-.channel-pie-legend { display: grid; align-content: center; max-height: 300px; margin: 0; padding: 0; overflow-y: auto; list-style: none; }
+.channel-pie-legend { display: grid; align-content: start; max-height: 300px; margin: 0; padding: 4px 0; overflow-y: auto; list-style: none; scrollbar-gutter: stable; }
 .channel-pie-legend li { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto auto; align-items: center; gap: 10px; min-height: 40px; padding: 7px 8px; border-bottom: 1px solid var(--rose-border); font-variant-numeric: tabular-nums; }
 .channel-pie-legend li:last-child { border-bottom: 0; }
 .channel-pie-legend li.is-active { background: var(--rose-surface-muted); }

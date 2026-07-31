@@ -396,7 +396,7 @@ function handleTimelineDialogOpened() {
   timelineDialogReady.value = true
 }
 
-function handleTimelineDialogClose() {
+function handleTimelineDialogClosed() {
   timelineDialogReady.value = false
 }
 
@@ -448,6 +448,7 @@ watch(
       <section class="session-summary-strip" aria-label="会话统计">
         <div><span>请求</span><strong>{{ formatCompactNumber(detail.summary.requestCount) }}</strong></div>
         <div><span>成功率</span><strong>{{ formatPercent(detail.summary.successRate) }}</strong></div>
+        <div><span>缓存命中率</span><strong>{{ formatPercent(detail.summary.cacheHitRate) }}</strong></div>
         <div><span>取消</span><strong>{{ formatCompactNumber(detail.summary.canceledCount) }}</strong></div>
         <div><span>处理中</span><strong>{{ formatCompactNumber(detail.summary.processingCount) }}</strong></div>
         <div><span>平均首 Token</span><strong>{{ detail.summary.firstTokenSampleCount ? formatTiming(detail.summary.averageFirstTokenMs) : '--' }}</strong></div>
@@ -507,7 +508,8 @@ watch(
         </div>
       </section>
 
-      <Teleport defer :disabled="!timelineDialogReady" to="#session-timeline-dialog-host">
+      <div id="session-timeline-drawer-host" class="session-timeline-drawer-host" />
+      <Teleport defer :to="timelineDialogReady ? '#session-timeline-dialog-host' : '#session-timeline-drawer-host'">
       <section
         class="timeline-section"
         :class="{ 'is-dialog-mode': timelineDialogReady }"
@@ -633,9 +635,8 @@ watch(
     width="min(1480px, calc(100vw - 32px))"
     top="3vh"
     append-to-body
-    destroy-on-close
     @opened="handleTimelineDialogOpened"
-    @close="handleTimelineDialogClose"
+    @closed="handleTimelineDialogClosed"
   >
     <div id="session-timeline-dialog-host" class="session-timeline-dialog-host" />
   </el-dialog>
@@ -690,6 +691,7 @@ watch(
 .migration-reason small { color: var(--rose-text-muted); }
 .migration-view-icon { justify-self: end; color: var(--rose-text-muted); }
 .timeline-section { display: grid; min-width: 0; min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
+.session-timeline-drawer-host { display: grid; min-width: 0; min-height: 0; }
 .timeline-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; padding-bottom: 12px; border-bottom: 1px solid var(--rose-border); }
 .timeline-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .timeline-heading-actions > span { color: var(--rose-text-muted); font-size: 12px; font-variant-numeric: tabular-nums; }

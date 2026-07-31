@@ -48,6 +48,10 @@ const channels = ref<Channel[]>([])
 const models = ref<GatewayModel[]>([])
 const channelSearchQuery = ref('')
 const drawerOpen = ref(false)
+const quickDialogOpen = ref(false)
+const quickProcessing = ref(false)
+const quickStep = ref(0)
+const quickError = ref('')
 const editingId = ref<number | null>(null)
 const form = reactive({ name: '', baseUrl: '', apiKey: '', enabled: true, supportsStreamUsage: true })
 const mappings = ref<MappingDraft[]>([])
@@ -63,10 +67,12 @@ const deletingChannelId = ref<number | null>(null)
 const resettingCircuitChannelId = ref<number | null>(null)
 const currentTime = ref(Date.now())
 const drawerTitle = computed(() => editingId.value ? '编辑渠道' : '新增渠道')
+const quickDialogTitle = computed(() => editingId.value ? '快速设置渠道' : '快速新增渠道')
+const sortedChannels = computed(() => [...channels.value].sort(compareChannels))
 const filteredChannels = computed(() => {
   const query = channelSearchQuery.value.trim().toLocaleLowerCase()
-  if (!query) return channels.value
-  return channels.value.filter((channel) => (
+  if (!query) return sortedChannels.value
+  return sortedChannels.value.filter((channel) => (
     channel.name.toLocaleLowerCase().includes(query)
     || channel.baseUrl.toLocaleLowerCase().includes(query)
   ))
@@ -97,6 +103,19 @@ const modelHueByName = computed(() => {
 let mappingDraftSequence = 0
 let discoveryRequestVersion = 0
 let clockTimer: ReturnType<typeof setInterval> | undefined
+
+function channelSortLatency(channel: Channel): number {
+  if (channel.metrics.latencySampleCount > 0) return channel.metrics.averageLatencyMs
+  if (channel.latencyEwmaMs > 0) return channel.latencyEwmaMs
+  return Number.POSITIVE_INFINITY
+}
+
+function compareChannels(left: Channel, right: Channel): number {
+  return Number(right.enabled) - Number(left.enabled)
+    || right.metrics.recentAttemptCount - left.metrics.recentAttemptCount
+    || channelSortLatency(left) - channelSortLatency(right)
+    || left.name.localeCompare(right.name, undefined, { numeric: true, sensitivity: 'base' })
+}
 
 function compareModelNamesDescending(left: string, right: string): number {
   return right.localeCompare(left, undefined, { numeric: true, sensitivity: 'base' })
@@ -195,8 +214,32 @@ function resetForm(channel?: Channel) {
   priceMultiplier.value = channel && Number.isFinite(channel.priceMultiplierBasisPoints)
     ? channel.priceMultiplierBasisPoints / 10_000
     : 1
+  drawerOpen.value = false
+  quickDialogOpen.value = true
+  quickProcessing.value = false
+  quickStep.value = 0
+  quickError.value = ''
+}
+
+function openAdvanced() {
+  quickDialogOpen.value = false
   drawerOpen.value = true
-  if (channel) void discoverChannelModels()
+}
+
+function openQuick() {
+  drawerOpen.value = false
+  quickDialogOpen.value = true
+  quickError.value = ''
+}
+
+function inferredChannelName() {
+  if (form.name.trim()) return form.name.trim()
+  try {
+    const host = new URL(form.baseUrl.trim()).hostname
+    return host || '新渠道'
+  } catch {
+    return '新渠道'
+  }
 }
 
 function filterMappingsByUpstreamModel(model: UpstreamModel) {
@@ -330,10 +373,10 @@ function formatDiscoveryTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', timeZone: 'Asia/Shanghai' }).format(new Date(value))
 }
 
-async function discoverChannelModels(showSuccess = false) {
+async function discoverChannelModels(showSuccess = false): Promise<boolean> {
   if (!form.baseUrl.trim() || (!editingId.value && !form.apiKey.trim())) {
     discoveryError.value = 'Base URL 和 API key 不完整'
-    return
+    return false
   }
   const requestVersion = ++discoveryRequestVersion
   discoveringModels.value = true
@@ -348,9 +391,9 @@ async function discoverChannelModels(showSuccess = false) {
       method: 'POST',
       body: JSON.stringify(payload),
     })
-    if (requestVersion !== discoveryRequestVersion) return
+    if (requestVersion !== discoveryRequestVersion) return false
     const refreshedModels = await request<GatewayModel[]>('/admin/gateway/models')
-    if (requestVersion !== discoveryRequestVersion) return
+    if (requestVersion !== discoveryRequestVersion) return false
     discoverySummary.value = result
     discoveredModels.value = result.models
     models.value = refreshedModels
@@ -359,14 +402,55 @@ async function discoverChannelModels(showSuccess = false) {
       const createdCount = result.models.filter((model) => model.publicModelCreated).length
       ElMessage.success(createdCount > 0 ? `已获取 ${result.models.length} 个模型，自动新增 ${createdCount} 个公共模型` : `已获取 ${result.models.length} 个模型，公共模型均已存在`)
     }
+    return true
   } catch (error) {
-    if (requestVersion !== discoveryRequestVersion) return
+    if (requestVersion !== discoveryRequestVersion) return false
     discoverySummary.value = null
     discoveredModels.value = []
     discoveryError.value = error instanceof Error ? error.message : '上游模型获取失败'
+    return false
   } finally {
     if (requestVersion === discoveryRequestVersion) discoveringModels.value = false
   }
+}
+
+async function quickSetup() {
+  if (!form.baseUrl.trim() || (!editingId.value && !form.apiKey.trim())) {
+    quickError.value = '请填写 Base URL 和 API key'
+    return
+  }
+  if (!Number.isFinite(priceMultiplier.value) || priceMultiplier.value < 0 || priceMultiplier.value > 100) {
+    quickError.value = '倍率必须在 0 到 100 之间'
+    return
+  }
+  form.name = inferredChannelName()
+  quickProcessing.value = true
+  quickError.value = ''
+  quickStep.value = 1
+  const discovered = await discoverChannelModels(false)
+  if (!discovered) {
+    quickProcessing.value = false
+    quickError.value = discoveryError.value || '模型获取失败，请检查连接配置'
+    return
+  }
+  quickStep.value = 2
+  const configuredUpstreams = new Set(mappings.value.map((mapping) => mapping.upstreamModel.trim()))
+  mergeDiscoveredMappings(discoveredModels.value, true)
+  for (const mapping of mappings.value) {
+    if (!configuredUpstreams.has(mapping.upstreamModel.trim()) && mapping.modelId) mapping.enabled = true
+  }
+  applyOfficialPriceMultiplier()
+  quickStep.value = 3
+  const enabledCount = mappings.value.filter((mapping) => mapping.enabled && !configuredUpstreams.has(mapping.upstreamModel.trim())).length
+  const saved = await saveChannel(false)
+  if (saved) {
+    quickStep.value = 4
+    quickDialogOpen.value = false
+    ElMessage.success(`操作成功，新增启用模型 ${enabledCount} 个`)
+  } else {
+    quickError.value = '保存失败，请检查配置后重试'
+  }
+  quickProcessing.value = false
 }
 
 function modelName(modelId: number): string {
@@ -491,22 +575,22 @@ async function loadData() {
   }
 }
 
-async function saveChannel() {
+async function saveChannel(showSuccess = true): Promise<boolean> {
   if (!form.name.trim() || !form.baseUrl.trim() || (!editingId.value && !form.apiKey.trim())) {
     ElMessage.error('请完整填写渠道名称、Base URL 和 API key')
-    return
+    return false
   }
   if (mappings.value.some((item) => !item.modelId || !item.upstreamModel.trim())) {
     ElMessage.error('模型映射需要选择公开模型和上游模型')
-    return
+    return false
   }
   if (mappings.value.some((item) => !Number.isFinite(item.adjustmentMultiplier) || item.adjustmentMultiplier < 0 || item.adjustmentMultiplier > 100)) {
     ElMessage.error('价格倍率必须在 0 到 100 之间')
-    return
+    return false
   }
   if (!Number.isFinite(priceMultiplier.value) || priceMultiplier.value < 0 || priceMultiplier.value > 100) {
     ElMessage.error('渠道官方价倍率必须在 0 到 100 之间')
-    return
+    return false
   }
   saving.value = true
   try {
@@ -533,10 +617,12 @@ async function saveChannel() {
       }),
     })
     drawerOpen.value = false
-    ElMessage.success('渠道配置已保存')
+    if (showSuccess) ElMessage.success('渠道配置已保存')
     await loadData()
+    return true
   } catch (error) {
     ElMessage.error(error instanceof Error ? error.message : '渠道保存失败')
+    return false
   } finally {
     saving.value = false
   }
@@ -717,6 +803,33 @@ onUnmounted(() => {
       <div v-if="!loading && channels.length === 0" class="table-empty-action"><el-button type="primary" :icon="Plus" @click="resetForm()">添加第一个渠道</el-button></div>
     </section>
 
+    <el-dialog v-model="quickDialogOpen" :title="quickDialogTitle" width="min(520px, calc(100vw - 32px))" destroy-on-close :close-on-click-modal="false" :close-on-press-escape="!quickProcessing" :show-close="!quickProcessing">
+      <div v-if="quickProcessing" class="quick-setup-progress" aria-live="polite">
+        <p>正在连接上游并准备模型映射，请稍候…</p>
+        <el-steps direction="vertical" :active="quickStep" finish-status="success">
+          <el-step title="验证 Base URL 和 API key" />
+          <el-step title="获取上游模型列表" />
+          <el-step title="自动映射并按倍率计算价格" />
+          <el-step title="保存渠道并刷新列表" />
+        </el-steps>
+      </div>
+      <el-form v-else label-position="top" class="quick-setup-form" @submit.prevent="quickSetup">
+        <el-alert title="快速设置只需要三项信息，模型会自动发现并映射。" type="info" :closable="false" show-icon />
+        <el-form-item label="Base URL" required><el-input v-model="form.baseUrl" placeholder="https://api.openai.com/v1" /></el-form-item>
+        <el-form-item :label="editingId ? '替换 API key（可留空）' : 'API key'" required><el-input v-model="form.apiKey" type="password" show-password autocomplete="new-password" :placeholder="editingId ? '留空则保持当前密钥' : '上游供应商密钥'" /></el-form-item>
+        <el-form-item label="价格倍率"><el-input-number v-model="priceMultiplier" :min="0" :max="100" :precision="2" :step="0.1" controls-position="right" /><small class="field-note">将按官方目录价格乘以该倍率写入模型映射，默认 1 倍。</small></el-form-item>
+        <div v-if="quickError" class="inline-error" role="alert">{{ quickError }}</div>
+      </el-form>
+      <template #footer>
+        <div class="quick-dialog-actions">
+          <el-button :disabled="quickProcessing" @click="openAdvanced">高级设置</el-button>
+          <span />
+          <el-button :disabled="quickProcessing" @click="quickDialogOpen = false">取消</el-button>
+          <el-button v-if="!quickProcessing" type="primary" :loading="saving" @click="quickSetup">设置</el-button>
+        </div>
+      </template>
+    </el-dialog>
+
     <el-drawer v-model="drawerOpen" :title="drawerTitle" size="min(820px, 100vw)" destroy-on-close>
       <el-form label-position="top" class="drawer-form">
         <div class="form-columns">
@@ -845,7 +958,7 @@ onUnmounted(() => {
         </section>
         </template>
       </el-form>
-      <template #footer><div class="drawer-actions"><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></div></template>
+      <template #footer><div class="drawer-actions"><el-button @click="openQuick">切换简要设置</el-button><span /><el-button @click="drawerOpen = false">取消</el-button><el-button type="primary" :loading="saving" @click="saveChannel">保存渠道</el-button></div></template>
     </el-drawer>
   </div>
 </template>
@@ -862,6 +975,16 @@ onUnmounted(() => {
 .channel-state-cell.is-circuit-open small { color: var(--rose-danger); cursor: help; }
 .reset-circuit-button { color: var(--rose-danger); }
 .channel-page { --channel-table-height: min(660px, max(360px, calc(100dvh - var(--rose-header-height) - 220px))); }
+@media (min-width: 961px) {
+  .channel-page { height: 100%; min-height: 0; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; --channel-table-height: calc(100% - 59px); }
+  .channel-page > .table-panel { min-height: 0; }
+}
+.quick-setup-form { display: grid; gap: 8px; }
+.quick-setup-form :deep(.el-input-number) { width: 100%; }
+.quick-setup-progress { min-height: 260px; padding: 8px 12px; }
+.quick-setup-progress p { margin: 0 0 18px; color: var(--rose-text-muted); font-size: 12px; }
+.quick-dialog-actions, .drawer-actions { display: flex; align-items: center; gap: 8px; }
+.quick-dialog-actions > span, .drawer-actions > span { flex: 1; }
 .channel-list-toolbar { display: flex; min-height: 58px; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 16px; border-bottom: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
 .channel-list-toolbar > div { display: grid; min-width: 0; gap: 2px; }
 .channel-list-toolbar strong { color: var(--rose-text); font-size: 14px; font-weight: 650; }

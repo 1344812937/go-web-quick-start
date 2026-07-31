@@ -18,7 +18,7 @@ const candidates = computed(() => {
   if (!isAffinityDecision.value) return sortedCandidates.value
   return sortedCandidates.value.filter((candidate) => candidate.selected)
 })
-const hasScoringWeights = computed(() => !isAffinityDecision.value && decision.weights && decision.weights.price + decision.weights.efficiency + decision.weights.quality > 0)
+const hasScoringWeights = computed(() => !isAffinityDecision.value && decision.weights && (decision.weights.price + decision.weights.efficiency + decision.weights.quality + (decision.weights.balance ?? 0) > 0))
 
 function formatPercent(value: number): string {
   return new Intl.NumberFormat('zh-CN', { style: 'percent', minimumFractionDigits: 1, maximumFractionDigits: 2 }).format(value)
@@ -51,6 +51,10 @@ function formatThroughput(candidate: RouteDecisionCandidate): string {
 function formatRecentShare(candidate: RouteDecisionCandidate): string {
   if (candidate.routeSampleSize <= 0) return '无样本'
   return `${formatPercent(candidate.recentRouteShare)} (${candidate.recentRouteCount}/${candidate.routeSampleSize})`
+}
+
+function formatBalance(candidate: RouteDecisionCandidate): string {
+  return `${formatPercent(candidate.targetRouteShare ?? 0)} · ×${(candidate.balanceMultiplier || 1).toFixed(2)}`
 }
 
 function formatCacheHitRate(candidate: RouteDecisionCandidate): string {
@@ -93,7 +97,7 @@ function modeLabel(): string {
         <strong v-if="selectedCandidate"><span>命中模型</span><code>{{ selectedCandidate.upstreamModel }}</code></strong>
         <span v-if="selectedCandidate">{{ selectedCandidate.channelName }} · {{ isAffinityDecision ? '沿用' : '已命中' }}</span>
         <span v-else>未记录命中模型</span>
-        <span v-if="expanded && hasScoringWeights">价格 {{ formatPercent(decision.weights.price) }} · 效率 {{ formatPercent(decision.weights.efficiency) }} · 质量 {{ formatPercent(decision.weights.quality) }}</span>
+        <span v-if="expanded && hasScoringWeights">价格 {{ formatPercent(decision.weights.price) }} · 效率 {{ formatPercent(decision.weights.efficiency) }} · 质量 {{ formatPercent(decision.weights.quality) }} · 均衡 {{ formatPercent(decision.weights.balance ?? 0) }}</span>
         <span v-if="expanded">{{ candidates.length }} 个候选渠道</span>
       </div>
     </header>
@@ -109,7 +113,7 @@ function modeLabel(): string {
           <col class="expectation-column">
           <col class="probability-column">
         </colgroup>
-        <thead><tr><th>渠道 / 上游模型</th><th>优先级 × 权重</th><th>价格 / 得分</th><th>效率 / 得分</th><th>质量</th><th>本站最近调用占比</th><th>期望度</th><th>命中概率</th></tr></thead>
+        <thead><tr><th>渠道 / 上游模型</th><th>优先级 × 权重</th><th>价格 / 得分</th><th>效率 / 得分</th><th>质量</th><th>实际 / 目标占比</th><th>期望度</th><th>命中概率</th></tr></thead>
         <tbody>
           <tr v-for="candidate in candidates" :key="candidate.channelModelId" :class="{ selected: candidate.selected }">
             <td><span class="channel-name"><i aria-hidden="true" />{{ candidate.channelName }}<em v-if="candidate.selected">{{ isAffinityDecision ? '沿用' : '已命中' }}</em></span><code>{{ candidate.upstreamModel }}</code></td>
@@ -117,14 +121,14 @@ function modeLabel(): string {
             <td><span>{{ formatCost(candidate.expectedCostMicros) }}</span><small>价格分 {{ formatScore(candidate.priceScore) }}</small></td>
             <td class="efficiency-cell"><span>首 token {{ formatFirstToken(candidate) }}</span><span>响应 {{ formatLatency(candidate) }}</span><span>{{ formatThroughput(candidate) }}</span><small>效率分 {{ formatScore(candidate.efficiencyScore) }}</small></td>
             <td><span>成功 {{ formatPercent(candidate.successRate) }}</span><small>质量分 {{ formatScore(candidate.qualityScore) }} · 缓存命中 {{ formatCacheHitRate(candidate) }} · 缓存率 {{ formatCacheRate(candidate) }}</small></td>
-            <td>{{ formatRecentShare(candidate) }}</td>
+            <td><span>{{ formatRecentShare(candidate) }}</span><small>目标 / 修正 {{ formatBalance(candidate) }}</small></td>
             <td><code>{{ formatExpectation(candidate.expectation) }}</code></td>
             <td><strong class="probability">{{ formatPercent(candidate.probability) }}</strong></td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p v-show="expanded" class="decision-note">效率分使用近 30 分钟成功样本：首 token 45% + 响应头延迟 20% + 输出吞吐 35%。价格分、效率分和质量分按当时系统配置合成，历史快照不会随后续配置变化。</p>
+    <p v-show="expanded" class="decision-note">效率分使用近 30 分钟成功样本；均衡按当前模型候选的实际占比相对基础目标占比纠偏，窗口随候选数从 100 条扩展到最多 1000 条。历史快照不会随后续配置变化。</p>
   </section>
 </template>
 

@@ -44,14 +44,18 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 
 	admin.GET("/dashboard", a.dashboard)
 	admin.GET("/logs", a.logs)
+	admin.GET("/logs/storage", a.logStorage)
 	admin.POST("/logs/clear-payloads", a.clearLogPayloads)
 	admin.GET("/logs/:requestId", a.logDetail)
 	admin.POST("/token-counts", a.tokenCounts)
 	admin.GET("/circuit-records", a.circuitRecords)
 	admin.POST("/circuit-records/:id/reopen-mapping", a.reopenCircuitMapping)
 	admin.GET("/sessions", a.sessions)
+	admin.GET("/active-sessions", a.activeSessions)
 	admin.GET("/sessions/detail", a.sessionDetail)
 	admin.PUT("/sessions/title", a.renameSession)
+	admin.GET("/codex-config", a.codexConfiguration)
+	admin.PUT("/codex-config", a.saveCodexConfiguration)
 
 	admin.GET("/channels", a.listChannels)
 	admin.POST("/channels", a.createChannel)
@@ -73,6 +77,28 @@ func (a *GatewayManagementApi) Register(router *gin.RouterGroup) {
 	admin.PUT("/tokens/:id", a.updateToken)
 	admin.POST("/tokens/:id/rotate", a.rotateToken)
 	admin.DELETE("/tokens/:id", a.deleteToken)
+}
+
+func (a *GatewayManagementApi) codexConfiguration(c *gin.Context) {
+	item, err := a.management.CodexConfiguration(c.Request.Context())
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(item))
+}
+
+func (a *GatewayManagementApi) saveCodexConfiguration(c *gin.Context) {
+	var input gateway.CodexConfigurationInput
+	if !bindManagementJSON(c, &input) {
+		return
+	}
+	item, err := a.management.SaveCodexConfiguration(c.Request.Context(), input)
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(item))
 }
 
 func (a *GatewayManagementApi) tokenCounts(c *gin.Context) {
@@ -433,6 +459,15 @@ func (a *GatewayManagementApi) logs(c *gin.Context) {
 	c.JSON(http.StatusOK, common.S(item))
 }
 
+func (a *GatewayManagementApi) logStorage(c *gin.Context) {
+	result, err := a.management.LogStorageUsage(c.Request.Context())
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(result))
+}
+
 func (a *GatewayManagementApi) clearLogPayloads(c *gin.Context) {
 	result, err := a.management.ClearHistoricalLogPayloads(c.Request.Context())
 	if err != nil {
@@ -469,6 +504,21 @@ func (a *GatewayManagementApi) sessions(c *gin.Context) {
 		query.To = query.To.UTC()
 	}
 	item, err := a.management.SessionLogs(c.Request.Context(), query)
+	if err != nil {
+		managementError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, common.S(item))
+}
+
+func (a *GatewayManagementApi) activeSessions(c *gin.Context) {
+	query := gateway.ActiveSessionQuery{
+		Session:     c.Query("session"),
+		ActiveSince: time.Now().UTC().Add(-30 * time.Minute),
+	}
+	query.Page, _ = strconv.Atoi(c.Query("page"))
+	query.PageSize, _ = strconv.Atoi(c.Query("pageSize"))
+	item, err := a.management.ActiveSessions(c.Request.Context(), query)
 	if err != nil {
 		managementError(c, err)
 		return

@@ -57,6 +57,7 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 			Title:               title,
 			ThreadSource:        threadSource,
 			LatestRequestID:     requestID,
+			LastActivityAt:      &now,
 			RequestManifestJSON: string(requestManifestJSON),
 			PayloadManifestJSON: string(encodedManifest),
 			CreatedAt:           now,
@@ -75,6 +76,7 @@ func compactSessionPayload(db *gorm.DB, tokenID uint64, sessionID string, reques
 	encodedManifest, _ := json.Marshal(manifest)
 	updates := map[string]any{
 		"latest_request_id":     requestID,
+		"last_activity_at":      now,
 		"request_manifest_json": string(requestManifestJSON),
 		"payload_manifest_json": string(encodedManifest),
 		"updated_at":            now,
@@ -97,14 +99,14 @@ func upsertSessionTitleWithoutManifest(db *gorm.DB, tokenID uint64, sessionID st
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		_ = db.Create(&RelaySessionState{
 			TokenID: tokenID, SessionID: sessionID, Title: title, ThreadSource: threadSource, LatestRequestID: requestID,
-			CreatedAt: now, UpdatedAt: now,
+			LastActivityAt: &now, CreatedAt: now, UpdatedAt: now,
 		}).Error
 		return
 	}
 	if err != nil {
 		return
 	}
-	updates := map[string]any{"latest_request_id": requestID, "updated_at": now}
+	updates := map[string]any{"latest_request_id": requestID, "last_activity_at": now, "updated_at": now}
 	if !state.TitleCustomized && strings.TrimSpace(state.Title) == "" && title != "" {
 		updates["title"] = title
 	}

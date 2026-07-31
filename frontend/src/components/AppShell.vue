@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { ArrowDown, Expand, Fold, Menu, Search } from '@element-plus/icons-vue'
 import { ElMessage } from 'element-plus'
 import AdminLogin from '@/components/AdminLogin.vue'
 import ChangePasswordDialog from '@/components/ChangePasswordDialog.vue'
+import FirstLoginGuide from '@/components/FirstLoginGuide.vue'
 import SidebarMenuItem from '@/components/SidebarMenuItem.vue'
 import { useAdminAuth } from '@/composables/useAdminAuth'
 import { useRequestActivity } from '@/composables/useRequestActivity'
@@ -20,7 +21,11 @@ const mobileOpen = ref(false)
 const isMobileViewport = ref(false)
 const searchQuery = ref('')
 const passwordDialogOpen = ref(false)
+const firstLoginGuideOpen = ref(false)
 const logoutLoading = ref(false)
+const workspaceScroll = ref<HTMLElement | null>(null)
+const firstLoginGuideStorageKey = `${projectMeta.appName}:first-login-guide-complete`
+let firstLoginGuideChecked = false
 let mobileMediaQuery: MediaQueryList | null = null
 
 function filterNavigationItems(items: NavigationItem[], query: string): NavigationItem[] {
@@ -60,6 +65,7 @@ const defaultOpenMenuKeys = computed(() => {
 
 const menuCollapsed = computed(() => sidebarCollapsed.value && !isMobileViewport.value)
 const breadcrumbs = computed(() => route.meta.breadcrumbs ?? ['网关控制台'])
+const workspaceContained = computed(() => route.meta.workspaceMode === 'contained')
 
 function syncMobileViewport(event: MediaQueryList | MediaQueryListEvent) {
   isMobileViewport.value = event.matches
@@ -90,6 +96,12 @@ async function handleAccountCommand(command: string) {
   }
 }
 
+function completeFirstLoginGuide() {
+  try {
+    window.localStorage.setItem(firstLoginGuideStorageKey, '1')
+  } catch {}
+}
+
 onMounted(() => {
   void auth.ensureSession()
   mobileMediaQuery = window.matchMedia('(max-width: 960px)')
@@ -101,9 +113,21 @@ onBeforeUnmount(() => {
   mobileMediaQuery?.removeEventListener('change', syncMobileViewport)
 })
 
-watch(() => route.path, () => {
+watch(() => route.path, async () => {
   mobileOpen.value = false
+  await nextTick()
+  workspaceScroll.value?.scrollTo({ top: 0 })
 })
+
+watch(authenticated, (isAuthenticated) => {
+  if (!isAuthenticated || firstLoginGuideChecked) return
+  firstLoginGuideChecked = true
+  try {
+    firstLoginGuideOpen.value = window.localStorage.getItem(firstLoginGuideStorageKey) !== '1'
+  } catch {
+    firstLoginGuideOpen.value = true
+  }
+}, { immediate: true })
 </script>
 
 <template>
@@ -202,13 +226,24 @@ watch(() => route.path, () => {
           </template>
         </div>
       </div>
-      <section id="workspace-content" class="workspace-content" tabindex="-1">
-        <slot />
+      <section
+        ref="workspaceScroll"
+        class="workspace-scroll"
+        :class="{ 'is-contained': workspaceContained }"
+      >
+        <div id="workspace-content" class="workspace-content" tabindex="-1">
+          <slot />
+        </div>
       </section>
     </main>
 
     <button v-if="mobileOpen" class="mobile-scrim" type="button" aria-label="关闭导航" @click="mobileOpen = false"></button>
     <ChangePasswordDialog v-model="passwordDialogOpen" />
+    <FirstLoginGuide
+      v-model="firstLoginGuideOpen"
+      @complete="completeFirstLoginGuide"
+      @skip="completeFirstLoginGuide"
+    />
   </div>
 </template>
 

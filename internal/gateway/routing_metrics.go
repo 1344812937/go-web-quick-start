@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"math"
 	"sort"
 	"time"
 
@@ -10,9 +11,14 @@ import (
 )
 
 const (
-	routingMetricWindow              = 30 * time.Minute
-	routingHistorySampleSize         = 100
-	routingColdStartExplorationShare = 0.20
+	routingMetricWindow               = 30 * time.Minute
+	routingHistorySamplesPerCandidate = 20
+	routingHistoryMinimumSampleSize   = 100
+	routingHistoryMaximumSampleSize   = 1000
+	routingColdStartExplorationShare  = 0.20
+	routingBalanceResponse            = 0.50
+	routingBalanceMinimumMultiplier   = 0.50
+	routingBalanceMaximumMultiplier   = 1.50
 )
 
 type recentRoutingMetric struct {
@@ -86,7 +92,8 @@ func loadRecentRoutingMetrics(ctx context.Context, db *gorm.DB, mappingIDs []uin
 		metrics[item.ChannelModelID] = metric
 	}
 	var latest []RelayAttemptLog
-	if err := db.WithContext(ctx).Order("created_at DESC, id DESC").Limit(routingHistorySampleSize).Find(&latest).Error; err != nil {
+	sampleLimit := routingHistorySampleSize(len(mappingIDs))
+	if err := db.WithContext(ctx).Where("channel_model_id IN ?", mappingIDs).Order("created_at DESC, id DESC").Limit(sampleLimit).Find(&latest).Error; err != nil {
 		return nil, err
 	}
 	mappingSet := make(map[uint64]struct{}, len(mappingIDs))
@@ -109,6 +116,10 @@ func loadRecentRoutingMetrics(ctx context.Context, db *gorm.DB, mappingIDs []uin
 		metrics[mappingID] = metric
 	}
 	return metrics, nil
+}
+
+func routingHistorySampleSize(candidateCount int) int {
+	return min(max(candidateCount*routingHistorySamplesPerCandidate, routingHistoryMinimumSampleSize), routingHistoryMaximumSampleSize)
 }
 
 func (r *Router) expectationProbabilityOrder(strategy string, candidates []RouteCandidate) *RouteDecision {
@@ -167,7 +178,8 @@ func (r *Router) scoredRouteDecision(strategy string, candidates []RouteCandidat
 		bestThroughput = max(bestThroughput, candidate.RecentTokensPerSecond)
 		maxPriority = max(maxPriority, candidate.Mapping.Priority)
 	}
-	total := float64(0)
+	baseExpectations := make([]float64, len(candidates))
+	baseTotal := float64(0)
 	for index, candidate := range candidates {
 		observedLatency := observedCandidateLatency(candidate)
 		costAdvantage := (float64(max(minCost, 0)) + 1) / (float64(max(candidate.Cost, 0)) + 1)
@@ -186,7 +198,8 @@ func (r *Router) scoredRouteDecision(strategy string, candidates []RouteCandidat
 		if strategy == RoutingPriorityWeighted && candidate.Mapping.Priority < maxPriority {
 			expectation = 0
 		}
-		total += expectation
+		baseExpectations[index] = expectation
+		baseTotal += expectation
 		decision.Candidates[index] = RouteDecisionCandidate{
 			ChannelID: candidate.Channel.ID, ChannelName: candidate.Channel.Name, ChannelModelID: candidate.Mapping.ID, UpstreamModel: candidate.Mapping.UpstreamModel,
 			Priority: candidate.Mapping.Priority, Weight: candidate.Mapping.Weight, ExpectedCostMicros: candidate.Cost, SuccessRate: float64(candidateSuccessBasisPoints(candidate)) / float64(routeProbabilityScale),
@@ -195,6 +208,7 @@ func (r *Router) scoredRouteDecision(strategy string, candidates []RouteCandidat
 			RecentRouteShare: candidate.RecentRouteShare, RouteSampleSize: candidate.RouteSampleSize, Expectation: expectation,
 		}
 	}
+	total := applyRouteBalance(candidates, decision, baseExpectations, baseTotal, weights.Balance)
 	applyColdStartExploration(strategy, candidates, decision, maxPriority, total)
 	return decision, total
 }
@@ -204,8 +218,8 @@ func (r *Router) routingDecisionWeights() RouteDecisionWeights {
 	if r != nil && r.configProvider != nil {
 		applicationConfig = r.configProvider()
 	}
-	price, efficiency, quality := config.EffectiveRoutingDecisionWeights(applicationConfig)
-	return RouteDecisionWeights{Price: price, Efficiency: efficiency, Quality: quality}
+	price, efficiency, quality, balance := config.EffectiveRoutingDecisionWeights(applicationConfig)
+	return RouteDecisionWeights{Price: price, Efficiency: efficiency, Quality: quality, Balance: balance}
 }
 
 func observedCandidateLatency(candidate RouteCandidate) float64 {
@@ -246,8 +260,67 @@ func candidateQualityScore(candidate RouteCandidate) float64 {
 	if candidate.RecentCacheTokens > 0 {
 		cacheRateScore = min(max(candidate.RecentCacheRate, 0), 1)
 	}
-	routeBalanceScore := 1 - min(max(candidate.RecentRouteShare, 0), 1)
-	return 0.65*successScore + 0.15*cacheHitScore + 0.10*cacheRateScore + 0.10*routeBalanceScore
+	return 0.70*successScore + 0.18*cacheHitScore + 0.12*cacheRateScore
+}
+
+func applyRouteBalance(candidates []RouteCandidate, decision *RouteDecision, baseExpectations []float64, baseTotal float64, balanceWeight float64) float64 {
+	if baseTotal <= 0 {
+		return 0
+	}
+	corrected := make([]float64, len(candidates))
+	correctedTotal := float64(0)
+	activeCandidateCount := 0
+	activeSampleSize := int64(0)
+	for index, candidate := range candidates {
+		if baseExpectations[index] > 0 {
+			activeCandidateCount++
+			activeSampleSize += candidate.RecentRouteCount
+		}
+	}
+	desiredSampleSize := float64(routingHistorySampleSize(activeCandidateCount))
+	for index, candidate := range candidates {
+		if baseExpectations[index] <= 0 {
+			continue
+		}
+		targetShare := baseExpectations[index] / baseTotal
+		actualShare := float64(0)
+		if activeSampleSize > 0 {
+			actualShare = float64(candidate.RecentRouteCount) / float64(activeSampleSize)
+		}
+		multiplier := routeBalanceMultiplier(actualShare, activeSampleSize, targetShare, desiredSampleSize)
+		corrected[index] = targetShare * multiplier
+		correctedTotal += corrected[index]
+		decision.Candidates[index].TargetRouteShare = targetShare
+		decision.Candidates[index].BalanceMultiplier = multiplier
+		decision.Candidates[index].RecentRouteShare = actualShare
+		decision.Candidates[index].RouteSampleSize = activeSampleSize
+	}
+	balanceWeight = min(max(balanceWeight, 0), 1)
+	for index := range candidates {
+		if baseExpectations[index] <= 0 {
+			decision.Candidates[index].Expectation = 0
+			continue
+		}
+		baseProbability := baseExpectations[index] / baseTotal
+		balancedProbability := baseProbability
+		if correctedTotal > 0 {
+			balancedProbability = corrected[index] / correctedTotal
+		}
+		decision.Candidates[index].Expectation = (1-balanceWeight)*baseProbability + balanceWeight*balancedProbability
+	}
+	return 1
+}
+
+func routeBalanceMultiplier(actualShare float64, sampleSize int64, targetShare float64, desiredSampleSize float64) float64 {
+	if targetShare <= 0 || sampleSize <= 0 || desiredSampleSize <= 0 {
+		return 1
+	}
+	sampleCount := float64(sampleSize)
+	shareFloor := 1 / sampleCount
+	deviation := (min(max(actualShare, 0), 1) - targetShare) / max(targetShare, shareFloor)
+	rawMultiplier := min(max(math.Exp(-routingBalanceResponse*deviation), routingBalanceMinimumMultiplier), routingBalanceMaximumMultiplier)
+	confidence := min(sampleCount/desiredSampleSize, 1)
+	return 1 + (rawMultiplier-1)*confidence
 }
 
 func applyColdStartExploration(strategy string, candidates []RouteCandidate, decision *RouteDecision, maxPriority int, total float64) {

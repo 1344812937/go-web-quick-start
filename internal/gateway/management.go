@@ -216,6 +216,8 @@ type DashboardBreakdown struct {
 	CanceledCount int64   `json:"canceledCount"`
 	SuccessRate   float64 `json:"successRate"`
 	InputTokens   int64   `json:"inputTokens"`
+	CachedTokens  int64   `json:"cachedTokens"`
+	CacheHitRate  float64 `json:"cacheHitRate"`
 	OutputTokens  int64   `json:"outputTokens"`
 	EstimatedCost int64   `json:"estimatedCostMicros"`
 	UpstreamCost  int64   `json:"upstreamCostMicros"`
@@ -1407,20 +1409,32 @@ func (s *ManagementService) Dashboard(ctx context.Context, days int) (*Dashboard
 		Select("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道') AS name, COUNT(*) AS requests, "+
 			"COALESCE(SUM(CASE WHEN request.outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN request.outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
 			"COALESCE(1.0 * SUM(CASE WHEN request.outcome = 'success' THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN request.outcome <> 'canceled' THEN 1 ELSE 0 END),0),0) AS success_rate, "+
-			"COALESCE(SUM(request.input_tokens),0) AS input_tokens, COALESCE(SUM(request.output_tokens),0) AS output_tokens, COALESCE(SUM(request.estimated_cost),0) AS estimated_cost, COALESCE(SUM(request.upstream_cost),0) AS upstream_cost").
+			"COALESCE(SUM(request.input_tokens),0) AS input_tokens, COALESCE(SUM(request.cached_tokens),0) AS cached_tokens, "+
+			"COALESCE(SUM(request.output_tokens),0) AS output_tokens, COALESCE(SUM(request.estimated_cost),0) AS estimated_cost, COALESCE(SUM(request.upstream_cost),0) AS upstream_cost").
 		Joins("LEFT JOIN relay_attempt_logs AS final_attempt ON final_attempt.id = (SELECT a.id FROM relay_attempt_logs AS a WHERE a.request_id = request.id ORDER BY a.id DESC LIMIT 1)").
 		Joins("LEFT JOIN channels AS c ON c.id = final_attempt.channel_id").
 		Where("request.created_at >= ? AND request.created_at < ?", startTime, endTime).
 		Group("COALESCE(NULLIF(final_attempt.channel_name, ''), c.name, '未归属渠道')").Order("upstream_cost desc").Scan(&summary.Channels).Error; err != nil {
 		return nil, err
 	}
+	for index := range summary.Channels {
+		if summary.Channels[index].InputTokens > 0 {
+			summary.Channels[index].CacheHitRate = float64(summary.Channels[index].CachedTokens) / float64(summary.Channels[index].InputTokens)
+		}
+	}
 	if err := s.store.db.WithContext(ctx).Model(&RelayRequestLog{}).
 		Select("requested_model AS name, COUNT(*) AS requests, "+
 			"COALESCE(SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END),0) AS successes, COALESCE(SUM(CASE WHEN outcome = 'canceled' THEN 1 ELSE 0 END),0) AS canceled_count, "+
 			"COALESCE(1.0 * SUM(CASE WHEN outcome = 'success' THEN 1 ELSE 0 END) / NULLIF(SUM(CASE WHEN outcome <> 'canceled' THEN 1 ELSE 0 END),0),0) AS success_rate, "+
-			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
+			"COALESCE(SUM(input_tokens),0) AS input_tokens, COALESCE(SUM(cached_tokens),0) AS cached_tokens, "+
+			"COALESCE(SUM(output_tokens),0) AS output_tokens, COALESCE(SUM(estimated_cost),0) AS estimated_cost, COALESCE(SUM(upstream_cost),0) AS upstream_cost").
 		Where("created_at >= ? AND created_at < ?", startTime, endTime).Group("requested_model").Order("upstream_cost desc").Scan(&summary.Models).Error; err != nil {
 		return nil, err
+	}
+	for index := range summary.Models {
+		if summary.Models[index].InputTokens > 0 {
+			summary.Models[index].CacheHitRate = float64(summary.Models[index].CachedTokens) / float64(summary.Models[index].InputTokens)
+		}
 	}
 	return summary, nil
 }

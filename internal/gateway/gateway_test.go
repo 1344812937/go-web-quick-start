@@ -942,7 +942,7 @@ func TestDashboardChannelBreakdownCountsEachRequestOnce(t *testing.T) {
 	_, model, channels, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
 	now := time.Now().UTC()
 	requests := []RelayRequestLog{
-		{ID: "retried-request", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusOK, InputTokens: 100, OutputTokens: 20, EstimatedCost: 70, UpstreamCost: 60, AttemptCount: 2, CreatedAt: now},
+		{ID: "retried-request", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusOK, InputTokens: 100, CachedTokens: 40, OutputTokens: 20, EstimatedCost: 70, UpstreamCost: 60, AttemptCount: 2, CreatedAt: now},
 		{ID: "unrouted-request", TokenID: 1, Endpoint: "responses", RequestedModel: model.Name, StatusCode: http.StatusServiceUnavailable, AttemptCount: 0, CreatedAt: now},
 	}
 	if err := store.db.Create(&requests).Error; err != nil {
@@ -970,7 +970,7 @@ func TestDashboardChannelBreakdownCountsEachRequestOnce(t *testing.T) {
 	for _, item := range summary.Channels {
 		byName[item.Name] = item
 	}
-	if final := byName[channels[1].Name]; final.Requests != 1 || final.Successes != 1 || final.SuccessRate != 1 || final.UpstreamCost != 60 || final.EstimatedCost != 70 {
+	if final := byName[channels[1].Name]; final.Requests != 1 || final.Successes != 1 || final.SuccessRate != 1 || final.CachedTokens != 40 || final.CacheHitRate != 0.4 || final.UpstreamCost != 60 || final.EstimatedCost != 70 {
 		t.Fatalf("final channel breakdown = %+v", final)
 	}
 	if unrouted := byName["未归属渠道"]; unrouted.Requests != 1 || unrouted.Successes != 0 || unrouted.SuccessRate != 0 || unrouted.UpstreamCost != 0 || unrouted.EstimatedCost != 0 {
@@ -1724,7 +1724,7 @@ func TestRouterExpectationProbabilityIncludesEveryRoutingSignal(t *testing.T) {
 	}
 }
 
-func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
+func TestRecentRoutingMetricsUseCandidateScopedDynamicSample(t *testing.T) {
 	store := newTestStore(t)
 	now := time.Now()
 	attempts := []RelayAttemptLog{
@@ -1742,15 +1742,15 @@ func TestRecentRoutingMetricsUseSiteWideLatestSample(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := metrics[11]
-	if first.RouteCount != 2 || first.RouteSampleSize != 4 || first.RouteShare != 0.5 || first.CacheHitRate != 1 || first.CacheSampleCount != 1 || first.CacheRate != 0.5 || first.CacheTokenCount != 100 || first.LatencyMS != 20 || first.FirstTokenMS != 50 || first.TokensPerSecond != 100 {
+	if first.RouteCount != 2 || first.RouteSampleSize != 3 || first.RouteShare != 2.0/3.0 || first.CacheHitRate != 1 || first.CacheSampleCount != 1 || first.CacheRate != 0.5 || first.CacheTokenCount != 100 || first.LatencyMS != 20 || first.FirstTokenMS != 50 || first.TokensPerSecond != 100 {
 		t.Fatalf("first routing metric = %+v", first)
 	}
 	second := metrics[22]
-	if second.RouteCount != 1 || second.RouteSampleSize != 4 || second.RouteShare != 0.25 || second.CacheHitRate != 0 || second.CacheSampleCount != 1 || second.CacheRate != 0 || second.CacheTokenCount != 200 || second.LatencyMS != 40 || second.FirstTokenMS != 100 || second.TokensPerSecond != 50 {
+	if second.RouteCount != 1 || second.RouteSampleSize != 3 || second.RouteShare != 1.0/3.0 || second.CacheHitRate != 0 || second.CacheSampleCount != 1 || second.CacheRate != 0 || second.CacheTokenCount != 200 || second.LatencyMS != 40 || second.FirstTokenMS != 100 || second.TokensPerSecond != 50 {
 		t.Fatalf("second routing metric = %+v", second)
 	}
 	empty := metrics[44]
-	if empty.RouteCount != 0 || empty.RouteSampleSize != 4 || empty.RouteShare != 0 {
+	if empty.RouteCount != 0 || empty.RouteSampleSize != 3 || empty.RouteShare != 0 {
 		t.Fatalf("empty routing metric = %+v", empty)
 	}
 }
@@ -1772,10 +1772,66 @@ func TestRouterConfiguredPriceWeightOutweighsCacheAndRouteShare(t *testing.T) {
 	}
 }
 
+func TestRouterBalanceUsesRelativeTargetAcrossManyCandidates(t *testing.T) {
+	configProvider := func(balance int) func() *config.ApplicationConfig {
+		return func() *config.ApplicationConfig {
+			return &config.ApplicationConfig{GatewayConfig: config.GatewayConfig{
+				RoutingPriceWeightPercent:      35,
+				RoutingEfficiencyWeightPercent: 30,
+				RoutingQualityWeightPercent:    35 - balance,
+				RoutingBalanceWeightPercent:    balance,
+			}}
+		}
+	}
+	base := make([]RouteCandidate, 20)
+	for index := range base {
+		count := int64(18)
+		if index == 0 {
+			count = 58
+		} else if index == 1 {
+			count = 0
+		}
+		id := uint64(index + 1)
+		base[index] = RouteCandidate{
+			Channel: Channel{ID: id}, Mapping: ChannelModel{ID: id, Priority: 10, Weight: 100}, Cost: 100,
+			RecentSuccessRate: 1, RecentAttemptCount: 10, RecentLatencyMS: 20, RecentFirstTokenMS: 50, RecentTokensPerSecond: 50,
+			RecentRouteCount: count, RouteSampleSize: 400, MetricsLoaded: true,
+		}
+	}
+	balancedRouter := &Router{random: func(int) int { return 0 }, configProvider: configProvider(20)}
+	balanced := balancedRouter.orderCandidates(RoutingPriorityWeighted, append([]RouteCandidate(nil), base...))
+	byID := make(map[uint64]RouteDecisionCandidate, len(balanced.Candidates))
+	for _, candidate := range balanced.Candidates {
+		byID[candidate.ChannelModelID] = candidate
+	}
+	if byID[1].RecentRouteShare <= byID[1].TargetRouteShare || byID[1].BalanceMultiplier >= 1 || byID[1].Probability >= byID[2].Probability || byID[2].BalanceMultiplier <= 1 {
+		t.Fatalf("relative balance did not suppress the overloaded candidate: overloaded=%+v idle=%+v", byID[1], byID[2])
+	}
+
+	unbalancedRouter := &Router{random: func(int) int { return 0 }, configProvider: configProvider(0)}
+	unbalanced := unbalancedRouter.orderCandidates(RoutingPriorityWeighted, append([]RouteCandidate(nil), base...))
+	for _, candidate := range unbalanced.Candidates {
+		if math.Abs(candidate.Probability-0.05) > 0.000001 {
+			t.Fatalf("zero balance weight changed base probability: %+v", candidate)
+		}
+	}
+}
+
+func TestRoutingHistorySampleSizeScalesWithCandidateCount(t *testing.T) {
+	tests := map[int]int{0: 100, 2: 100, 20: 400, 80: 1000}
+	for candidates, want := range tests {
+		if got := routingHistorySampleSize(candidates); got != want {
+			t.Fatalf("routingHistorySampleSize(%d) = %d, want %d", candidates, got, want)
+		}
+	}
+}
+
 func TestRouterRoutingWeightsUpdateAtRuntime(t *testing.T) {
 	currentConfig := &config.ApplicationConfig{GatewayConfig: config.GatewayConfig{
 		RoutingPriceWeightPercent:      80,
 		RoutingEfficiencyWeightPercent: 10,
+		RoutingQualityWeightPercent:    5,
+		RoutingBalanceWeightPercent:    5,
 	}}
 	router := &Router{
 		random: func(int) int { return 0 },
@@ -1797,13 +1853,15 @@ func TestRouterRoutingWeightsUpdateAtRuntime(t *testing.T) {
 	currentConfig = &config.ApplicationConfig{GatewayConfig: config.GatewayConfig{
 		RoutingPriceWeightPercent:      10,
 		RoutingEfficiencyWeightPercent: 80,
+		RoutingQualityWeightPercent:    5,
+		RoutingBalanceWeightPercent:    5,
 	}}
 	efficiencyCandidates := append([]RouteCandidate(nil), base...)
 	efficiencyDecision := router.orderCandidates(RoutingPriorityWeighted, efficiencyCandidates)
 	if efficiencyDecision.Candidates[1].Probability <= efficiencyDecision.Candidates[0].Probability {
 		t.Fatalf("efficiency-weighted decision = %+v", efficiencyDecision.Candidates)
 	}
-	if efficiencyDecision.Weights.Price != 0.1 || efficiencyDecision.Weights.Efficiency != 0.8 || efficiencyDecision.Weights.Quality != 0.1 {
+	if efficiencyDecision.Weights.Price != 0.1 || efficiencyDecision.Weights.Efficiency != 0.8 || efficiencyDecision.Weights.Quality != 0.05 || efficiencyDecision.Weights.Balance != 0.05 {
 		t.Fatalf("updated decision weights = %+v", efficiencyDecision.Weights)
 	}
 }
@@ -2134,7 +2192,7 @@ func TestRelayPersistsCopilotResponsesIdentityAndRenamedTitle(t *testing.T) {
 	store := newTestStore(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_copilot","object":"response","status":"completed","usage":{"input_tokens":10,"output_tokens":2}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_copilot","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":10,"output_tokens":2}}`))
 	}))
 	defer upstream.Close()
 	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
@@ -2697,6 +2755,13 @@ func TestCodexSessionModelSwitchRecordsPreviousChannel(t *testing.T) {
 	if err := store.db.Create(&secondMapping).Error; err != nil {
 		t.Fatal(err)
 	}
+	stickyMapping := ChannelModel{
+		ChannelID: channels[0].ID, ModelID: secondModel.ID, UpstreamModel: "second-upstream-model-sticky",
+		Priority: 1, Weight: 1, InputPriceMicros: 1_000_000, OutputPriceMicros: 1_000_000, Enabled: true,
+	}
+	if err := store.db.Create(&stickyMapping).Error; err != nil {
+		t.Fatal(err)
+	}
 	previousRequest := RelayRequestLog{
 		ID: "model-switch-previous", TokenID: token.ID, RequestedModel: firstModel.Name,
 		CodexSessionID: "model-switch-session", CreatedAt: time.Now().Add(-time.Minute),
@@ -2719,19 +2784,36 @@ func TestCodexSessionModelSwitchRecordsPreviousChannel(t *testing.T) {
 	}
 
 	router := NewRouter(store, NewClientAccessService(store), nil)
-	plan, err := router.Plan(context.Background(), token, secondModel.Name, 10, 10, "", "model-switch-session")
+	router.RecordSessionAffinity(context.Background(), token.ID, secondModel.ID, "model-switch-session", secondMapping.ID)
+	router.RecordAffinity(context.Background(), "resp_before_model_switch", firstMappings[0].ID)
+	plan, err := router.Plan(context.Background(), token, secondModel.Name, 10, 10, "resp_before_model_switch", "model-switch-session")
 	if err != nil {
 		t.Fatal(err)
 	}
 	selection := plan.InitialSelection
-	if len(plan.Candidates) != 1 || plan.Candidates[0].Mapping.ID != secondMapping.ID {
+	if len(plan.Candidates) != 2 || plan.Candidates[0].Mapping.ID != stickyMapping.ID {
 		t.Fatalf("model-switch candidates = %+v", plan.Candidates)
+	}
+	if !plan.SessionAffinity || plan.Affinity || !plan.RefreshSessionAffinity || plan.SessionAffinityMappingID != 0 {
+		t.Fatalf("model-switch affinity flags = %+v", plan)
 	}
 	if selection.Reason != SelectionReasonModelSwitch || selection.PreviousChannelID != channels[0].ID || selection.PreviousChannelName != channels[0].Name || selection.Detail != firstModel.Name+" -> "+secondModel.Name {
 		t.Fatalf("model-switch selection = %+v", selection)
 	}
-	if selection.Decision == nil || selection.Decision.Mode != "probability" {
+	if selection.Decision == nil || selection.Decision.Mode != "session_affinity" || !selection.Decision.Candidates[0].Selected {
 		t.Fatalf("model-switch route decision = %+v", selection.Decision)
+	}
+
+	execution := &relayExecution{
+		token: token, modelID: secondModel.ID, payload: &RelayPayload{SessionKey: "model-switch-session"}, refreshSessionAffinity: true,
+	}
+	(&RelayService{router: router}).recordSessionAffinityAfterSuccess(context.Background(), execution, stickyMapping.ID)
+	var refreshedAffinity SessionAffinity
+	if err := store.db.Where("token_id = ? AND model_id = ? AND session_hash = ?", token.ID, secondModel.ID, hashSecret("model-switch-session")).First(&refreshedAffinity).Error; err != nil {
+		t.Fatal(err)
+	}
+	if refreshedAffinity.ChannelModelID != stickyMapping.ID {
+		t.Fatalf("refreshed model-switch affinity = %+v", refreshedAffinity)
 	}
 
 	if err := store.db.Create(&RelayRequestLog{
@@ -2753,6 +2835,48 @@ func TestCodexSessionModelSwitchRecordsPreviousChannel(t *testing.T) {
 	}
 	if sameModelPlan.InitialSelection.Reason != SelectionReasonInitialRoute || sameModelPlan.InitialSelection.PreviousChannelID != 0 {
 		t.Fatalf("same-model selection = %+v", sameModelPlan.InitialSelection)
+	}
+}
+
+func TestCodexSessionModelSwitchFallsBackWhenPreviousChannelDoesNotSupportModel(t *testing.T) {
+	store := newTestStore(t)
+	token, firstModel, channels, firstMappings := createRouteFixture(t, store, RoutingPriorityWeighted, "http://one.invalid", "http://two.invalid")
+	secondModel := GatewayModel{Name: "fallback-public-model", RoutingStrategy: RoutingPriorityWeighted, Enabled: true}
+	if err := store.db.Create(&secondModel).Error; err != nil {
+		t.Fatal(err)
+	}
+	secondMapping := ChannelModel{
+		ChannelID: channels[1].ID, ModelID: secondModel.ID, UpstreamModel: "fallback-upstream-model",
+		Priority: 100, Weight: 100, Enabled: true,
+	}
+	if err := store.db.Create(&secondMapping).Error; err != nil {
+		t.Fatal(err)
+	}
+	previousRequest := RelayRequestLog{
+		ID: "model-switch-fallback", TokenID: token.ID, RequestedModel: firstModel.Name,
+		CodexSessionID: "model-switch-fallback-session", CreatedAt: time.Now().Add(-time.Minute),
+	}
+	if err := store.db.Create(&previousRequest).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := store.db.Create(&RelayAttemptLog{
+		RequestID: previousRequest.ID, ChannelID: channels[0].ID, ChannelName: channels[0].Name,
+		ChannelModelID: firstMappings[0].ID, UpstreamModel: firstMappings[0].UpstreamModel,
+		Success: true, CreatedAt: previousRequest.CreatedAt,
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	router := NewRouter(store, NewClientAccessService(store), nil)
+	plan, err := router.Plan(context.Background(), token, secondModel.Name, 10, 10, "", previousRequest.CodexSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Candidates) != 1 || plan.Candidates[0].Mapping.ID != secondMapping.ID || plan.RefreshSessionAffinity {
+		t.Fatalf("model-switch fallback plan = %+v", plan)
+	}
+	if plan.InitialSelection.Reason != SelectionReasonModelSwitch || plan.InitialSelection.Decision == nil || plan.InitialSelection.Decision.Mode != "probability" {
+		t.Fatalf("model-switch fallback selection = %+v", plan.InitialSelection)
 	}
 }
 
@@ -3224,6 +3348,7 @@ func TestRelayStreamUsesLastValidCostSnapshot(t *testing.T) {
 		_, _ = writer.Write([]byte("data: {\"usage\":{\"input_tokens\":10,\"output_tokens\":1,\"cost\":\"0.000100\"}}\n\n"))
 		_, _ = writer.Write([]byte("data: {\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"total_cost\":\"0.000250\"}}\n\n"))
 		_, _ = writer.Write([]byte("data: {\"usage\":{\"cost\":\"invalid\"}}\n\n"))
+		_, _ = writer.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"done\"}\n\n"))
 		_, _ = writer.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cost\",\"status\":\"completed\"}}\n\n"))
 	}))
 	defer upstream.Close()
@@ -3283,9 +3408,11 @@ func TestRequestSessionNameUsesLatestUserText(t *testing.T) {
 		{name: "chat string", body: `{"messages":[{"role":"assistant","content":"ignored"},{"role":"user","content":"  first   question here  "}]}`, want: "first ques"},
 		{name: "chat accumulated context", body: `{"messages":[{"role":"user","content":"old context"},{"role":"assistant","content":"old answer"},{"role":"user","content":"current user request"}]}`, want: "current us"},
 		{name: "chat parts", body: `{"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"private"}},{"type":"text","text":"inspect this image"}]}]}`, want: "inspect th"},
+		{name: "chat Codex image attachment", body: `{"messages":[{"role":"user","content":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\n修复一下这个问题\n<image name=[Image #1] path=\"/tmp/screenshot.png\">\n</image>"}]}`, want: "修复一下这个问题"},
 		{name: "responses string", body: `{"input":"生成一份设备运行日报表"}`, want: "生成一份设备运行日报"},
 		{name: "responses messages", body: `{"input":[{"role":"developer","content":"ignored"},{"role":"user","content":[{"type":"input_text","text":"line one"},{"type":"input_text","text":"line two"}]}]}`, want: "line one l"},
 		{name: "responses accumulated context", body: `{"input":[{"role":"user","content":"older prompt"},{"role":"assistant","content":"older answer"},{"role":"user","content":"latest prompt"}]}`, want: "latest pro"},
+		{name: "responses Codex image attachment", body: `{"input":[{"role":"user","content":[{"type":"input_text","text":"# Files mentioned by the user:\n\n## screenshot.png: /tmp/screenshot.png\n\n## My request for Codex:\ninspect session naming"},{"type":"input_text","text":"<image name=[Image #1] path=\"/tmp/screenshot.png\">"},{"type":"input_image","image_url":"data:image/png;base64,AA=="},{"type":"input_text","text":"</image>"}]}]}`, want: "inspect se"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -3562,7 +3689,7 @@ func TestHistoricalOutcomeClassifierSkipsUncertainPayloads(t *testing.T) {
 	if failure, _, inspected := classifyHistoricalResponse("responses", true, truncated, true); inspected || failure != nil {
 		t.Fatalf("truncated payload was reclassified: %+v", failure)
 	}
-	completed := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\"}}\n\n"
+	completed := "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"ok\"}]}]}}\n\n"
 	if failure, responseID, inspected := classifyHistoricalResponse("responses", true, completed, false); !inspected || failure != nil || responseID != "resp_ok" {
 		t.Fatalf("completed payload failure=%+v responseID=%q inspected=%v", failure, responseID, inspected)
 	}
@@ -3672,7 +3799,7 @@ func TestRelayPersistsProcessingLogBeforeUpstreamCompletes(t *testing.T) {
 		close(upstreamStarted)
 		<-releaseUpstream
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_two_phase","object":"response","status":"completed","output":[]}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_two_phase","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`))
 	}))
 	defer upstream.Close()
 	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, upstream.URL)
@@ -3882,7 +4009,7 @@ func TestRelayRecordsRetrySelectionReasons(t *testing.T) {
 func successfulResponseServer() *httptest.Server {
 	return httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_retry","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_retry","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":5,"output_tokens":1}}`))
 	}))
 }
 
@@ -3921,7 +4048,7 @@ func TestRelayMovesCodexSessionAffinityAfterRetryableFailure(t *testing.T) {
 	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		secondCalls.Add(1)
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_session","object":"response","status":"completed","usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_session","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}],"usage":{"input_tokens":10,"output_tokens":2,"input_tokens_details":{"cached_tokens":4}}}`))
 	}))
 	defer second.Close()
 	token, model, _, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
@@ -4017,14 +4144,14 @@ func TestRelayKeepsCodexSessionAffinityUntilOriginalChannelIsUnavailable(t *test
 			_, _ = writer.Write([]byte(`{"error":{"message":"temporary","type":"api_error","code":"temporary"}}`))
 			return
 		}
-		_, _ = writer.Write([]byte(`{"id":"resp_original","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":1}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_original","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"original"}]}],"usage":{"input_tokens":4,"output_tokens":1}}`))
 	}))
 	defer first.Close()
 	var secondCalls atomic.Int32
 	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		secondCalls.Add(1)
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_fallback","object":"response","status":"completed","usage":{"input_tokens":4,"output_tokens":1}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_fallback","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"fallback"}]}],"usage":{"input_tokens":4,"output_tokens":1}}`))
 	}))
 	defer second.Close()
 	token, model, _, mappings := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
@@ -4302,7 +4429,7 @@ func TestRelayCircuitsBalanceFailureAndSwitchesChannel(t *testing.T) {
 	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		secondCalls.Add(1)
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_switched","status":"completed","usage":{"input_tokens":5,"output_tokens":1}}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_switched","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"switched"}]}],"usage":{"input_tokens":5,"output_tokens":1}}`))
 	}))
 	defer second.Close()
 	token, _, channels, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)
@@ -4576,7 +4703,7 @@ func TestRelayRetriesTopLevelNonStreamingIncompleteResponse(t *testing.T) {
 	defer first.Close()
 	second := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_, _ = writer.Write([]byte(`{"id":"resp_completed","object":"response","status":"completed","output":[]}`))
+		_, _ = writer.Write([]byte(`{"id":"resp_completed","object":"response","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}]}`))
 	}))
 	defer second.Close()
 	token, _, _, _ := createRouteFixture(t, store, RoutingPriorityWeighted, first.URL, second.URL)

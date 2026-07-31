@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
-import { Check, Link, Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
+import { Check, Delete, Link, Refresh } from '@element-plus/icons-vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import projectMeta from '@/config/project.generated.js'
-import type { ApplicationSettings, PayloadLogDetail } from '@/types/gateway'
+import RoutingWeightEditor from '@/components/RoutingWeightEditor.vue'
+import type { ApplicationSettings, LogPayloadCleanupResult, LogStorageUsage, PayloadLogDetail } from '@/types/gateway'
+import type { RoutingWeightValues } from '@/types/routing'
 import { request } from '@/utils/api'
 
 const repositoryUrl = 'https://github.com/1344812937/go-web-quick-start'
@@ -11,6 +13,10 @@ const buildBranch = __BUILD_BRANCH__
 const loading = ref(true)
 const saving = ref(false)
 const errorMessage = ref('')
+const logStorage = ref<LogStorageUsage | null>(null)
+const logStorageLoading = ref(false)
+const clearingPayloads = ref(false)
+let storageTimer: ReturnType<typeof setInterval> | undefined
 const payloadLogDetailOptions: Array<{ label: string; value: PayloadLogDetail }> = [
   { label: '默认', value: 'default' },
   { label: '摘要', value: 'summary' },
@@ -21,10 +27,13 @@ const payloadLogDetailDescriptions: Record<PayloadLogDetail, string> = {
   summary: '保留 JSON 结构、短文本预览及首尾数组项，单段不超过 64 KiB。',
   none: '不保存请求参数和响应正文，仅保留状态、用量、耗时与路由结果。',
 }
-const defaultRoutingPriceWeightPercent = 45
-const defaultRoutingEfficiencyWeightPercent = 45
+const defaultRoutingPriceWeightPercent = 40
+const defaultRoutingEfficiencyWeightPercent = 35
+const defaultRoutingQualityWeightPercent = 15
+const defaultRoutingBalanceWeightPercent = 10
 const minimumRoutingQualityWeightPercent = 5
-const maximumPrimaryRoutingWeightPercent = 100 - minimumRoutingQualityWeightPercent
+type RoutingWeightKey = 'routingPriceWeightPercent' | 'routingEfficiencyWeightPercent' | 'routingQualityWeightPercent' | 'routingBalanceWeightPercent'
+const routingWeightKeys: RoutingWeightKey[] = ['routingPriceWeightPercent', 'routingEfficiencyWeightPercent', 'routingQualityWeightPercent', 'routingBalanceWeightPercent']
 const defaultCommonModelNames = ['gpt-image-2', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.4-mini', 'codex-auto-review']
 const form = reactive<ApplicationSettings>({
   webConfig: { host: '', port: '' },
@@ -36,50 +45,57 @@ const form = reactive<ApplicationSettings>({
     streamIdleTimeoutSeconds: 300,
     routingPriceWeightPercent: defaultRoutingPriceWeightPercent,
     routingEfficiencyWeightPercent: defaultRoutingEfficiencyWeightPercent,
+    routingQualityWeightPercent: defaultRoutingQualityWeightPercent,
+    routingBalanceWeightPercent: defaultRoutingBalanceWeightPercent,
     sessionTTLHours: 12,
     secureCookie: false,
     payloadLogDetail: 'default',
     commonModelNames: [...defaultCommonModelNames],
   },
 })
-const routingQualityWeightPercent = computed(() => 100 - form.gatewayConfig.routingPriceWeightPercent - form.gatewayConfig.routingEfficiencyWeightPercent)
+const routingWeights = computed<RoutingWeightValues>(() => ({
+  price: form.gatewayConfig.routingPriceWeightPercent,
+  efficiency: form.gatewayConfig.routingEfficiencyWeightPercent,
+  quality: form.gatewayConfig.routingQualityWeightPercent,
+  balance: form.gatewayConfig.routingBalanceWeightPercent,
+}))
 
-function clampRoutingWeight(value: number, maximum: number): number {
+function clampRoutingWeight(value: number, minimum = 0): number {
   if (!Number.isFinite(value)) return 0
-  return Math.min(Math.max(Math.round(value), 0), Math.max(maximum, 0))
+  return Math.min(Math.max(Math.round(value), minimum), 100)
 }
 
-function updateRoutingPriceWeight(value: number | number[] | undefined) {
-  if (value === undefined) return
-  const next = Array.isArray(value) ? value[0] : value
-  const availableWeight = maximumPrimaryRoutingWeightPercent - form.gatewayConfig.routingEfficiencyWeightPercent
-  form.gatewayConfig.routingPriceWeightPercent = clampRoutingWeight(next, availableWeight)
+function applyRoutingWeights(weights: RoutingWeightValues) {
+  form.gatewayConfig.routingPriceWeightPercent = weights.price
+  form.gatewayConfig.routingEfficiencyWeightPercent = weights.efficiency
+  form.gatewayConfig.routingQualityWeightPercent = weights.quality
+  form.gatewayConfig.routingBalanceWeightPercent = weights.balance
 }
 
-function updateRoutingEfficiencyWeight(value: number | number[] | undefined) {
-  if (value === undefined) return
-  const next = Array.isArray(value) ? value[0] : value
-  const availableWeight = maximumPrimaryRoutingWeightPercent - form.gatewayConfig.routingPriceWeightPercent
-  form.gatewayConfig.routingEfficiencyWeightPercent = clampRoutingWeight(next, availableWeight)
-}
-
-function normalizedRoutingWeights(priceValue: number | undefined, efficiencyValue: number | undefined) {
-  const price = clampRoutingWeight(priceValue ?? defaultRoutingPriceWeightPercent, maximumPrimaryRoutingWeightPercent)
-  const efficiency = clampRoutingWeight(efficiencyValue ?? defaultRoutingEfficiencyWeightPercent, maximumPrimaryRoutingWeightPercent - price)
-  return { price, efficiency }
+function normalizedRoutingWeights(payload: ApplicationSettings['gatewayConfig']) {
+  const price = clampRoutingWeight(payload.routingPriceWeightPercent ?? defaultRoutingPriceWeightPercent)
+  const efficiency = clampRoutingWeight(payload.routingEfficiencyWeightPercent ?? defaultRoutingEfficiencyWeightPercent)
+  const remaining = Math.max(100 - price - efficiency, minimumRoutingQualityWeightPercent)
+  const balance = payload.routingBalanceWeightPercent === undefined
+    ? Math.min(defaultRoutingBalanceWeightPercent, remaining - minimumRoutingQualityWeightPercent)
+    : clampRoutingWeight(payload.routingBalanceWeightPercent)
+  const quality = payload.routingQualityWeightPercent === undefined
+    ? remaining - balance
+    : clampRoutingWeight(payload.routingQualityWeightPercent, minimumRoutingQualityWeightPercent)
+  if (price + efficiency + quality + balance === 100) return { price, efficiency, quality, balance }
+  return { price: defaultRoutingPriceWeightPercent, efficiency: defaultRoutingEfficiencyWeightPercent, quality: defaultRoutingQualityWeightPercent, balance: defaultRoutingBalanceWeightPercent }
 }
 
 function applySettings(payload: ApplicationSettings) {
-  const routingWeights = normalizedRoutingWeights(
-    payload.gatewayConfig.routingPriceWeightPercent,
-    payload.gatewayConfig.routingEfficiencyWeightPercent,
-  )
+  const routingWeights = normalizedRoutingWeights(payload.gatewayConfig)
   form.webConfig = { ...payload.webConfig }
   form.nodeConfig = { ...payload.nodeConfig }
   form.gatewayConfig = {
     ...payload.gatewayConfig,
     routingPriceWeightPercent: routingWeights.price,
     routingEfficiencyWeightPercent: routingWeights.efficiency,
+    routingQualityWeightPercent: routingWeights.quality,
+    routingBalanceWeightPercent: routingWeights.balance,
     commonModelNames: payload.gatewayConfig.commonModelNames?.length ? [...payload.gatewayConfig.commonModelNames] : [...defaultCommonModelNames],
   }
 }
@@ -96,9 +112,60 @@ async function loadSettings() {
   }
 }
 
+function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let size = value
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024
+    unit += 1
+  }
+  return `${size.toFixed(unit === 0 ? 0 : size >= 10 ? 1 : 2)} ${units[unit]}`
+}
+
+function formatCutoff(value: string): string {
+  return new Intl.DateTimeFormat('zh-CN', { dateStyle: 'medium', timeStyle: 'short', timeZone: 'Asia/Shanghai' }).format(new Date(value))
+}
+
+async function loadLogStorage() {
+  logStorageLoading.value = true
+  try {
+    logStorage.value = await request<LogStorageUsage>('/admin/gateway/logs/storage')
+  } catch {
+    logStorage.value = null
+  } finally {
+    logStorageLoading.value = false
+  }
+}
+
+async function clearHistoricalPayloads() {
+  const cutoff = logStorage.value?.cutoffAt ? formatCutoff(logStorage.value.cutoffAt) : '当前时间前 30 分钟'
+  try {
+    await ElMessageBox.confirm(
+      `将永久清空 ${cutoff} 之前调用日志中的请求参数、请求正文和响应正文。状态、Token、费用和耗时统计会保留。`,
+      '清理调用日志参数',
+      { type: 'warning', confirmButtonText: '确认清理', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  clearingPayloads.value = true
+  try {
+    const result = await request<LogPayloadCleanupResult>('/admin/gateway/logs/clear-payloads', { method: 'POST' })
+    ElMessage.success(`已清理 ${result.requestLogsCleared} 条调用和 ${result.attemptLogsCleared} 条上游尝试的参数与明细`)
+    await loadLogStorage()
+  } catch (error) {
+    ElMessage.error(error instanceof Error ? error.message : '调用日志参数清理失败')
+  } finally {
+    clearingPayloads.value = false
+  }
+}
+
 async function saveSettings() {
-  if (routingQualityWeightPercent.value < minimumRoutingQualityWeightPercent) {
-    ElMessage.error(`质量与均衡占比不能低于 ${minimumRoutingQualityWeightPercent}%`)
+  const routingWeightTotal = routingWeightKeys.reduce((total, key) => total + form.gatewayConfig[key], 0)
+  if (routingWeightTotal !== 100 || form.gatewayConfig.routingQualityWeightPercent < minimumRoutingQualityWeightPercent) {
+    ElMessage.error(`四项路由占比之和必须为 100%，且质量占比不能低于 ${minimumRoutingQualityWeightPercent}%`)
     return
   }
   saving.value = true
@@ -112,7 +179,15 @@ async function saveSettings() {
   }
 }
 
-onMounted(loadSettings)
+onMounted(() => {
+  void loadSettings()
+  void loadLogStorage()
+  storageTimer = setInterval(() => { void loadLogStorage() }, 10_000)
+})
+
+onUnmounted(() => {
+  if (storageTimer) clearInterval(storageTimer)
+})
 </script>
 
 <template>
@@ -135,34 +210,17 @@ onMounted(loadSettings)
 
       <section class="surface-panel settings-section routing-settings-section">
         <header class="panel-heading"><div><h2>路由决策</h2><p>保存后立即作用于新进入的非固定渠道请求</p></div></header>
-        <div class="routing-weight-overview" aria-label="路由决策占比">
-          <div><span>价格</span><strong>{{ form.gatewayConfig.routingPriceWeightPercent }}%</strong></div>
-          <div><span>效率</span><strong>{{ form.gatewayConfig.routingEfficiencyWeightPercent }}%</strong></div>
-          <div><span>质量与均衡</span><strong>{{ routingQualityWeightPercent }}%</strong></div>
-        </div>
-        <div class="routing-weight-bar" aria-hidden="true">
-          <i class="is-price" :style="{ flexGrow: form.gatewayConfig.routingPriceWeightPercent }" />
-          <i class="is-efficiency" :style="{ flexGrow: form.gatewayConfig.routingEfficiencyWeightPercent }" />
-          <i class="is-quality" :style="{ flexGrow: routingQualityWeightPercent }" />
-        </div>
-        <div class="settings-fields routing-weight-fields">
-          <el-form-item label="价格占比">
-            <div class="weight-control">
-              <el-slider :model-value="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :step="5" show-stops aria-label="价格决策占比" @update:model-value="updateRoutingPriceWeight" />
-              <el-input-number :model-value="form.gatewayConfig.routingPriceWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :precision="0" :step="5" controls-position="right" aria-label="价格决策占比百分比" @update:model-value="updateRoutingPriceWeight" />
-            </div>
-          </el-form-item>
-          <el-form-item label="效率占比">
-            <div class="weight-control">
-              <el-slider :model-value="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :step="5" show-stops aria-label="效率决策占比" @update:model-value="updateRoutingEfficiencyWeight" />
-              <el-input-number :model-value="form.gatewayConfig.routingEfficiencyWeightPercent" :min="0" :max="maximumPrimaryRoutingWeightPercent" :precision="0" :step="5" controls-position="right" aria-label="效率决策占比百分比" @update:model-value="updateRoutingEfficiencyWeight" />
-            </div>
-          </el-form-item>
-        </div>
+        <RoutingWeightEditor
+          :weights="routingWeights"
+          :minimum-quality="minimumRoutingQualityWeightPercent"
+          :disabled="saving"
+          @update:weights="applyRoutingWeights"
+        />
         <dl class="routing-formula">
           <div><dt>价格</dt><dd>按本次预计费用相对最低费用归一化，价格越低得分越高。</dd></div>
           <div><dt>效率</dt><dd>首 token 45% + 响应头延迟 20% + 输出吞吐 35%，使用近 30 分钟成功样本。</dd></div>
-          <div><dt>质量与均衡</dt><dd>始终使用价格与效率之后的剩余占比，至少保留 {{ minimumRoutingQualityWeightPercent }}%，用于成功率、缓存表现和近期流量均衡。</dd></div>
+          <div><dt>质量</dt><dd>成功率 70% + 缓存命中 18% + 缓存 Token 率 12%，至少保留 {{ minimumRoutingQualityWeightPercent }}%。</dd></div>
+          <div><dt>均衡</dt><dd>比较当前模型各候选渠道的实际占比与基础目标占比，按样本置信度纠偏；候选越多，窗口会从 100 条动态扩展到最多 1000 条。</dd></div>
         </dl>
       </section>
 
@@ -185,6 +243,11 @@ onMounted(loadSettings)
             <div class="payload-detail-control">
               <el-segmented v-model="form.gatewayConfig.payloadLogDetail" :options="payloadLogDetailOptions" aria-label="调用日志参数和返回记录细节" />
               <small>{{ payloadLogDetailDescriptions[form.gatewayConfig.payloadLogDetail] }} 保存后立即作用于新进入的调用。</small>
+              <div class="payload-storage-row">
+                <span class="payload-storage-metric"><strong>当前占用空间</strong><b v-if="!logStorageLoading && logStorage">{{ formatBytes(logStorage.payloadBytes) }}</b><b v-else-if="!logStorageLoading">--</b><el-skeleton v-else :rows="1" animated /></span>
+                <el-button type="danger" plain size="small" :icon="Delete" :loading="clearingPayloads" @click="clearHistoricalPayloads">清理</el-button>
+              </div>
+              <small v-if="logStorage">清理范围：{{ formatCutoff(logStorage.cutoffAt) }} 之前的参数与正文；每 10 秒刷新。</small>
             </div>
           </el-form-item>
           <el-form-item label="首次渠道配置自动启用模型" class="payload-detail-field">
@@ -224,26 +287,17 @@ onMounted(loadSettings)
 .settings-fields { padding: 20px 22px 8px; }
 .settings-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0 18px; }
 .settings-actions { display: flex; justify-content: flex-end; position: sticky; bottom: 12px; padding: 10px; border: 1px solid var(--rose-border); background: var(--rose-surface); }
-.routing-weight-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--rose-border); }
-.routing-weight-overview > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 14px 22px; border-right: 1px solid var(--rose-border); }
-.routing-weight-overview > div:last-child { border-right: 0; }
-.routing-weight-overview span { color: var(--rose-text-muted); font-size: 11px; }
-.routing-weight-overview strong { color: var(--rose-text); font-family: var(--rose-font-mono); font-size: 18px; font-weight: 650; }
-.routing-weight-bar { display: flex; height: 4px; background: var(--rose-surface-muted); }
-.routing-weight-bar i { min-width: 0; }
-.routing-weight-bar .is-price { background: var(--rose-primary); }
-.routing-weight-bar .is-efficiency { background: var(--rose-success); }
-.routing-weight-bar .is-quality { background: var(--rose-warning); }
-.routing-weight-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; padding-bottom: 0; }
-.weight-control { display: grid; grid-template-columns: minmax(120px, 1fr) 118px; align-items: center; gap: 20px; width: 100%; }
-.weight-control :deep(.el-input-number) { width: 118px; }
-.routing-formula { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; padding: 4px 22px 20px; }
+.routing-formula { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin: 0; padding: 4px 22px 20px; }
 .routing-formula > div { min-width: 0; padding: 10px 14px; border-left: 2px solid var(--rose-border-strong); }
 .routing-formula dt { color: var(--rose-text); font-size: 11px; font-weight: 650; }
 .routing-formula dd { margin: 5px 0 0; color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
 .payload-detail-field { grid-column: 1 / -1; }
 .payload-detail-control { display: grid; justify-items: start; gap: 8px; }
 .payload-detail-control small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
+.payload-storage-row { display: flex; width: 100%; align-items: center; justify-content: space-between; gap: 16px; padding: 10px 12px; border: 1px solid var(--rose-border); background: var(--rose-surface-muted); }
+.payload-storage-metric { display: flex; align-items: baseline; gap: 10px; color: var(--rose-text-muted); font-size: 11px; }
+.payload-storage-metric b { color: var(--rose-text); font-family: var(--rose-font-mono); font-size: 16px; }
+.payload-storage-metric :deep(.el-skeleton) { width: 70px; }
 .common-model-control { display: grid; gap: 8px; width: 100%; }
 .common-model-control .el-select { width: 100%; }
 .common-model-control small { color: var(--rose-text-muted); font-size: 11px; line-height: 1.6; }
@@ -260,14 +314,11 @@ onMounted(loadSettings)
 .disclaimer strong { display: block; margin-bottom: 5px; color: var(--rose-text); font-size: 12px; }
 .disclaimer p { margin: 0; font-size: 12px; line-height: 1.7; }
 @media (max-width: 800px) {
-  .settings-grid, .routing-weight-fields { grid-template-columns: 1fr 1fr; }
-  .weight-control { grid-template-columns: 1fr; gap: 8px; }
+  .settings-grid { grid-template-columns: 1fr 1fr; }
   .routing-formula { grid-template-columns: 1fr; gap: 8px; }
 }
 @media (max-width: 520px) {
-  .settings-grid, .routing-weight-fields, .routing-weight-overview, .project-metadata { grid-template-columns: 1fr; }
-  .routing-weight-overview > div { border-right: 0; border-bottom: 1px solid var(--rose-border); }
-  .routing-weight-overview > div:last-child { border-bottom: 0; }
+  .settings-grid, .project-metadata { grid-template-columns: 1fr; }
   .repository-row { grid-column: auto; }
   .project-metadata { gap: 14px; padding: 18px; }
   .disclaimer { margin: 0 18px 18px; }
