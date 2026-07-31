@@ -38,28 +38,56 @@ function formatTiming(value: number, samples: number): string {
   return samples > 0 ? formatDuration(value) : '--'
 }
 
-function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
+interface SessionHealth {
+  score: number | null
+  label: '健康' | '关注' | '风险' | '待观察'
+  kind: 'healthy' | 'attention' | 'risk' | 'unknown'
+}
+
+function sessionHealth(row: CodexSessionSummary): SessionHealth {
   const completedRequests = Math.max(0, row.requestCount - row.canceledCount - row.processingCount)
-  const successRate = Math.min(1, Math.max(0, row.successRate))
-  const volumeRisk = Math.min(1, Math.max(0, row.requestCount) / 300)
-  const requestEmphasis = Math.min(1, Math.log1p(Math.max(0, row.requestCount)) / Math.log1p(100))
-  const risk = Math.min(1, volumeRisk + (1 - successRate) * (1 - volumeRisk) * 0.6)
+  if (completedRequests === 0) return { score: null, label: '待观察', kind: 'unknown' }
+
+  const successScore = Math.min(1, Math.max(0, row.successRate))
+  const compactionCount = Math.max(0, row.compactionCount)
+  const compactionScore = 1 / (1 + compactionCount * 0.35)
+  const score = Math.round((successScore * 0.7 + compactionScore * 0.3) * 100)
+  if (score >= 85) return { score, label: '健康', kind: 'healthy' }
+  if (score >= 65) return { score, label: '关注', kind: 'attention' }
+  return { score, label: '风险', kind: 'risk' }
+}
+
+function sessionRowStyle({ row }: { row: CodexSessionSummary }): CSSProperties {
+  const health = sessionHealth(row)
+  const score = health.score ?? 50
+  const risk = 1 - score / 100
   let tone = 'var(--rose-text-subtle)'
-  if (completedRequests > 0) {
-    if (risk <= 0.5) {
-      const warningWeight = Math.round(risk * 200)
-      tone = `color-mix(in srgb, var(--rose-success) ${100 - warningWeight}%, var(--rose-warning))`
-    } else {
-      const dangerWeight = Math.round((risk - 0.5) * 200)
-      tone = `color-mix(in srgb, var(--rose-warning) ${100 - dangerWeight}%, var(--rose-danger))`
-    }
+  if (health.score !== null && score >= 50) {
+    const successWeight = Math.round((score - 50) * 2)
+    tone = `color-mix(in srgb, var(--rose-warning) ${100 - successWeight}%, var(--rose-success))`
+  } else if (health.score !== null) {
+    const warningWeight = Math.round(score * 2)
+    tone = `color-mix(in srgb, var(--rose-danger) ${100 - warningWeight}%, var(--rose-warning))`
   }
-  const tint = Math.round(6 + risk * 6)
+  const tint = health.kind === 'unknown' ? 3 : Math.round(5 + risk * 5)
   return {
     '--session-row-tone': tone,
     '--session-row-fill': `color-mix(in srgb, var(--rose-surface) ${100 - tint}%, ${tone})`,
     '--session-row-fill-hover': `color-mix(in srgb, var(--rose-surface) ${Math.max(0, 96 - tint)}%, ${tone})`,
-    '--request-count-size': `${Math.round(13 + requestEmphasis * 3)}px`,
+  } as CSSProperties
+}
+
+function compactionStyle(count: number): CSSProperties {
+  const normalizedCount = Math.max(0, count)
+  const emphasis = normalizedCount === 0 ? 0 : Math.min(1, Math.log1p(normalizedCount) / Math.log1p(8))
+  const dangerWeight = Math.round(emphasis * 100)
+  const tone = normalizedCount === 0
+    ? 'var(--rose-text-subtle)'
+    : `color-mix(in srgb, var(--rose-warning) ${100 - dangerWeight}%, var(--rose-danger))`
+  return {
+    '--compaction-tone': tone,
+    '--compaction-size': `${Math.round(14 + emphasis * 4)}px`,
+    '--compaction-width': `${Math.round(12 + emphasis * 44)}px`,
   } as CSSProperties
 }
 
@@ -238,11 +266,13 @@ onMounted(async () => {
     <div v-if="errorMessage" class="state-panel state-error" role="alert"><strong>会话日志加载失败</strong><span>{{ errorMessage }}</span><el-button :loading="loading" @click="loadSessions">重试</el-button></div>
     <section v-else class="surface-panel table-panel log-table-panel">
       <el-table v-loading="loading" class="session-table" :data="sessions" :row-key="sessionRowKey" :row-style="sessionRowStyle" height="100%" empty-text="当前筛选条件下没有会话记录" @row-click="openSession">
-        <el-table-column label="会话" min-width="360">
+        <el-table-column label="会话" min-width="300">
           <template #default="scope">
             <div class="session-identity" :class="`is-${sessionClientSource(scope.row).kind}`" :aria-label="`来源 ${sessionClientSource(scope.row).label}`">
-              <span class="session-source-watermark" aria-hidden="true">{{ sessionClientSource(scope.row).label }}</span>
-              <strong class="session-name" :title="scope.row.sessionName || '未命名会话'">{{ scope.row.sessionName || '未命名会话' }}</strong>
+              <div class="session-title-line">
+                <strong class="session-name" :title="scope.row.sessionName || '未命名会话'">{{ scope.row.sessionName || '未命名会话' }}</strong>
+                <span class="session-client"><i aria-hidden="true" />{{ sessionClientSource(scope.row).label }}</span>
+              </div>
               <div class="session-meta">
                 <small><code>{{ scope.row.identified ? scope.row.sessionId : scope.row.fallbackRequestId }}</code></small>
                 <span class="session-origin" :class="`is-${sessionOrigin(scope.row.threadSource).kind}`" :title="`原始来源：${scope.row.threadSource || 'unavailable'}`"><i aria-hidden="true" />{{ sessionOrigin(scope.row.threadSource).label }}</span>
@@ -250,28 +280,36 @@ onMounted(async () => {
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="当前渠道" min-width="210">
+        <el-table-column label="路由 / 调用身份" min-width="270">
           <template #default="scope">
-            <div v-if="scope.row.currentChannel" class="primary-cell"><div class="channel-title"><strong>{{ scope.row.currentChannel.channelName }}</strong><el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag></div><small><code>{{ scope.row.currentChannel.upstreamModel }}</code></small></div>
-            <span v-else class="muted-text">未进入上游渠道</span>
-          </template>
-        </el-table-column>
-        <el-table-column label="模型 / 调用令牌" min-width="190"><template #default="scope"><div class="primary-cell"><strong>{{ scope.row.latestModel }}</strong><small>{{ scope.row.tokenName || `令牌 #${scope.row.tokenId}` }} · <code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small></div></template></el-table-column>
-        <el-table-column label="请求 / 成功率" width="130" align="right"><template #default="scope"><div class="numeric-cell"><strong class="request-count">{{ formatCompactNumber(scope.row.requestCount) }}</strong><small>{{ formatPercent(scope.row.successRate) }} · {{ formatCompactNumber(scope.row.attemptCount) }} 次尝试</small></div></template></el-table-column>
-        <el-table-column label="Token 明细" min-width="280">
-          <template #default="scope">
-            <div class="session-tokens">
-              <span><small>普通输入</small><strong>{{ formatCompactNumber(scope.row.normalInputTokens) }}</strong></span>
-              <span><small>输出</small><strong>{{ formatCompactNumber(scope.row.outputTokens) }}</strong></span>
-              <span><small>缓存读</small><strong>{{ formatCompactNumber(scope.row.cachedTokens) }}</strong></span>
-              <span><small>缓存写</small><strong>{{ formatCompactNumber(scope.row.cacheWriteTokens) }}</strong></span>
-              <span class="session-sent"><small>真实发送（本地分词）</small><strong>{{ formatCompactNumber(scope.row.sentTokens) }}</strong></span>
+            <div class="route-cell">
+              <div v-if="scope.row.currentChannel" class="channel-title"><strong>{{ scope.row.currentChannel.channelName }}</strong><el-tag :type="channelState(scope.row).type" effect="plain">{{ channelState(scope.row).label }}</el-tag></div>
+              <div v-else class="channel-title"><strong class="muted-text">未进入上游渠道</strong><el-tag type="info" effect="plain">未分配</el-tag></div>
+              <small><span>模型</span><code>{{ scope.row.latestModel }}</code><span v-if="scope.row.currentChannel">上游</span><code v-if="scope.row.currentChannel">{{ scope.row.currentChannel.upstreamModel }}</code></small>
+              <small><span>令牌</span>{{ scope.row.tokenName || `令牌 #${scope.row.tokenId}` }}<code>{{ scope.row.tokenKeyPrefix || '无历史前缀' }}</code></small>
             </div>
           </template>
         </el-table-column>
-        <el-table-column label="费用" width="150" align="right"><template #default="scope"><div class="numeric-cell"><strong>{{ formatUSD(scope.row.upstreamCostMicros) }}</strong><small>估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small></div></template></el-table-column>
-        <el-table-column label="平均性能" min-width="250"><template #default="scope"><div class="numeric-cell"><strong>首 Token {{ formatTiming(scope.row.averageFirstTokenMs, scope.row.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.averageLatencyMs, scope.row.latencySampleCount) }}</strong><small>请求耗时 {{ formatTiming(scope.row.averageDurationMs, scope.row.durationSampleCount) }}</small></div></template></el-table-column>
-        <el-table-column label="首次 / 最近调用" width="180"><template #default="scope"><div class="numeric-cell"><strong>{{ formatDate(scope.row.firstSeenAt) }}</strong><small>最近 {{ formatDate(scope.row.lastSeenAt) }}</small></div></template></el-table-column>
+        <el-table-column label="会话健康度" width="156">
+          <template #default="scope">
+            <div class="health-cell" :class="`is-${sessionHealth(scope.row).kind}`">
+              <div><strong>{{ sessionHealth(scope.row).score ?? '--' }}<small v-if="sessionHealth(scope.row).score !== null">分</small></strong><span><i aria-hidden="true" />{{ sessionHealth(scope.row).label }}</span></div>
+              <small>成功率 {{ formatPercent(scope.row.successRate) }}</small>
+              <small>{{ formatCompactNumber(scope.row.requestCount) }} 请求 · {{ formatCompactNumber(scope.row.attemptCount) }} 尝试</small>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="压缩次数" width="104" align="right"><template #default="scope"><div class="compaction-cell" :style="compactionStyle(scope.row.compactionCount)"><strong>{{ formatCompactNumber(scope.row.compactionCount) }}</strong><small>次压缩</small><i aria-hidden="true" /></div></template></el-table-column>
+        <el-table-column label="Token / 费用" min-width="260">
+          <template #default="scope">
+            <div class="usage-cell">
+              <div><strong>{{ formatCompactNumber(scope.row.inputTokens + scope.row.outputTokens) }} Token</strong><span>{{ formatUSD(scope.row.upstreamCostMicros) }}</span></div>
+              <small>普通输入 {{ formatCompactNumber(scope.row.normalInputTokens) }} · 输出 {{ formatCompactNumber(scope.row.outputTokens) }} · 缓存读 {{ formatCompactNumber(scope.row.cachedTokens) }}</small>
+              <small>缓存写 {{ formatCompactNumber(scope.row.cacheWriteTokens) }} · 真实发送 {{ formatCompactNumber(scope.row.sentTokens) }} · 估算 {{ formatUSD(scope.row.estimatedCostMicros) }}</small>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="性能 / 时间" min-width="270"><template #default="scope"><div class="performance-cell"><strong>首 Token {{ formatTiming(scope.row.averageFirstTokenMs, scope.row.firstTokenSampleCount) }} · 延迟 {{ formatTiming(scope.row.averageLatencyMs, scope.row.latencySampleCount) }}</strong><small>请求耗时 {{ formatTiming(scope.row.averageDurationMs, scope.row.durationSampleCount) }}</small><small>首次 {{ formatDate(scope.row.firstSeenAt) }} · 最近 {{ formatDate(scope.row.lastSeenAt) }}</small></div></template></el-table-column>
         <el-table-column label="操作" width="96" fixed="right" align="right"><template #default="scope"><div class="table-actions"><el-tooltip content="修改会话名称" placement="top"><el-button class="table-action-button" text :icon="EditPen" aria-label="修改会话名称" @click.stop="renameSession(scope.row)" /></el-tooltip><el-tooltip content="查看会话详情" placement="top"><el-button class="table-action-button" text :icon="View" aria-label="查看会话详情" @click.stop="openSession(scope.row)" /></el-tooltip></div></template></el-table-column>
       </el-table>
       <footer class="table-pagination"><el-pagination v-model:current-page="pagination.page" v-model:page-size="pagination.pageSize" :disabled="loading" :total="total" :page-sizes="[25, 50, 100]" layout="total, sizes, prev, pager, next" @change="loadSessions" /></footer>
@@ -286,13 +324,14 @@ onMounted(async () => {
 .log-table-panel { display: flex; min-width: 0; flex-direction: column; }
 .log-table-panel :deep(.el-table__inner-wrapper::before) { display: none; }
 .log-table-panel .table-pagination { flex: none; min-height: 56px; align-items: center; background: var(--rose-surface); }
-.session-identity { position: relative; isolation: isolate; display: grid; min-width: 0; gap: 6px; padding: 4px 6px; overflow: hidden; }
-.session-identity > *:not(.session-source-watermark) { z-index: 1; }
-.session-source-watermark { position: absolute; z-index: 0; top: 5px; right: 10px; color: var(--rose-text-subtle); font: 800 25px/1 var(--rose-font-mono); letter-spacing: 0; opacity: .12; transform: rotate(-7deg); transform-origin: right top; pointer-events: none; user-select: none; }
-.session-identity.is-codex .session-source-watermark { color: var(--rose-success); }
-.session-identity.is-copilot .session-source-watermark { color: var(--rose-primary); }
-.session-name { display: -webkit-box; max-width: 100%; padding-right: 104px; overflow: hidden; color: var(--rose-text); line-height: 1.45; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-.session-meta { z-index: 1; display: flex; min-width: 0; align-items: center; gap: 8px; }
+.session-identity { display: grid; min-width: 0; gap: 6px; padding: 3px 4px; }
+.session-title-line { display: flex; min-width: 0; align-items: flex-start; gap: 8px; }
+.session-name { display: -webkit-box; min-width: 0; flex: 1; overflow: hidden; color: var(--rose-text); line-height: 1.4; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.session-client { display: inline-flex; flex: none; align-items: center; gap: 5px; color: var(--rose-text-muted); font-size: 10px; line-height: 18px; }
+.session-client i { width: 6px; height: 6px; border-radius: 50%; background: var(--rose-text-subtle); }
+.session-identity.is-codex .session-client i { background: var(--rose-success); }
+.session-identity.is-copilot .session-client i { background: var(--rose-primary); }
+.session-meta { display: flex; min-width: 0; align-items: center; gap: 8px; }
 .session-meta small { min-width: 0; flex: 1; }
 .session-origin { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; padding: 2px 6px; border: 1px solid var(--rose-border); color: var(--rose-text-muted); background: color-mix(in srgb, var(--rose-surface) 88%, transparent); font-size: 10px; line-height: 1.2; }
 .session-origin i { width: 5px; height: 5px; border-radius: 50%; background: var(--rose-text-subtle); }
@@ -305,18 +344,28 @@ onMounted(async () => {
 .channel-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .channel-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-identity small { overflow: hidden; color: var(--rose-text-muted); text-overflow: ellipsis; white-space: nowrap; }
-.numeric-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
-.numeric-cell strong { color: var(--rose-text); }
-.numeric-cell small { color: var(--rose-text-muted); font-size: 11px; }
-.numeric-cell .request-count { color: var(--session-row-tone); font-size: var(--request-count-size); }
+.route-cell, .usage-cell, .performance-cell { display: grid; min-width: 0; gap: 4px; font-variant-numeric: tabular-nums; }
+.route-cell > small, .usage-cell > small, .performance-cell > small { overflow: hidden; color: var(--rose-text-muted); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.route-cell > small { display: flex; align-items: center; gap: 6px; }
+.route-cell > small span { color: var(--rose-text-subtle); }
+.route-cell > small code { overflow: hidden; text-overflow: ellipsis; }
+.usage-cell > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.usage-cell > div strong, .performance-cell > strong { color: var(--rose-text); font-size: 12px; }
+.usage-cell > div span { color: var(--rose-text); font: 600 12px/1.3 var(--rose-font-mono); white-space: nowrap; }
+.health-cell { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
+.health-cell > div { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.health-cell > div > strong { color: var(--session-row-tone); font: 700 19px/1.2 var(--rose-font-mono); }
+.health-cell > div > strong small { margin-left: 2px; color: inherit; font: 500 10px/1 var(--rose-font-sans); }
+.health-cell > div > span { display: inline-flex; align-items: center; gap: 5px; color: var(--session-row-tone); font-size: 11px; font-weight: 600; }
+.health-cell > div > span i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.health-cell > small { color: var(--rose-text-muted); font-size: 10px; }
+.compaction-cell { position: relative; display: grid; justify-items: end; gap: 2px; padding-right: 7px; font-variant-numeric: tabular-nums; }
+.compaction-cell strong { color: var(--compaction-tone); font: 700 var(--compaction-size)/1.2 var(--rose-font-mono); }
+.compaction-cell small { color: var(--rose-text-muted); font-size: 10px; }
+.compaction-cell > i { width: var(--compaction-width); height: 2px; margin-top: 3px; background: var(--compaction-tone); content: ''; }
 .session-table :deep(.el-table__body tr > td.el-table__cell) { background-color: var(--session-row-fill); transition: background-color 140ms ease; }
 .session-table :deep(.el-table__body tr:hover > td.el-table__cell) { background-color: var(--session-row-fill-hover) !important; }
 .session-table :deep(.el-table__body tr > td.el-table__cell:first-child) { box-shadow: inset 3px 0 0 var(--session-row-tone); }
-.session-tokens { display: grid; grid-template-columns: repeat(4, minmax(52px, 1fr)); gap: 4px 9px; font-variant-numeric: tabular-nums; }
-.session-tokens > span { display: grid; gap: 1px; }
-.session-tokens small { color: var(--rose-text-muted); font-size: 10px; white-space: nowrap; }
-.session-tokens strong { color: var(--rose-text); font-size: 12px; }
-.session-sent { grid-column: 1 / -1; padding-top: 3px; border-top: 1px solid var(--rose-border); }
 @media (min-width: 961px) {
   .log-page { height: 100%; min-height: 0; grid-template-rows: auto auto auto minmax(0, 1fr); overflow: hidden; padding-bottom: 0; }
   .log-table-panel { min-height: 0; }
