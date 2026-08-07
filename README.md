@@ -124,6 +124,8 @@ go build -buildvcs=false ./...
 
 可使用 `PACKAGE_NAME=my-app ./build.sh` 指定本次产物名。未指定时，脚本优先从具有业务含义的当前分支名生成。
 
+脚本只隐藏前端构建的详细日志，保留 Go 各目标平台、产物路径和最终目录清单，并输出各阶段和总耗时；同时生成 Linux、Windows、macOS 的 arm64 与 amd64 产物。`runtime/` 是本地运行和功能验证目录；在确认没有运行中的实例后，可执行 `./runtime/install_to_here.sh` 自动构建并将当前操作系统和架构的产物移动到该目录。Agent 默认不修改或关闭 `runtime/` 中的配置、数据、日志和程序。
+
 ## 页面与 API
 
 | 功能 | 页面或接口 |

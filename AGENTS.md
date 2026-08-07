@@ -6,6 +6,8 @@
 
 前端源码位于 `frontend/src/`，页面位于 `frontend/src/pages/`，公共资源位于 `frontend/public/`。功能菜单和页面路由统一由 `frontend/src/navigation/index.ts` 管理。项目身份只在 `project.json` 中维护，`internal/projectmeta/` 和 `frontend/src/config/project.generated.js` 是生成文件，不得直接编辑。
 
+`runtime/` 是本地运行时目录，供用户启动程序和进行功能验证。除非任务明确要求，Agent 不得修改其中的配置、数据库、日志或运行产物，不得关闭、重启或替换其中正在运行的程序。需要更新当前平台运行产物时，只使用 `runtime/install_to_here.sh`，并先确认没有正在运行的实例。
+
 ## Git 工作流
 
 修改前执行 `git status --short --branch`，保留用户已有修改，不得擅自覆盖或回退。
@@ -125,7 +127,7 @@ pnpm --dir frontend build
 PACKAGE_NAME=<package-slug> ./build.sh
 ```
 
-未指定时，`build.sh` 从有业务含义的分支名生成，例如 `feature/device-monitoring` 生成 `device-monitoring`。`main`、`master`、detached HEAD 或无法转换的分支名回退到 `project.json.binaryName`。打包完成后向用户报告实际产物名。修改 Wire provider 后执行 `go generate ./cmd`。
+未指定时，`build.sh` 从有业务含义的分支名生成，例如 `feature/device-monitoring` 生成 `device-monitoring`。`main`、`master`、detached HEAD 或无法转换的分支名回退到 `project.json.binaryName`。脚本只隐藏前端构建的详细日志，保留 Go 各目标平台、产物路径和最终目录清单，并额外输出各阶段和总耗时；它会生成 Linux、Windows、macOS 的 arm64 与 amd64 产物。运行时目录可执行 `./runtime/install_to_here.sh`，它会先调用根目录构建脚本，再将当前操作系统和 CPU 架构的产物移动到 `runtime/`。修改 Wire provider 后执行 `go generate ./cmd`。
 
 ## 依赖安装失败处理
 
