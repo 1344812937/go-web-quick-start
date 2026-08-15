@@ -11,4 +11,6 @@
 /frontend/node_modules/
 /data/
 /config/
+/runtime/
+/.env
 data.db
