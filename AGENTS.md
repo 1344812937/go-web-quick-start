@@ -1,12 +1,20 @@
 # Repository Guidelines
 
+## 用户授权边界（最高优先级）
+
+除非用户在当前任务中明确授权，否则不得新增需求范围之外的功能、页面、接口、配置、脚本、文档或其他内容。发现可改进项时只报告，不得自行实施。
+
+运行环境默认只读。除非用户针对具体操作明确授权，否则严禁修改运行环境中的数据库数据，包括执行迁移、回填、修复、更新、插入、删除、清理、导入或恢复数据。用户授权修改源码或编写数据库迁移，不等于授权把迁移应用到运行环境；应用运行环境数据变更必须单独取得明确授权。
+
+除非用户明确授权，否则不得停止、重启或终止运行中的服务，不得替换运行环境二进制、部署构建产物或修改运行配置。构建和测试授权不等于部署授权。只读检查不得产生隐式写入；如果工具可能触发迁移、WAL 变更或其他状态变化，必须先请求授权。
+
+不得使用测试、模拟或临时服务占用、覆盖、代理或替换项目运行时服务及其默认端口，即使端口探测时暂时空闲。验证需要启动服务时，必须使用隔离的临时端口，避免影响用户运行中的程序，并在验证结束后关闭由代理启动的进程。
+
 ## 项目结构
 
 这是一个 Go 与 Vue 3 单仓库项目。`main.go` 嵌入 `frontend/dist/` 并启动 Gin 服务；后端业务代码放在 `internal/`，可复用的 API、模型、Repository、Service、事务和日志能力放在 `pkg/`。Wire 定义位于 `cmd/wire.go`，生成文件为 `cmd/wire_gen.go`。
 
 前端源码位于 `frontend/src/`，页面位于 `frontend/src/pages/`，公共资源位于 `frontend/public/`。功能菜单和页面路由统一由 `frontend/src/navigation/index.ts` 管理。项目身份只在 `project.json` 中维护，`internal/projectmeta/` 和 `frontend/src/config/project.generated.js` 是生成文件，不得直接编辑。
-
-`runtime/` 是本地运行时目录，供用户启动程序和进行功能验证。除非任务明确要求，Agent 不得修改其中的配置、数据库、日志或运行产物，不得关闭、重启或替换其中正在运行的程序。需要更新当前平台运行产物时，只使用 `runtime/install_to_here.sh`，并先确认没有正在运行的实例。
 
 ## Git 工作流
 
@@ -127,7 +135,7 @@ pnpm --dir frontend build
 PACKAGE_NAME=<package-slug> ./build.sh
 ```
 
-未指定时，`build.sh` 从有业务含义的分支名生成，例如 `feature/device-monitoring` 生成 `device-monitoring`。`main`、`master`、detached HEAD 或无法转换的分支名回退到 `project.json.binaryName`。脚本只隐藏前端构建的详细日志，保留 Go 各目标平台、产物路径和最终目录清单，并额外输出各阶段和总耗时；它会生成 Linux、Windows、macOS 的 arm64 与 amd64 产物。运行时目录可执行 `./runtime/install_to_here.sh`，它会先调用根目录构建脚本，再将当前操作系统和 CPU 架构的产物移动到 `runtime/`。修改 Wire provider 后执行 `go generate ./cmd`。
+未指定时，`build.sh` 从有业务含义的分支名生成，例如 `feature/device-monitoring` 生成 `device-monitoring`。`main`、`master`、detached HEAD 或无法转换的分支名回退到 `project.json.binaryName`。打包完成后向用户报告实际产物名。修改 Wire provider 后执行 `go generate ./cmd`。
 
 ## 依赖安装失败处理
 

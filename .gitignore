@@ -7,10 +7,11 @@
 /logs/
 /.github/
 /.claude/
+/.codegraph/
+/.env
+/runtime
 /frontend/dist/
 /frontend/node_modules/
 /data/
 /config/
-/runtime/
-/.env
 data.db

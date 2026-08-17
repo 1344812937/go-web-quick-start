@@ -1,9 +1,7 @@
 #!/bin/bash
+# build.sh
 
 set -euo pipefail
-
-ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-cd "$ROOT_DIR"
 
 # project.json 维护稳定项目身份；PACKAGE_NAME 只控制本次构建产物名。
 PROJECT_BINARY=$(go run ./tools/projectctl field binaryName)
@@ -54,41 +52,30 @@ if [ -z "$VERSION" ]; then
 	exit 1
 fi
 
-echo "构建 ${APP_NAME} ${VERSION}"
+echo "构建产物名称：${APP_NAME}（来源：${NAME_SOURCE}）"
 
+# 清理之前的构建
 rm -rf build
 mkdir -p build
-
-frontend_started_at=$SECONDS
-frontend_log=$(mktemp "${TMPDIR:-/tmp}/go-web-quick-start-frontend.XXXXXX")
-trap 'rm -f "$frontend_log"' EXIT
-if ! pnpm --dir frontend build >"$frontend_log" 2>&1; then
-	echo "前端构建失败："
-	tail -n 40 "$frontend_log"
-	exit 1
-fi
-printf '前端构建耗时：%ss\n' "$((SECONDS - frontend_started_at))"
-
-go_started_at=$SECONDS
 
 build_target() {
 	local goos="$1"
 	local goarch="$2"
-	local output="build/${APP_NAME}-${goos}-${goarch}-${VERSION}"
-	if [ "$goos" = "windows" ]; then
-		output+=".exe"
-	fi
-	echo "+ ${goos}/${goarch} -> ${output}"
-	GOOS="$goos" GOARCH="$goarch" go build -buildvcs=false -o "$output" .
+	local output="$3"
+	CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -buildvcs=false -o "$output" .
 }
 
-for target in \
-	"linux amd64" "linux arm64" \
-	"windows amd64" "windows arm64" \
-	"darwin amd64" "darwin arm64"; do
-	read -r goos goarch <<<"$target"
-	build_target "$goos" "$goarch"
-done
-printf 'Go 交叉编译耗时：%ss\n' "$((SECONDS - go_started_at))"
-printf '构建完成，共生成 6 个产物，总耗时：%ss\n' "$SECONDS"
+echo "+ Linux！"
+build_target linux amd64 "build/${APP_NAME}-linux-x86-${VERSION}"
+build_target linux arm64 "build/${APP_NAME}-linux-arm64-${VERSION}"
+
+echo "+ Windows！"
+build_target windows amd64 "build/${APP_NAME}-windows-x86-${VERSION}.exe"
+build_target windows arm64 "build/${APP_NAME}-windows-arm64-${VERSION}.exe"
+
+echo "+ macOS！"
+build_target darwin amd64 "build/${APP_NAME}-darwin-x86-${VERSION}"
+build_target darwin arm64 "build/${APP_NAME}-darwin-arm64-${VERSION}"
+
+echo "✅ 构建完成！"
 ls -lh build/
