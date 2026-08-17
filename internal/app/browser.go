@@ -52,7 +52,7 @@ func openDefaultBrowser(targetURL string) error {
 }
 
 func (awm *AppWebManager) openBrowserOnce(targetURL string) {
-	if awm.browserOpener == nil {
+	if !awm.openBrowser || awm.browserOpener == nil {
 		return
 	}
 	awm.browserOpenOnce.Do(func() {

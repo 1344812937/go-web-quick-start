@@ -11,6 +11,8 @@ import (
 	providers2 "github.com/1344812937/go-web-quick-start/internal/api/providers"
 	"github.com/1344812937/go-web-quick-start/internal/app"
 	"github.com/1344812937/go-web-quick-start/internal/config"
+	"github.com/1344812937/go-web-quick-start/internal/core/ds/providers"
+	"github.com/1344812937/go-web-quick-start/internal/gateway"
 )
 
 // Injectors from wire.go:
@@ -18,9 +20,23 @@ import (
 func InitializeApp() *app.ApplicationHolder {
 	applicationConfigManager := config.NewApplicationConfigManager()
 	siteApi := api.NewSiteApi(applicationConfigManager)
-	settingsApi := api.NewSettingsApi(applicationConfigManager)
-	v := providers2.ProvideApis(siteApi, settingsApi)
-	appWebManager := app.NewAppWebManager(applicationConfigManager, v)
+	multiDataSource := providers.NewMultiDataSource()
+	dataSource := providers.GetPrimaryDataSource(multiDataSource)
+	store := gateway.NewStore(dataSource, applicationConfigManager)
+	adminAuthService := gateway.NewAdminAuthService(store, applicationConfigManager)
+	adminSecurity := api.NewAdminSecurity(adminAuthService, applicationConfigManager)
+	settingsApi := api.NewSettingsApi(applicationConfigManager, adminSecurity)
+	adminApi := api.NewAdminApi(adminAuthService, adminSecurity)
+	managementService := gateway.NewManagementService(store)
+	tokenEstimator := gateway.NewTokenEstimator()
+	gatewayManagementApi := api.NewGatewayManagementApi(managementService, adminSecurity, tokenEstimator)
+	v := providers2.ProvideApis(siteApi, settingsApi, adminApi, gatewayManagementApi)
+	clientAccessService := gateway.NewClientAccessService(store)
+	router := gateway.NewRouter(store, clientAccessService, applicationConfigManager)
+	relayService := gateway.NewRelayService(store, router, tokenEstimator, applicationConfigManager)
+	openAIRelayApi := api.NewOpenAIRelayApi(clientAccessService, relayService, applicationConfigManager)
+	iRootApi := providers2.ProvideRootApi(openAIRelayApi)
+	appWebManager := app.NewAppWebManager(applicationConfigManager, v, iRootApi)
 	applicationHolder := app.NewApplicationHolder(applicationConfigManager, appWebManager)
 	return applicationHolder
 }

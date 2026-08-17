@@ -2,13 +2,17 @@ package app
 
 import (
 	"embed"
+	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"github.com/1344812937/go-web-quick-start/internal/config"
 	pkgApi "github.com/1344812937/go-web-quick-start/pkg/api"
@@ -86,29 +90,45 @@ type AppWebManager struct {
 	assertFs        embed.FS
 	staticFiles     map[string]bool
 	apis            []pkgApi.IApi
+	rootApi         pkgApi.IRootApi
 	browserOpenOnce sync.Once
 	browserOpener   func(string) error
+	openBrowser     bool
 }
 
-func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi) *AppWebManager {
+func NewAppWebManager(appConfigManager *config.ApplicationConfigManager, apis []pkgApi.IApi, rootApi pkgApi.IRootApi) *AppWebManager {
 	var webConfig *config.WebConfig = nil
 	appConfig := appConfigManager.GetConfig()
 	if appConfig != nil {
 		webConfig = &appConfig.WebConfig
 	}
+	openBrowser, err := config.OpenBrowserOnStart()
+	if err != nil {
+		panic(err)
+	}
+	allowIframe, err := config.AllowIframeEmbedding()
+	if err != nil {
+		panic(err)
+	}
 	return &AppWebManager{
-		WebServer:     getGin(),
+		WebServer:     getGin(allowIframe),
 		WebConfig:     webConfig,
 		apis:          apis,
+		rootApi:       rootApi,
 		browserOpener: openDefaultBrowser,
+		openBrowser:   openBrowser,
 	}
 }
 
-func getGin() *gin.Engine {
+func getGin(allowIframe bool) *gin.Engine {
 	engine := gin.Default()
+	if err := engine.SetTrustedProxies(nil); err != nil {
+		panic(err)
+	}
 	// 重定向 Gin 日志
 	gin.DefaultWriter = &until.GinLogWriter{}
 	gin.DefaultErrorWriter = &until.GinLogWriter{}
+	engine.Use(frameOptionsMiddleware(allowIframe))
 	// 更换默认的日志输出方式
 	engine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
 		log.WithFields(logrus.Fields{
@@ -125,6 +145,15 @@ func getGin() *gin.Engine {
 	return engine
 }
 
+func frameOptionsMiddleware(allowIframe bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if !allowIframe {
+			c.Header("X-Frame-Options", "DENY")
+		}
+		c.Next()
+	}
+}
+
 func (awm *AppWebManager) Run(assertFs embed.FS) {
 	awm.assertFs = assertFs
 	webConfig := awm.WebConfig
@@ -135,12 +164,12 @@ func (awm *AppWebManager) Run(assertFs embed.FS) {
 			Host: config.DefaultWebHost,
 		}
 	}
-	listenAddress := net.JoinHostPort(webConfig.Host, webConfig.Port)
-	listener, err := net.Listen("tcp", listenAddress)
+	listener, actualPort, err := listenWithPortFallback(webConfig.Host, webConfig.Port)
 	if err != nil {
 		panic(err)
 	}
-	localURL := localBrowserURL(webConfig.Host, webConfig.Port)
+	listenAddress := listener.Addr().String()
+	localURL := localBrowserURL(webConfig.Host, actualPort)
 	go func() {
 		if err := awm.WebServer.RunListener(listener); err != nil {
 			panic(err)
@@ -148,7 +177,52 @@ func (awm *AppWebManager) Run(assertFs embed.FS) {
 	}()
 	log.Infof("application listening on %s", listenAddress)
 	log.Infof("local interface available at %s", localURL)
-	go awm.openBrowserOnce(localURL)
+	if awm.openBrowser {
+		go awm.openBrowserOnce(localURL)
+	} else {
+		log.Infof("automatic browser opening is disabled by %s", config.StartOpenWebKey)
+	}
+}
+
+func listenWithPortFallback(host string, preferredPort string) (net.Listener, string, error) {
+	return listenWithPortFallbackUsing(net.Listen, host, preferredPort)
+}
+
+func listenWithPortFallbackUsing(listen func(string, string) (net.Listener, error), host string, preferredPort string) (net.Listener, string, error) {
+	preferredPort = strings.TrimSpace(preferredPort)
+	if preferredPort == "" {
+		preferredPort = config.DefaultWebPort
+	}
+	preferredAddress := net.JoinHostPort(host, preferredPort)
+	listener, err := listen("tcp", preferredAddress)
+	if err == nil {
+		return listener, actualListenerPort(listener, preferredPort), nil
+	}
+	if !errors.Is(err, syscall.EADDRINUSE) {
+		return nil, "", err
+	}
+
+	fallbackAddress := net.JoinHostPort(host, "0")
+	fallbackListener, fallbackErr := listen("tcp", fallbackAddress)
+	if fallbackErr != nil {
+		return nil, "", fmt.Errorf("监听 %s 失败，备用端口也无法使用: %w", preferredAddress, fallbackErr)
+	}
+	actualPort := actualListenerPort(fallbackListener, "")
+	log.Warnf("端口 %s 已被占用，已改用端口 %s", preferredPort, actualPort)
+	return fallbackListener, actualPort, nil
+}
+
+func actualListenerPort(listener net.Listener, fallback string) string {
+	if listener == nil {
+		return fallback
+	}
+	if address, ok := listener.Addr().(*net.TCPAddr); ok {
+		return strconv.Itoa(address.Port)
+	}
+	if _, port, err := net.SplitHostPort(listener.Addr().String()); err == nil {
+		return port
+	}
+	return fallback
 }
 
 func (awm *AppWebManager) RegisterRouter() {
@@ -158,6 +232,9 @@ func (awm *AppWebManager) RegisterRouter() {
 	apiGroup := server.Group("/api")
 	for _, a := range awm.apis {
 		a.Register(apiGroup)
+	}
+	if awm.rootApi != nil {
+		awm.rootApi.RegisterRoot(server)
 	}
 
 	server.GET("/", func(c *gin.Context) {

@@ -1,12 +1,14 @@
 package providers
 
 import (
-	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
+	"fmt"
 	"os"
 	"path/filepath"
 
+	"github.com/1344812937/go-web-quick-start/pkg/core/tx"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 )
 
 func NewMultiDataSource() *tx.MultiDataSource {
@@ -32,7 +34,7 @@ func getPrimaryDS() *tx.DataSource {
 	if err := os.MkdirAll(dbDir, 0o755); err != nil {
 		panic("failed to create database directory: " + err.Error())
 	}
-	db, err := gorm.Open(sqlite.Open(primaryDBPath), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open(primarySQLiteDSN(primaryDBPath)), &gorm.Config{Logger: logger.Discard})
 	if err != nil {
 		panic("failed to connect database: " + err.Error())
 	}
@@ -42,32 +44,59 @@ func getPrimaryDS() *tx.DataSource {
 	return tx.CreateDataSource("primary", db)
 }
 
+func primarySQLiteDSN(path string) string {
+	return path + "?_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
+}
+
 func configurePrimarySQLite(db *gorm.DB) error {
 	mode, err := queryPrimaryAutoVacuumMode(db)
 	if err != nil {
 		return err
 	}
-	if mode == 1 {
-		return nil
-	}
-	if err := db.Exec("PRAGMA auto_vacuum = FULL").Error; err != nil {
-		return err
-	}
-	hasTables, err := hasPrimaryUserTables(db)
-	if err != nil {
-		return err
-	}
-	if hasTables {
-		if err := db.Exec("VACUUM").Error; err != nil {
+	if mode != 1 {
+		if err := db.Exec("PRAGMA auto_vacuum = FULL").Error; err != nil {
 			return err
 		}
+		hasTables, err := hasPrimaryUserTables(db)
+		if err != nil {
+			return err
+		}
+		if hasTables {
+			if err := db.Exec("VACUUM").Error; err != nil {
+				return err
+			}
+		}
+		mode, err = queryPrimaryAutoVacuumMode(db)
+		if err != nil {
+			return err
+		}
+		if mode != 1 {
+			return gorm.ErrInvalidDB
+		}
 	}
-	mode, err = queryPrimaryAutoVacuumMode(db)
-	if err != nil {
+	if err := db.Exec("PRAGMA journal_mode = WAL").Error; err != nil {
 		return err
 	}
-	if mode != 1 {
-		return gorm.ErrInvalidDB
+	if err := db.Exec("PRAGMA wal_autocheckpoint = 1000").Error; err != nil {
+		return err
+	}
+	return verifyPrimarySQLiteWritePragmas(db)
+}
+
+func verifyPrimarySQLiteWritePragmas(db *gorm.DB) error {
+	var journalMode string
+	if err := db.Raw("PRAGMA journal_mode").Scan(&journalMode).Error; err != nil {
+		return err
+	}
+	if journalMode != "wal" {
+		return fmt.Errorf("unexpected SQLite journal_mode %q", journalMode)
+	}
+	var synchronous int
+	if err := db.Raw("PRAGMA synchronous").Scan(&synchronous).Error; err != nil {
+		return err
+	}
+	if synchronous != 1 {
+		return fmt.Errorf("unexpected SQLite synchronous mode %d", synchronous)
 	}
 	return nil
 }

@@ -8,11 +8,12 @@
 
 body {
   min-height: 100vh;
-  color: var(--supos-text);
-  background: var(--supos-page);
+  color: var(--rose-text);
+  background: var(--rose-page);
   line-height: 1.5;
-  font-family: var(--supos-font-sans);
+  font-family: var(--rose-font-sans);
   font-size: 14px;
+	letter-spacing: 0;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;

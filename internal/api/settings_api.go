@@ -12,15 +12,18 @@ import (
 type SettingsApi struct {
 	pkgApi.BaseApi
 	configManager *config.ApplicationConfigManager
+	security      *AdminSecurity
 }
 
-func NewSettingsApi(configManager *config.ApplicationConfigManager) *SettingsApi {
-	return &SettingsApi{configManager: configManager}
+func NewSettingsApi(configManager *config.ApplicationConfigManager, security *AdminSecurity) *SettingsApi {
+	return &SettingsApi{configManager: configManager, security: security}
 }
 
 func (a *SettingsApi) Register(router *gin.RouterGroup) {
-	router.GET("/settings", a.GetSettings)
-	router.PUT("/settings", a.UpdateSettings)
+	settings := router.Group("/settings")
+	settings.Use(a.security.RequireAdmin, a.security.VerifyOrigin)
+	settings.GET("", a.GetSettings)
+	settings.PUT("", a.UpdateSettings)
 }
 
 func (a *SettingsApi) GetSettings(c *gin.Context) {
@@ -35,13 +38,16 @@ func (a *SettingsApi) UpdateSettings(c *gin.Context) {
 
 	var req config.ApplicationConfig
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusOK, common.F[any](400, "参数错误: "+err.Error()))
+		c.JSON(http.StatusBadRequest, common.F[any](400, "参数错误: "+err.Error()))
 		return
 	}
 	if err := a.configManager.Save(&req); err != nil {
-		c.JSON(http.StatusOK, common.F[any](500, "保存配置失败: "+err.Error()))
+		c.JSON(http.StatusInternalServerError, common.F[any](500, "保存配置失败: "+err.Error()))
 		return
 	}
+	// Refresh the current administrator cookie so a changed session lifetime
+	// takes effect on this response instead of waiting for the next request.
+	a.security.refreshSessionCookie(c)
 	var result any = a.configManager.GetConfig()
 	c.JSON(http.StatusOK, common.S(&result))
 }

@@ -1,8 +1,11 @@
 package app
 
 import (
+	"errors"
 	"io"
+	"net"
 	"reflect"
+	"syscall"
 	"testing"
 )
 
@@ -69,6 +72,7 @@ func TestOpenBrowserOnce(t *testing.T) {
 
 	openCount := 0
 	manager := &AppWebManager{
+		openBrowser: true,
 		browserOpener: func(string) error {
 			openCount++
 			return nil
@@ -82,3 +86,60 @@ func TestOpenBrowserOnce(t *testing.T) {
 		t.Fatalf("browser opened %d times, want 1", openCount)
 	}
 }
+
+func TestOpenBrowserOnceDisabled(t *testing.T) {
+	openCount := 0
+	manager := &AppWebManager{
+		openBrowser: false,
+		browserOpener: func(string) error {
+			openCount++
+			return nil
+		},
+	}
+
+	manager.openBrowserOnce("http://127.0.0.1:8888/static/")
+
+	if openCount != 0 {
+		t.Fatalf("browser opened %d times, want 0", openCount)
+	}
+}
+
+func TestListenWithPortFallbackUsesAvailablePortWhenPreferredPortIsBusy(t *testing.T) {
+	var addresses []string
+	listener, actualPort, err := listenWithPortFallbackUsing(func(network string, address string) (net.Listener, error) {
+		addresses = append(addresses, address)
+		if len(addresses) == 1 {
+			return nil, &net.OpError{Op: "listen", Net: network, Addr: &testAddr{network: network, address: address}, Err: syscall.EADDRINUSE}
+		}
+		return &testListener{address: testAddr{network: network, address: "127.0.0.1:40123"}}, nil
+	}, "127.0.0.1", "8888")
+	if err != nil {
+		t.Fatalf("listenWithPortFallback() error = %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	if !reflect.DeepEqual(addresses, []string{"127.0.0.1:8888", "127.0.0.1:0"}) {
+		t.Fatalf("listen addresses = %#v", addresses)
+	}
+	if actualPort != "40123" {
+		t.Fatalf("fallback port = %s, want 40123", actualPort)
+	}
+}
+
+type testAddr struct {
+	network string
+	address string
+}
+
+func (a testAddr) Network() string { return a.network }
+func (a testAddr) String() string  { return a.address }
+
+type testListener struct {
+	address net.Addr
+}
+
+func (l *testListener) Accept() (net.Conn, error) {
+	return nil, errors.New("test listener does not accept connections")
+}
+func (l *testListener) Close() error   { return nil }
+func (l *testListener) Addr() net.Addr { return l.address }
